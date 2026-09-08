@@ -228,7 +228,7 @@ app.get('/sales',(req,res)=>res.redirect('/sales/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.8'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.9'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
