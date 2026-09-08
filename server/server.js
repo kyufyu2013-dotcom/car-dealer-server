@@ -81,6 +81,7 @@ function userDto(u){
     name:u.name,
     role:u.role,
     commissionRate:Number(u.commission_rate||0),
+    baseSalary:Number(u.base_salary||0),
     enabled:!!u.enabled
   };
 }
@@ -149,6 +150,7 @@ async function initDb(){
       name TEXT NOT NULL,
       role TEXT NOT NULL,
       commission_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+      base_salary DOUBLE PRECISION NOT NULL DEFAULT 0,
       enabled BOOLEAN NOT NULL DEFAULT TRUE,
       updated_at TEXT NOT NULL,
       UNIQUE(company_id, username)
@@ -160,6 +162,8 @@ async function initDb(){
       json JSONB NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS base_salary DOUBLE PRECISION NOT NULL DEFAULT 0;
 
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
@@ -185,7 +189,7 @@ async function getSnapshot(companyId, client=pool){
   if(row){
     return {version:Number(row.version||0),snapshot:row.json,updatedAt:row.updated_at};
   }
-  return {version:0,snapshot:{settings:{companyName:'車行',taxRate:0},users:[],cars:[],saleRequests:[]},updatedAt:null};
+  return {version:0,snapshot:{settings:{companyName:'車行',taxRate:0},users:[],cars:[],saleRequests:[],operationLogs:[]},updatedAt:null};
 }
 
 function auth(req,res,next){
@@ -224,7 +228,7 @@ app.get('/sales',(req,res)=>res.redirect('/sales/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.4'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.5'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -248,12 +252,12 @@ app.post('/api/company/register',async(req,res,next)=>{
     };
     const user={
       id:`admin_${crypto.randomUUID()}`,company_id:companyCode,username,name:ownerName,
-      role:'admin',commission_rate:0,enabled:true,updated_at:now()
+      role:'admin',commission_rate:0,base_salary:0,enabled:true,updated_at:now()
     };
     const snapshot={
       settings:{companyName,taxRate:0},
-      users:[{id:user.id,username:user.username,password:'',name:user.name,role:'admin',commissionRate:0}],
-      cars:[],saleRequests:[]
+      users:[{id:user.id,username:user.username,password:'',name:user.name,role:'admin',commissionRate:0,baseSalary:0}],
+      cars:[],saleRequests:[],operationLogs:[]
     };
 
     await client.query('BEGIN');
@@ -262,9 +266,9 @@ app.post('/api/company/register',async(req,res,next)=>{
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
     `,[company.id,company.name,true,company.start_date,company.expires_at,company.created_at,company.created_by,company.contact_email,true]);
     await client.query(`
-      INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,enabled,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-    `,[user.id,user.company_id,user.username,hashPassword(password),user.name,user.role,0,true,user.updated_at]);
+      INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `,[user.id,user.company_id,user.username,hashPassword(password),user.name,user.role,0,0,true,user.updated_at]);
     await client.query(`
       INSERT INTO snapshots(company_id,version,json,updated_at) VALUES($1,$2,$3::jsonb,$4)
     `,[companyCode,1,JSON.stringify(snapshot),now()]);
@@ -349,7 +353,7 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
     const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
     const existing=lock.rows[0]
       ? {version:Number(lock.rows[0].version),snapshot:lock.rows[0].json}
-      : {version:0,snapshot:{settings:{companyName:'車行',taxRate:0},users:[],cars:[],saleRequests:[]}};
+      : {version:0,snapshot:{settings:{companyName:'車行',taxRate:0},users:[],cars:[],saleRequests:[],operationLogs:[]}};
     if(baseVersion!==existing.version){
       await client.query('ROLLBACK');
       return res.status(409).json({error:'中央資料已有新版本',version:existing.version});
@@ -370,16 +374,16 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       const ph=x.password?hashPassword(x.password):(old?.password_hash||'');
       if(old){
         await client.query(`
-          UPDATE users SET username=$1,password_hash=$2,name=$3,role=$4,commission_rate=$5,enabled=TRUE,updated_at=$6
-          WHERE id=$7 AND company_id=$8
-        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),now(),old.id,req.auth.companyId]);
+          UPDATE users SET username=$1,password_hash=$2,name=$3,role=$4,commission_rate=$5,base_salary=$6,enabled=TRUE,updated_at=$7
+          WHERE id=$8 AND company_id=$9
+        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),old.id,req.auth.companyId]);
         if(old.id!==x.id){ x.id=old.id; keep.add(old.id); }
       }else{
         if(!ph)return res.status(400).json({error:`新帳號 ${x.username} 必須設定密碼`});
         await client.query(`
-          INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,enabled,updated_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,$8)
-        `,[x.id,req.auth.companyId,x.username,ph,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),now()]);
+          INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9)
+        `,[x.id,req.auth.companyId,x.username,ph,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now()]);
       }
       x.password='';
     }
@@ -487,11 +491,13 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
     const commission=Math.max(0,Number(r.sellPrice||0)-Number(r.floorPrice||0))*Number(r.commissionRate||0)/100;
     const extra=tr+fu+li+ot,totalCost=Number(c.totalCost||c.purchasePrice||0);
     Object.assign(c,{status:'已售',outDate:r.saleDate,sellPrice:Number(r.sellPrice||0),salesId:r.salesId,salesName:r.salesName,commissionRate:Number(r.commissionRate||0),commissionAmount:commission,saleTransferFee:tr,saleFuelFee:fu,saleLicenseTax:li,saleOtherFee:ot,saleOtherFeeName:String(otherName||''),saleExtraCost:extra,companyProfit:Number(r.sellPrice||0)-totalCost-extra-commission});
-    Object.assign(r,{status:'已成交',finalCommission:commission,confirmedAt:today()});
+    Object.assign(r,{status:'已成交',finalCommission:commission,confirmedAt:now()});
+    d.operationLogs=Array.isArray(d.operationLogs)?d.operationLogs:[];
+    d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'確認成交',carId:c.id,plate:c.plate||'',requestId:r.id,reason:'',operatedAt:now(),operatedBy:req.auth.username||req.auth.sub});
     // Defense in depth: there must never be another pending request for this sold car.
     for(const x of d.saleRequests){
       if(x.id!==r.id&&String(x.carId)===String(c.id)&&x.status==='待確認'){
-        x.status='已駁回';x.rejectReason='此車已由其他成交申請完成成交';x.rejectedAt=today();
+        x.status='已駁回';x.rejectReason='此車已由其他成交申請完成成交';x.rejectedAt=now();
       }
     }
     const ver=Number(lock.rows[0].version||0)+1;
@@ -527,10 +533,12 @@ app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=
     Object.assign(r,{
       status:'成交已取消',
       cancelReason:why,
-      canceledAt:today(),
+      canceledAt:now(),
       canceledBy:req.auth.username||req.auth.sub,
       previousConfirmedAt:r.confirmedAt||''
     });
+    d.operationLogs=Array.isArray(d.operationLogs)?d.operationLogs:[];
+    d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'取消成交／恢復在庫',carId:c.id,plate:c.plate||'',requestId:r.id,reason:why,operatedAt:r.canceledAt,operatedBy:req.auth.username||req.auth.sub,previousConfirmedAt:r.previousConfirmedAt||''});
     // 只清除「成交結果」欄位；進貨成本、底價、來源、照片、整備資料全部保留。
     Object.assign(c,{
       status:'在庫',outDate:'',sellPrice:0,salesId:'',salesName:'',commissionRate:0,commissionAmount:0,
@@ -557,7 +565,9 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
     const r=d.saleRequests.find(x=>String(x.id)===String(requestId));
     if(!r){await client.query('ROLLBACK');return res.status(404).json({error:'找不到成交申請'});}
     if(r.status!=='待確認'){await client.query('ROLLBACK');return res.status(409).json({error:`此申請目前為「${r.status}」，不可再次處理`});}
-    r.status='已駁回';r.rejectReason=String(reason).trim();r.rejectedAt=today();
+    r.status='已駁回';r.rejectReason=String(reason).trim();r.rejectedAt=now();
+    d.operationLogs=Array.isArray(d.operationLogs)?d.operationLogs:[];
+    d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'駁回成交申請',carId:r.carId,plate:r.plate||'',requestId:r.id,reason:r.rejectReason,operatedAt:r.rejectedAt,operatedBy:req.auth.username||req.auth.sub});
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
     await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
@@ -631,10 +641,10 @@ app.post('/api/super/companies',superAuth,async(req,res,next)=>{
     const enabled=b.enabled!==false;
     const trial=!!b.trial;
     const id=`admin_${crypto.randomUUID()}`;
-    const snapshot={settings:{companyName,taxRate:0},users:[{id,username,password:'',name:ownerName,role:'admin',commissionRate:0}],cars:[],saleRequests:[]};
+    const snapshot={settings:{companyName,taxRate:0},users:[{id,username,password:'',name:ownerName,role:'admin',commissionRate:0,baseSalary:0}],cars:[],saleRequests:[],operationLogs:[]};
     await client.query('BEGIN');
     await client.query(`INSERT INTO companies(id,name,enabled,start_date,expires_at,created_at,created_by,contact_email,trial) VALUES($1,$2,$3,$4,$5,$6,'manual',$7,$8)`,[companyCode,companyName,enabled,startDate,expiresAt,now(),String(b.email||''),trial]);
-    await client.query(`INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,enabled,updated_at) VALUES($1,$2,$3,$4,$5,'admin',0,TRUE,$6)`,[id,companyCode,username,hashPassword(password),ownerName,now()]);
+    await client.query(`INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at) VALUES($1,$2,$3,$4,$5,'admin',0,0,TRUE,$6)`,[id,companyCode,username,hashPassword(password),ownerName,now()]);
     await client.query(`INSERT INTO snapshots(company_id,version,json,updated_at) VALUES($1,1,$2::jsonb,$3)`,[companyCode,JSON.stringify(snapshot),now()]);
     await client.query('COMMIT');
     const c=await getCompany(companyCode);
