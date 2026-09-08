@@ -223,12 +223,13 @@ const app=express();
 app.use(cors({origin:true,credentials:false}));
 app.use(express.json({limit:'30mb'}));
 app.use('/sales', express.static(path.join(__dirname,'public','sales'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
+app.use('/admin', express.static(path.join(__dirname,'public','admin'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.9'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.0'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
