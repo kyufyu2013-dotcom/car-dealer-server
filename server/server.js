@@ -12,8 +12,8 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 8787);
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_THIS_SECRET_BEFORE_DEPLOYING_0123456789';
-const SUPER_ADMIN_USER = process.env.SUPER_ADMIN_USER || 'master';
-const SUPER_ADMIN_PASSWORD = process.env.SUPER_ADMIN_PASSWORD || 'ChangeMe123!';
+const SUPER_ADMIN_USER = process.env.SUPER_ADMIN_USER || 'm200530366';
+const SUPER_ADMIN_PASSWORD = process.env.SUPER_ADMIN_PASSWORD || '00000000';
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
@@ -223,13 +223,14 @@ const app=express();
 app.use(cors({origin:true,credentials:false}));
 app.use(express.json({limit:'30mb'}));
 app.use('/sales', express.static(path.join(__dirname,'public','sales'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
-app.use('/admin', express.static(path.join(__dirname,'public','admin'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
+app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
+app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.0'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.1'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
