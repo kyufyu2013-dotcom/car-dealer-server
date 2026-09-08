@@ -27,8 +27,18 @@ const pool = new Pool({
 });
 
 function now(){ return new Date().toISOString(); }
-function today(){ return new Date().toISOString().slice(0,10); }
-function addDays(n){ const d=new Date(); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+function taiwanDateParts(date=new Date()){
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date);
+  const get=t=>parts.find(p=>p.type===t)?.value||'';
+  return {year:get('year'),month:get('month'),day:get('day')};
+}
+function today(){ const p=taiwanDateParts(); return `${p.year}-${p.month}-${p.day}`; }
+function addDays(n){
+  const p=taiwanDateParts();
+  const d=new Date(Date.UTC(Number(p.year),Number(p.month)-1,Number(p.day)));
+  d.setUTCDate(d.getUTCDate()+Number(n||0));
+  return d.toISOString().slice(0,10);
+}
 function cleanCode(v){ return String(v||'').trim(); }
 
 function hashPassword(password, salt=crypto.randomBytes(16).toString('hex')){
@@ -214,7 +224,7 @@ app.get('/sales',(req,res)=>res.redirect('/sales/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.4'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
