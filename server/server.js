@@ -93,7 +93,7 @@ function salesSafeSnapshot(snapshot,user){
       sellPrice:Number(r.sellPrice||0),saleDate:r.saleDate||'',requestedAt:r.requestedAt||'',
       salesId:r.salesId,salesName:r.salesName||user.name,commissionRate:Number(r.commissionRate??user.commission_rate??0),
       expectedCommission:Number(r.expectedCommission||0),status:r.status||'待確認',
-      rejectReason:r.rejectReason||'',rejectedAt:r.rejectedAt||'',confirmedAt:r.confirmedAt||''
+      rejectReason:r.rejectReason||'',rejectedAt:r.rejectedAt||'',confirmedAt:r.confirmedAt||'',cancelReason:r.cancelReason||'',canceledAt:r.canceledAt||''
     }));
   return {
     settings:{companyName:d.settings?.companyName||''},
@@ -214,7 +214,7 @@ app.get('/sales',(req,res)=>res.redirect('/sales/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.0'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -302,6 +302,31 @@ app.get('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
   }catch(e){ next(e); }
 });
 
+
+function validateSaleIntegrity(snapshot){
+  const d=snapshot&&typeof snapshot==='object'?snapshot:{};
+  const cars=Array.isArray(d.cars)?d.cars:[];
+  const reqs=Array.isArray(d.saleRequests)?d.saleRequests:[];
+  const carMap=new Map(cars.map(c=>[String(c.id),c]));
+  const pendingCount=new Map();
+  const completedCount=new Map();
+  for(const r of reqs){
+    if(!r?.carId)continue;
+    const k=String(r.carId);
+    if(r.status==='待確認')pendingCount.set(k,(pendingCount.get(k)||0)+1);
+    if(r.status==='已成交')completedCount.set(k,(completedCount.get(k)||0)+1);
+  }
+  for(const [k,n] of pendingCount){
+    if(n>1)return `同一台車不可同時存在 ${n} 筆待確認成交申請`;
+    const c=carMap.get(k);
+    if(c&&c.status==='已售')return '已售車輛不可仍有待確認成交申請';
+  }
+  for(const [k,n] of completedCount){
+    if(n>1)return `同一台車不可有 ${n} 筆已成交紀錄`;
+  }
+  return '';
+}
+
 app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
@@ -321,6 +346,8 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
     }
 
     const clean=JSON.parse(JSON.stringify(incoming));
+    const saleIntegrityError=validateSaleIntegrity(clean);
+    if(saleIntegrityError){await client.query('ROLLBACK');return res.status(409).json({error:saleIntegrityError,version:existing.version});}
     const users=Array.isArray(clean.users)?clean.users:[];
     const keep=new Set();
 
@@ -401,6 +428,130 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     try{ await client.query('ROLLBACK'); }catch{}
     next(e);
   }finally{ client.release(); }
+});
+
+
+// -------------------- Dealership admin sale workflow --------------------
+app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行後台可使用'});
+    const {carId,salesId,sellPrice,saleDate}=req.body||{};
+    await client.query('BEGIN');
+    const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
+    if(!lock.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'車行資料不存在'});}
+    const d=lock.rows[0].json||{};d.cars=Array.isArray(d.cars)?d.cars:[];d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
+    const c=d.cars.find(x=>String(x.id)===String(carId));
+    if(!c||c.status!=='在庫'){await client.query('ROLLBACK');return res.status(409).json({error:'此車已售或不存在，不能再次建立成交'});}
+    if(d.saleRequests.some(r=>String(r.carId)===String(c.id)&&r.status==='待確認')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有待確認成交申請，請直接處理原申請'});}
+    if(d.saleRequests.some(r=>String(r.carId)===String(c.id)&&r.status==='已成交')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有成交紀錄'});}
+    const ur=await client.query("SELECT * FROM users WHERE id=$1 AND company_id=$2 AND role='sales' AND enabled=TRUE",[salesId,req.auth.companyId]);
+    const u=ur.rows[0];if(!u){await client.query('ROLLBACK');return res.status(400).json({error:'業務帳號不存在或已停用'});}
+    const sell=Number(sellPrice||0);if(sell<=0){await client.query('ROLLBACK');return res.status(400).json({error:'售價錯誤'});}
+    const floor=Number(c.floorPrice||0),rate=Number(u.commission_rate||0);
+    const r={id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,carId:c.id,plate:c.plate,model:c.model,floorPrice:floor,sellPrice:sell,saleDate:saleDate||today(),requestedAt:today(),salesId:u.id,salesName:u.name,commissionRate:rate,expectedCommission:Math.max(0,sell-floor)*rate/100,status:'待確認',directByAdmin:true};
+    d.saleRequests.push(r);
+    const ver=Number(lock.rows[0].version||0)+1;
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d,request:r});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
+app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行後台可確認成交'});
+    const {requestId,transfer=0,fuel=0,license=0,other=0,otherName=''}=req.body||{};
+    await client.query('BEGIN');
+    const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
+    if(!lock.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'車行資料不存在'});}
+    const d=lock.rows[0].json||{};d.cars=Array.isArray(d.cars)?d.cars:[];d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
+    const r=d.saleRequests.find(x=>String(x.id)===String(requestId));
+    if(!r){await client.query('ROLLBACK');return res.status(404).json({error:'找不到成交申請'});}
+    if(r.status!=='待確認'){await client.query('ROLLBACK');return res.status(409).json({error:`此申請目前為「${r.status}」，不可重複確認`});}
+    const c=d.cars.find(x=>String(x.id)===String(r.carId));
+    if(!c){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車輛'});}
+    if(c.status!=='在庫'){await client.query('ROLLBACK');return res.status(409).json({error:'此車已完成成交，不可再次確認'});}
+    if(d.saleRequests.some(x=>String(x.carId)===String(c.id)&&x.status==='已成交')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有成交紀錄，不可重複成交'});}
+    const tr=Number(transfer||0),fu=Number(fuel||0),li=Number(license||0),ot=Number(other||0);
+    const commission=Math.max(0,Number(r.sellPrice||0)-Number(r.floorPrice||0))*Number(r.commissionRate||0)/100;
+    const extra=tr+fu+li+ot,totalCost=Number(c.totalCost||c.purchasePrice||0);
+    Object.assign(c,{status:'已售',outDate:r.saleDate,sellPrice:Number(r.sellPrice||0),salesId:r.salesId,salesName:r.salesName,commissionRate:Number(r.commissionRate||0),commissionAmount:commission,saleTransferFee:tr,saleFuelFee:fu,saleLicenseTax:li,saleOtherFee:ot,saleOtherFeeName:String(otherName||''),saleExtraCost:extra,companyProfit:Number(r.sellPrice||0)-totalCost-extra-commission});
+    Object.assign(r,{status:'已成交',finalCommission:commission,confirmedAt:today()});
+    // Defense in depth: there must never be another pending request for this sold car.
+    for(const x of d.saleRequests){
+      if(x.id!==r.id&&String(x.carId)===String(c.id)&&x.status==='待確認'){
+        x.status='已駁回';x.rejectReason='此車已由其他成交申請完成成交';x.rejectedAt=today();
+      }
+    }
+    const ver=Number(lock.rows[0].version||0)+1;
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
+app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行後台可取消已確認成交'});
+    const {carId,reason}=req.body||{};
+    const why=String(reason||'').trim();
+    if(!why)return res.status(400).json({error:'取消成交原因不可空白'});
+    await client.query('BEGIN');
+    const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
+    if(!lock.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'車行資料不存在'});}
+    const d=lock.rows[0].json||{};
+    d.cars=Array.isArray(d.cars)?d.cars:[];
+    d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
+    const c=d.cars.find(x=>String(x.id)===String(carId));
+    if(!c){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車輛'});}
+    if(c.status!=='已售'){await client.query('ROLLBACK');return res.status(409).json({error:'此車目前不是已售狀態，無法取消成交'});}
+    const completed=d.saleRequests
+      .filter(r=>String(r.carId)===String(c.id)&&r.status==='已成交')
+      .sort((a,b)=>String(b.confirmedAt||'').localeCompare(String(a.confirmedAt||'')));
+    if(completed.length!==1){
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:completed.length===0?'找不到此車的已成交申請紀錄':'此車存在多筆已成交紀錄，請先由系統管理員處理資料'});
+    }
+    const r=completed[0];
+    Object.assign(r,{
+      status:'成交已取消',
+      cancelReason:why,
+      canceledAt:today(),
+      canceledBy:req.auth.username||req.auth.sub,
+      previousConfirmedAt:r.confirmedAt||''
+    });
+    // 只清除「成交結果」欄位；進貨成本、底價、來源、照片、整備資料全部保留。
+    Object.assign(c,{
+      status:'在庫',outDate:'',sellPrice:0,salesId:'',salesName:'',commissionRate:0,commissionAmount:0,
+      saleTransferFee:0,saleFuelFee:0,saleLicenseTax:0,saleOtherFee:0,saleOtherFeeName:'',saleExtraCost:0,companyProfit:0
+    });
+    const ver=Number(lock.rows[0].version||0)+1;
+    const integrity=validateSaleIntegrity(d);
+    if(integrity){await client.query('ROLLBACK');return res.status(409).json({error:integrity});}
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('COMMIT');
+    res.json({ok:true,version:ver,snapshot:d,canceledRequestId:r.id});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
+app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行後台可駁回成交申請'});
+    const {requestId,reason}=req.body||{};if(!String(reason||'').trim())return res.status(400).json({error:'駁回原因不可空白'});
+    await client.query('BEGIN');
+    const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
+    if(!lock.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'車行資料不存在'});}
+    const d=lock.rows[0].json||{};d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
+    const r=d.saleRequests.find(x=>String(x.id)===String(requestId));
+    if(!r){await client.query('ROLLBACK');return res.status(404).json({error:'找不到成交申請'});}
+    if(r.status!=='待確認'){await client.query('ROLLBACK');return res.status(409).json({error:`此申請目前為「${r.status}」，不可再次處理`});}
+    r.status='已駁回';r.rejectReason=String(reason).trim();r.rejectedAt=today();
+    const ver=Number(lock.rows[0].version||0)+1;
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
 // -------------------- Super Admin cloud API --------------------
