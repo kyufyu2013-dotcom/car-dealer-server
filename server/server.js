@@ -3,8 +3,12 @@ import cors from 'cors';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 8787);
 const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_THIS_SECRET_BEFORE_DEPLOYING_0123456789';
@@ -70,6 +74,38 @@ function userDto(u){
     enabled:!!u.enabled
   };
 }
+
+function salesSafeSnapshot(snapshot,user){
+  const d=snapshot&&typeof snapshot==='object'?snapshot:{};
+  const cars=(Array.isArray(d.cars)?d.cars:[])
+    .filter(c=>c&&c.status==='在庫')
+    .map(c=>({
+      id:c.id,plate:c.plate||'',model:c.model||'',year:c.year||'',mileage:Number(c.mileage||0),
+      inDate:c.inDate||'',floorPrice:Number(c.floorPrice||0),status:'在庫',
+      inspectionStatus:c.inspectionStatus||'',
+      inspectionCertPhotos:Array.isArray(c.inspectionCertPhotos)?c.inspectionCertPhotos:[],
+      intakePhotos:Array.isArray(c.intakePhotos)?c.intakePhotos:[]
+    }));
+  const requests=(Array.isArray(d.saleRequests)?d.saleRequests:[])
+    .filter(r=>r&&String(r.salesId)===String(user.id))
+    .map(r=>({
+      id:r.id,carId:r.carId,plate:r.plate||'',model:r.model||'',floorPrice:Number(r.floorPrice||0),
+      sellPrice:Number(r.sellPrice||0),saleDate:r.saleDate||'',requestedAt:r.requestedAt||'',
+      salesId:r.salesId,salesName:r.salesName||user.name,commissionRate:Number(r.commissionRate??user.commission_rate??0),
+      expectedCommission:Number(r.expectedCommission||0),status:r.status||'待確認',
+      rejectReason:r.rejectReason||'',rejectedAt:r.rejectedAt||'',confirmedAt:r.confirmedAt||''
+    }));
+  return {
+    settings:{companyName:d.settings?.companyName||''},
+    users:[{...userDto(user),password:''}],
+    cars,
+    saleRequests:requests
+  };
+}
+function snapshotForUser(snapshot,user){
+  return user?.role==='sales'?salesSafeSnapshot(snapshot,user):snapshot;
+}
+
 function signUser(u){
   return jwt.sign(
     {sub:u.id,companyId:u.company_id,role:u.role,username:u.username},
@@ -172,11 +208,13 @@ function superAuth(req,res,next){
 const app=express();
 app.use(cors({origin:true,credentials:false}));
 app.use(express.json({limit:'30mb'}));
+app.use('/sales', express.static(path.join(__dirname,'public','sales')));
+app.get('/sales',(req,res)=>res.redirect('/sales/'));
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.1.0'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.2.0'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -242,7 +280,7 @@ app.post('/api/auth/login',async(req,res,next)=>{
     if(!u||!verifyPassword(password,u.password_hash))return res.status(401).json({error:'帳號或密碼錯誤'});
 
     const snap=await getSnapshot(companyCode);
-    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snap.snapshot,version:snap.version});
+    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
   }catch(e){ next(e); }
 });
 
@@ -251,14 +289,16 @@ app.get('/api/session/restore',auth,requireActiveCompany,async(req,res,next)=>{
     const u=await getUserById(req.auth.companyId,req.auth.sub);
     if(!u)return res.status(401).json({error:'帳號已失效'});
     const snap=await getSnapshot(req.auth.companyId);
-    res.json({company:companyDto(req.company),user:userDto(u),snapshot:snap.snapshot,version:snap.version});
+    res.json({company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
   }catch(e){ next(e); }
 });
 
 app.get('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
   try{
+    const u=await getUserById(req.auth.companyId,req.auth.sub);
+    if(!u)return res.status(401).json({error:'帳號已失效'});
     const snap=await getSnapshot(req.auth.companyId);
-    res.json({company:companyDto(req.company),snapshot:snap.snapshot,version:snap.version,updatedAt:snap.updatedAt});
+    res.json({company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,updatedAt:snap.updatedAt});
   }catch(e){ next(e); }
 });
 
@@ -356,7 +396,7 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     const ver=existing.version+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
     await client.query('COMMIT');
-    res.json({ok:true,version:ver,snapshot:d});
+    res.json({ok:true,version:ver,snapshot:salesSafeSnapshot(d,u)});
   }catch(e){
     try{ await client.query('ROLLBACK'); }catch{}
     next(e);
