@@ -286,7 +286,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.6',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.7',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -363,8 +363,7 @@ app.post('/api/auth/login',async(req,res,next)=>{
     if(!u||!verifyPassword(password,u.password_hash))return res.status(401).json({error:'帳號或密碼錯誤'});
 
     const snap=await getSnapshot(companyCode);
-    const nodeRow=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[companyCode])).rows[0];
-    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,nodeOnline:!!(nodeRow&&nodeOnline(nodeRow))});
+    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
   }catch(e){ next(e); }
 });
 
@@ -375,6 +374,14 @@ app.get('/api/session/restore',auth,requireActiveCompany,async(req,res,next)=>{
     const snap=await getSnapshot(req.auth.companyId);
     res.json({company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
   }catch(e){ next(e); }
+});
+
+
+app.get('/api/node/status',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    const n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    res.json({ok:true,online:!!(n&&nodeOnline(n)),lastSeenAt:n?.last_seen_at||null});
+  }catch(e){next(e)}
 });
 
 app.get('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
@@ -736,7 +743,7 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 
 // Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
-const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle']);
+const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle','salesInventory']);
 function nodeOnline(row,maxAgeMs=45000){
   const t=Date.parse(row?.last_seen_at||'');
   return Number.isFinite(t)&&(Date.now()-t)<=maxAgeMs;
@@ -876,6 +883,48 @@ app.get('/api/sales/node-photo-requests/:id',auth,requireActiveCompany,async(req
     }
     if(r.status==='failed'){
       const err=r.error_text||'車行主機讀取照片失敗';
+      await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);
+      return res.json({requestId:r.id,status:'failed',error:err});
+    }
+    res.json({requestId:r.id,status:r.status,expiresAt:r.expires_at});
+  }catch(e){next(e)}
+});
+
+
+app.post('/api/sales/node-inventory/request',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    await cleanupNodeRequests();
+    if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
+    const n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    if(!n||!nodeOnline(n))return res.status(409).json({error:'車行主機目前離線'});
+    const id=`sinv_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+    const requestedAt=now(),expiresAt=new Date(Date.now()+60000).toISOString();
+    const payload={requesterSalesId:String(req.auth.sub)};
+    await pool.query(`INSERT INTO dealer_node_requests(id,company_id,node_id,resource,payload,status,requested_at,expires_at)
+      VALUES($1,$2,$3,'salesInventory',$4::jsonb,'queued',$5,$6)`,
+      [id,req.auth.companyId,n.node_id,JSON.stringify(payload),requestedAt,expiresAt]);
+    res.json({ok:true,requestId:id,status:'queued',expiresAt});
+  }catch(e){next(e)}
+});
+
+app.get('/api/sales/node-inventory-requests/:id',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
+    const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
+    const r=rows[0];
+    if(!r||r.resource!=='salesInventory'||String(r.payload?.requesterSalesId||'')!==String(req.auth.sub))
+      return res.status(404).json({error:'庫存請求不存在'});
+    if(Date.parse(r.expires_at)<Date.now() && !['completed','failed'].includes(r.status)){
+      await pool.query("UPDATE dealer_node_requests SET status='expired',error_text='Node request timeout' WHERE id=$1",[r.id]);
+      return res.json({requestId:r.id,status:'expired',error:'車行主機回應逾時'});
+    }
+    if(r.status==='completed'){
+      const result=r.result_json;
+      await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);
+      return res.json({requestId:r.id,status:'completed',result});
+    }
+    if(r.status==='failed'){
+      const err=r.error_text||'車行主機讀取庫存失敗';
       await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);
       return res.json({requestId:r.id,status:'failed',error:err});
     }
