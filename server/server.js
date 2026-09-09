@@ -286,7 +286,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.4',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.5',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -787,8 +787,8 @@ app.post('/api/sales/node-photo/request',auth,requireActiveCompany,async(req,res
     const index=Number(req.body?.index);
     if(!carId||!Number.isInteger(index)||index<0)return res.status(400).json({error:'照片參數不正確'});
 
-    const snapRow=(await pool.query('SELECT data FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0];
-    const snap=snapRow?.data||{};
+    const snapRow=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    const snap=snapRow?.json||{};
     const car=(Array.isArray(snap.cars)?snap.cars:[]).find(c=>String(c?.id)===carId && c?.status==='在庫');
     if(!car)return res.status(404).json({error:'找不到可供業務查看的在庫車輛'});
     const count=kind==='inspection'?Number(car.inspectionPhotoCount||0):Number(car.intakePhotoCount||0);

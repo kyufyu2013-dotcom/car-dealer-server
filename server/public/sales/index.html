@@ -59,7 +59,7 @@ function openCarPhotos(carId){
  let c=(data.cars||[]).find(x=>String(x.id)===String(carId));if(!c)return;
  let a=Number(c.intakePhotoCount||0),b=Number(c.inspectionPhotoCount||0);
  const buttons=(kind,count,label)=>count?`<div class="field"><label>${label}（${count} 張）</label><div>${Array.from({length:count},(_,i)=>`<button id="salesPhoto_${kind}_${i}" class="btn ghost" style="margin:4px" onclick="loadSalesPhoto('${esc(carId)}','${kind}',${i})">📷 第 ${i+1} 張</button>`).join('')}</div></div>`:`<div class="muted">${label}：沒有照片</div>`;
- $('modal').innerHTML=`<h2>${esc(c.plate)}｜${esc(c.model)}</h2><div class="notice">照片保存在車行主機。你點哪一張，系統才即時向 Dealer Node 讀取哪一張；中央資料庫不永久保存照片。</div>${buttons('intake',a,'入庫照片')}${buttons('inspection',b,'檢驗證照片')}<div class="row"><button class="btn ghost full" onclick="closeModal()">關閉</button></div>`;
+ $('modal').innerHTML=`<h2>${esc(c.plate)}｜${esc(c.model)}</h2>${buttons('intake',a,'入庫照片')}${buttons('inspection',b,'檢驗證照片')}<div class="row"><button class="btn ghost full" onclick="closeModal()">關閉</button></div>`;
  $('modalBg').classList.add('show');
 }
 async function loadSalesPhoto(carId,kind,index){
@@ -95,5 +95,5 @@ function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===Strin
 async function submitApply(carId){let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');try{let j=await api('/sales/request',{method:'POST',body:JSON.stringify({carId,sellPrice:sell,saleDate:date})});data=j.snapshot||data;version=Number(j.version||version);closeModal();showPage('requests');alert('成交申請已送出，等待車行後台確認。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>token?sync():health());window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.2',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
+(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.3',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>
