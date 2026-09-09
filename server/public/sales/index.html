@@ -23,74 +23,73 @@ linear-gradient(180deg,rgba(255,255,255,.03),transparent 18%,transparent 78%,rgb
 @media(max-width:520px){.login{background-position:38% center;background-attachment:scroll}.techSide{display:none}.login{padding-top:10px}.loginHero{padding-top:28px}.brandName{font-size:38px}.brandSub{font-size:13px}.brandTag{font-size:11px}.loginCard{padding:24px 17px 19px;border-radius:24px}.loginTitle{font-size:24px}.loginRow{height:53px}.loginRow input{height:49px}.login .primary{height:53px}.loginFeatures{margin-top:21px}.loginFeatures b{font-size:22px}.finalSlogan{font-size:21px}}
 .card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 8px 28px #00000012}.brand{font-size:28px;font-weight:900;margin-bottom:4px}.muted{color:#64748b;font-size:13px}.field{margin:12px 0}.field label{display:block;font-weight:700;font-size:13px;margin-bottom:6px}input{width:100%;padding:13px;border:1px solid #cbd5e1;border-radius:12px;background:#fff}.btn{border:0;border-radius:11px;padding:11px 14px;cursor:pointer;font-weight:800}.primary{background:#111827;color:#fff}.full{width:100%}.ghost{background:#e8edf4;color:#111827}.dangerBtn{background:#fee2e2;color:#991b1b}.top{position:sticky;top:0;z-index:5;background:#f3f6fbdd;backdrop-filter:blur(10px);padding:10px 0;display:flex;justify-content:space-between;gap:10px;align-items:center}.badge{font-size:12px;padding:6px 10px;border-radius:999px;background:#dcfce7;color:#166534;white-space:nowrap}.badge.off{background:#fee2e2;color:#991b1b}.search{margin:10px 0}.car{border:1px solid #e2e8f0;border-radius:15px;padding:14px;margin:10px 0;background:#fff}.carhead{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.plate{font-size:18px;font-weight:900}.price{font-size:21px;font-weight:900;margin:8px 0}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.thumbs{display:flex;gap:8px;overflow:auto;margin-top:10px}.thumbs img{width:88px;height:66px;object-fit:cover;border-radius:10px;border:1px solid #e2e8f0;cursor:pointer}.tabs{position:sticky;bottom:0;display:grid;grid-template-columns:1fr 1fr 1fr 72px;gap:8px;background:#f3f6fb;padding:10px 0 calc(10px + env(safe-area-inset-bottom))}.tabs button{border:0;border-radius:12px;padding:12px;background:#e2e8f0;font-weight:800}.tabs button.active{background:#111827;color:#fff}.status{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px}.pending{background:#fef3c7;color:#92400e}.approved{background:#dcfce7;color:#166534}.rejected{background:#fee2e2;color:#991b1b}.notice{padding:11px;border-radius:11px;margin:10px 0;background:#eff6ff;color:#1e40af}.error{background:#fef2f2;color:#991b1b}.modalBg{position:fixed;inset:0;background:#0009;display:none;align-items:flex-end;justify-content:center;z-index:30;padding:0}.modalBg.show{display:flex}.modal{background:#fff;width:min(620px,100%);max-height:90vh;overflow:auto;border-radius:22px 22px 0 0;padding:18px}.modal h2{margin-top:0}.imageBg{position:fixed;inset:0;background:#000d;display:none;place-items:center;z-index:40;padding:20px}.imageBg.show{display:grid}.imageBg img{max-width:100%;max-height:92vh;border-radius:10px}.kpi{display:grid;grid-template-columns:1fr 1fr;gap:10px}.kpi>div{background:#f8fafc;border-radius:12px;padding:10px}.big{font-size:20px;font-weight:900}@media(min-width:760px){.modalBg{align-items:center;padding:20px}.modal{border-radius:20px}.cardsGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.car{margin:0}}
 .photoLoading{width:78px;height:62px;border:1px solid rgba(88,163,221,.35);border-radius:10px;background:rgba(4,18,33,.66);display:flex;align-items:center;justify-content:center;color:#9fb5c9;font-size:11px;text-align:center;padding:4px}.photoLoading.photoOffline{color:#ffb4bd;border-color:rgba(255,100,122,.28)}</style></head><body>
-<div id="loginPage" class="login"><div class="techSide left">SPEED<br>DATA<br>PEOPLE<br>RESULTS<span class="dash"></span>MORE THAN<br>A DEAL</div><div class="techSide right">DRIVE<br>YOUR<br>SUCCESS<br><br>CARS<br>PEOPLE<br>OPPORTUNITY</div><div class="wrap"><div class="loginVersion">v2.4.7</div><div class="loginHero"><div class="carLine"><span class="wheel w1"></span><span class="wheel w2"></span></div><div class="brandName">庫車掌盤</div><div class="brandSub">CAR DEALER CRM</div><div class="brandTag">業績・從每一次出發開始</div></div><div class="loginCard"><div class="loginTitle">歡迎回來</div><div class="loginHint">登入您的業務帳號</div><div class="loginRow"><span class="ico">◇</span><input id="companyCode" autocomplete="organization" placeholder="車行代碼" aria-label="車行代碼"></div><div class="loginRow"><span class="ico">♙</span><input id="username" autocomplete="username" placeholder="業務帳號" aria-label="業務帳號"></div><div class="loginRow"><span class="ico">▣</span><input id="password" type="password" autocomplete="current-password" placeholder="密碼" aria-label="密碼"><button class="eyeBtn" type="button" onclick="togglePassword()" aria-label="顯示或隱藏密碼">◉</button></div><div class="loginMeta"><span class="rememberDot">保持登入</span><button type="button" onclick="alert('忘記密碼請聯絡車行管理員協助重設。')">忘記密碼？</button></div><button id="loginBtn" class="btn primary full" onclick="doLogin()">登入　→</button><div id="netState" class="notice">正在檢查中央伺服器…</div></div><div class="loginFeatures"><div><b>▥</b>即時掌握業績</div><div><b>♧</b>客戶隨身管理</div><div><b>▯</b>行動成交更快</div></div><div class="englishLine">GOOD CARS ・ GOOD PEOPLE ・ A BRIGHTER TOMORROW</div><div class="finalSlogan">讓好車，走向更多人</div></div></div>
+<div id="loginPage" class="login"><div class="techSide left">SPEED<br>DATA<br>PEOPLE<br>RESULTS<span class="dash"></span>MORE THAN<br>A DEAL</div><div class="techSide right">DRIVE<br>YOUR<br>SUCCESS<br><br>CARS<br>PEOPLE<br>OPPORTUNITY</div><div class="wrap"><div class="loginVersion">v2.4.8</div><div class="loginHero"><div class="carLine"><span class="wheel w1"></span><span class="wheel w2"></span></div><div class="brandName">庫車掌盤</div><div class="brandSub">CAR DEALER CRM</div><div class="brandTag">業績・從每一次出發開始</div></div><div class="loginCard"><div class="loginTitle">歡迎回來</div><div class="loginHint">登入您的業務帳號</div><div class="loginRow"><span class="ico">◇</span><input id="companyCode" autocomplete="organization" placeholder="車行代碼" aria-label="車行代碼"></div><div class="loginRow"><span class="ico">♙</span><input id="username" autocomplete="username" placeholder="業務帳號" aria-label="業務帳號"></div><div class="loginRow"><span class="ico">▣</span><input id="password" type="password" autocomplete="current-password" placeholder="密碼" aria-label="密碼"><button class="eyeBtn" type="button" onclick="togglePassword()" aria-label="顯示或隱藏密碼">◉</button></div><div class="loginMeta"><span class="rememberDot">保持登入</span><button type="button" onclick="alert('忘記密碼請聯絡車行管理員協助重設。')">忘記密碼？</button></div><button id="loginBtn" class="btn primary full" onclick="doLogin()">登入　→</button><div id="netState" class="notice">正在檢查中央伺服器…</div></div><div class="loginFeatures"><div><b>▥</b>即時掌握業績</div><div><b>♧</b>客戶隨身管理</div><div><b>▯</b>行動成交更快</div></div><div class="englishLine">GOOD CARS ・ GOOD PEOPLE ・ A BRIGHTER TOMORROW</div><div class="finalSlogan">讓好車，走向更多人</div></div></div>
 <div id="app" class="hidden"><div class="wrap"><div class="top"><div><b id="who"></b><div class="muted" id="shop"></div></div><div class="row"><button class="btn ghost" onclick="openAccountSettings()">⚙ 帳號設定</button><span id="cloud" class="badge">☁ 中央已連線</span><span id="dealerNode" class="badge off">● 車行主機檢查中</span></div></div><div id="bonusSummary"></div><div id="page"></div><div class="tabs"><button id="tabCars" onclick="showPage('cars')">🚙 庫存</button><button id="tabReq" onclick="showPage('requests')">📝 我的申請</button><button onclick="openAccountSettings()">⚙ 帳號設定</button><button onclick="logout()">登出</button></div></div></div>
 <div id="modalBg" class="modalBg" onclick="if(event.target===this)closeModal()"><div id="modal" class="modal"></div></div><div id="imageBg" class="imageBg" onclick="closeImage()"><img id="bigImage"></div>
 <script>
-const API='/api';const SESSION='carDealerSalesWebSession_v8_4';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null;
+const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={};
 const $=id=>document.getElementById(id);const money=n=>'NT$ '+Number(n||0).toLocaleString('zh-TW');const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const rate=v=>{let n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')};
 async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})};let r=await fetch(API+path,opt);let j={};try{j=await r.json()}catch{};if((r.status===401||r.status===403)&&token){logout(j.error||'登入或授權已失效');throw new Error(j.error||'授權失效')}if(!r.ok)throw new Error(j.error||'操作失敗');return j}
 function togglePassword(){const p=$('password');if(!p)return;p.type=p.type==='password'?'text':'password'}
 async function health(){try{let r=await fetch(API+'/health',{cache:'no-store'});if(!r.ok)throw 0;$('netState').className='notice';$('netState').textContent='🟢 中央伺服器連線正常';return true}catch{$('netState').className='notice error';$('netState').textContent='🔴 無法連線。沒有網路或伺服器離線時不能登入';return false}}
-async function checkLoginNodeStatus(silent=false){
- const code=($('companyCode')?.value||'').trim(),el=$('nodeState');
- if(!el)return {known:false,online:false};
- if(!code){el.className='notice';el.textContent='⚪ 輸入車行代碼查看主機狀態';return {known:false,online:false}}
- try{
-   el.className='notice';el.textContent='🟡 正在檢查車行主機…';
-   const r=await fetch(API+'/public/node-status?companyCode='+encodeURIComponent(code),{cache:'no-store'});
-   const j=await r.json();
-   if(!j.known){el.className='notice error';el.textContent='⚪ 找不到此車行代碼';return j}
-   nodeIsOnline=!!j.online;
-   if(j.online){el.className='notice';el.textContent='🟢 車行主機已連線'}
-   else{el.className='notice error';el.textContent='🔴 車行主機離線'}
-   return j;
- }catch(e){if(!silent){el.className='notice error';el.textContent='⚪ 無法取得車行主機狀態'}return {known:false,online:false}}
-}
-function scheduleLoginNodeStatus(){clearTimeout(nodeStatusTimer);nodeStatusTimer=setTimeout(()=>checkLoginNodeStatus(true),350)}
-
 async function doLogin(){if(!(await health()))return;let b=$('loginBtn');b.disabled=true;b.textContent='登入中…';try{let j=await api('/auth/login',{method:'POST',body:JSON.stringify({companyCode:$('companyCode').value.trim(),username:$('username').value.trim(),password:$('password').value})});if(j.user?.role!=='sales')throw new Error('這個入口只允許業務帳號登入');token=j.token;me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);saveSession();enter();await refreshNodeStateAndInventory(true)}catch(e){alert(e.message)}finally{b.disabled=false;b.textContent='登入'}}
 function saveSession(){if(token)localStorage.setItem(SESSION,JSON.stringify({token,page:currentPage}))}
 
 async function fetchNodeInventory(){
- const q=await api('/sales/node-inventory/request',{method:'POST',body:'{}'});
- const deadline=Date.now()+65000;
- while(Date.now()<deadline){
-   await new Promise(r=>setTimeout(r,550));
-   const rr=await api('/sales/node-inventory-requests/'+encodeURIComponent(q.requestId));
-   if(rr.status==='completed')return Array.isArray(rr.result?.cars)?rr.result.cars:[];
-   if(rr.status==='failed'||rr.status==='expired')throw new Error(rr.error||'庫存讀取失敗');
- }
- throw new Error('車行主機回應逾時');
+ if(nodeInventoryBusy)return null;
+ nodeInventoryBusy=true;
+ try{
+   const q=await api('/sales/node-inventory/request',{method:'POST',body:'{}'});
+   const deadline=Date.now()+20000;
+   while(Date.now()<deadline){
+     await new Promise(r=>setTimeout(r,450));
+     const rr=await api('/sales/node-inventory-requests/'+encodeURIComponent(q.requestId));
+     if(rr.status==='completed')return Array.isArray(rr.result?.cars)?rr.result.cars:[];
+     if(rr.status==='failed'||rr.status==='expired')throw new Error(rr.error||'庫存讀取失敗');
+   }
+   throw new Error('車行主機回應逾時');
+ }finally{nodeInventoryBusy=false}
 }
-async function refreshNodeStateAndInventory(showLoginAlert=false){
- const badge=$('dealerNode');
+function setDealerNodeBadge(state,text){
+ const badge=$('dealerNode');if(!badge)return;
+ badge.className=state==='on'?'badge':state==='checking'?'badge':'badge off';
+ badge.textContent=text;
+}
+async function refreshNodeStatus(showOfflineAlert=false){
+ if(!token)return false;
  try{
    const ns=await api('/node/status');
-   nodeIsOnline=!!ns.online;
-   if(badge){
-     badge.className=nodeIsOnline?'badge':'badge off';
-     badge.textContent=nodeIsOnline?'● 車行主機已連線':'● 車行主機離線';
-   }
-   if(!nodeIsOnline){
-     if(showLoginAlert)alert('⚠ 車行主機離線中，照片無法讀取。');
-     render();
-     return;
-   }
-   try{
-     const cars=await fetchNodeInventory();
-     data={...(data||{}),cars};
-     salesPhotoCache={};
-     render();
-   }catch(e){
-     if(badge){badge.className='badge off';badge.textContent='● 車行主機讀取失敗'}
-   }
+   const online=!!ns.online;
+   const changed=lastNodeOnline!==online;
+   nodeIsOnline=online;lastNodeOnline=online;
+   setDealerNodeBadge(online?'on':'off',online?'● 車行主機已連線':'● 車行主機離線');
+   if(!online&&changed&&showOfflineAlert)alert('⚠ 車行主機離線中，照片無法讀取。');
+   if(online&&changed){salesPhotoCache={};salesPhotoLoading={};setTimeout(refreshNodeInventory,0)}
+   return online;
  }catch(e){
    nodeIsOnline=false;
-   if(badge){badge.className='badge off';badge.textContent='● 車行主機狀態未知'}
+   setDealerNodeBadge('off','● 車行主機狀態未知');
+   return false;
  }
 }
-function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;showPage(currentPage||'cars');clearInterval(timer);timer=setInterval(sync,3000)}
+async function refreshNodeInventory(){
+ if(!token||!nodeIsOnline||nodeInventoryBusy)return;
+ try{
+   const cars=await fetchNodeInventory();
+   if(cars===null)return;
+   data={...(data||{}),cars};
+   salesPhotoCache={};salesPhotoLoading={};
+   render();
+ }catch(e){
+   setDealerNodeBadge('off','● 車行主機讀取失敗');
+ }
+}
+async function refreshNodeStateAndInventory(showLoginAlert=false){
+ setDealerNodeBadge('checking','● 車行主機檢查中');
+ const online=await refreshNodeStatus(showLoginAlert);
+ if(online)await refreshNodeInventory();
+}
+function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;setDealerNodeBadge('checking','● 車行主機檢查中');showPage(currentPage||'cars');clearInterval(timer);clearInterval(nodeTimer);timer=setInterval(sync,5000);nodeTimer=setInterval(()=>refreshNodeStatus(false),2000)}
 function openAccountSettings(){
  $('modal').innerHTML=`<h2>⚙ 帳號設定</h2><div class="notice">${esc(me?.name||'')}｜${esc(me?.username||'')}<br>你可以在這裡修改自己的登入密碼。</div><div class="field"><label>目前密碼</label><input id="currentPw" type="password" autocomplete="current-password" placeholder="輸入目前密碼"></div><div class="field"><label>新密碼</label><input id="newPw" type="password" autocomplete="new-password" placeholder="至少 6 碼"></div><div class="field"><label>再次輸入新密碼</label><input id="newPw2" type="password" autocomplete="new-password" placeholder="再次輸入新密碼"></div><div class="row"><button id="changePwBtn" class="btn primary" style="flex:1" onclick="changeMyPassword()">確認修改密碼</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
  $('modalBg').classList.add('show');setTimeout(()=>$('currentPw')?.focus(),50)
@@ -101,10 +100,10 @@ async function changeMyPassword(){
  const b=$('changePwBtn');if(b){b.disabled=true;b.textContent='修改中…'}
  try{await api('/account/change-password',{method:'POST',body:JSON.stringify({currentPassword,newPassword})});alert('密碼修改成功，請使用新密碼重新登入');closeModal();logout()}catch(e){alert(e.message||'修改密碼失敗');if(b){b.disabled=false;b.textContent='確認修改密碼'}}
 }
-function logout(msg=''){clearInterval(timer);timer=null;token='';me=null;company=null;nodeIsOnline=false;data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
+function logout(msg=''){clearInterval(timer);clearInterval(nodeTimer);timer=null;nodeTimer=null;token='';me=null;company=null;nodeIsOnline=false;lastNodeOnline=null;nodeInventoryBusy=false;salesPhotoCache={};salesPhotoLoading={};data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
 async function restore(){let s;try{s=JSON.parse(localStorage.getItem(SESSION))}catch{};if(!s?.token)return false;token=s.token;currentPage=s.page||'cars';try{let j=await api('/session/restore');if(j.user?.role!=='sales')throw new Error('角色不符');me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);enter();await refreshNodeStateAndInventory(false);return true}catch{token='';localStorage.removeItem(SESSION);return false}}
-async function sync(){if(!token)return;try{let j=await api('/company/snapshot');$('cloud').className='badge';$('cloud').textContent='☁ 中央已連線';company=j.company||company;if(j.user)me=j.user;if(Number(j.version||0)!==version){version=Number(j.version||0);const keepCars=data?.cars||[];data=j.snapshot||data;if(keepCars.length)data.cars=keepCars;render()}refreshNodeStateAndInventory(false)}catch(e){if(token){$('cloud').className='badge off';$('cloud').textContent='🔴 中央離線'}}}
-function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');render()}
+async function sync(){if(!token)return;try{let j=await api('/company/snapshot');$('cloud').className='badge';$('cloud').textContent='☁ 中央已連線';company=j.company||company;if(j.user)me=j.user;if(Number(j.version||0)!==version){version=Number(j.version||0);const keepCars=data?.cars||[];data=j.snapshot||data;data.cars=keepCars;render()}}catch(e){if(token){$('cloud').className='badge off';$('cloud').textContent='🔴 中央離線'}}}
+function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');render();if(p==='cars'&&nodeIsOnline)setTimeout(refreshNodeInventory,0)}
 function carPhotos(c){
  let legacy=[...(c.intakePhotos||[]),...(c.inspectionCertPhotos||[])];
  if(legacy.length)return `<div class="thumbs">${legacy.slice(0,8).map(x=>`<img src="${x}" onclick="openImage(this.src)">`).join('')}</div>`;
@@ -159,5 +158,5 @@ function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===Strin
 async function submitApply(carId){let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');try{let j=await api('/sales/request',{method:'POST',body:JSON.stringify({carId,sellPrice:sell,saleDate:date})});data=j.snapshot||data;version=Number(j.version||version);closeModal();showPage('requests');alert('成交申請已送出，等待車行後台確認。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>token?sync():health());window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.5',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
+(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.6',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>
