@@ -49,7 +49,41 @@ function logout(msg=''){clearInterval(timer);timer=null;token='';me=null;company
 async function restore(){let s;try{s=JSON.parse(localStorage.getItem(SESSION))}catch{};if(!s?.token)return false;token=s.token;currentPage=s.page||'cars';try{let j=await api('/session/restore');if(j.user?.role!=='sales')throw new Error('角色不符');me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);enter();return true}catch{token='';localStorage.removeItem(SESSION);return false}}
 async function sync(){if(!token)return;try{let j=await api('/company/snapshot');$('cloud').className='badge';$('cloud').textContent='☁ 已同步';company=j.company||company;if(j.user)me=j.user;if(Number(j.version||0)!==version){version=Number(j.version||0);data=j.snapshot||data;render()}}catch(e){if(token){$('cloud').className='badge off';$('cloud').textContent='🔴 離線'}}}
 function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');render()}
-function carPhotos(c){let p=[...(c.intakePhotos||[]),...(c.inspectionCertPhotos||[])];return p.length?`<div class="thumbs">${p.slice(0,8).map(x=>`<img src="${x}" onclick="openImage(this.src)">`).join('')}</div>`:''}
+function carPhotos(c){
+ let legacy=[...(c.intakePhotos||[]),...(c.inspectionCertPhotos||[])];
+ if(legacy.length)return `<div class="thumbs">${legacy.slice(0,8).map(x=>`<img src="${x}" onclick="openImage(this.src)">`).join('')}</div>`;
+ let n=Number(c.intakePhotoCount||0)+Number(c.inspectionPhotoCount||0);
+ return n?`<button class="btn ghost full" style="margin-top:10px" onclick="openCarPhotos('${esc(c.id)}')">📷 查看照片（${n} 張）</button>`:`<div class="muted" style="margin-top:8px">尚無照片</div>`;
+}
+function openCarPhotos(carId){
+ let c=(data.cars||[]).find(x=>String(x.id)===String(carId));if(!c)return;
+ let a=Number(c.intakePhotoCount||0),b=Number(c.inspectionPhotoCount||0);
+ const buttons=(kind,count,label)=>count?`<div class="field"><label>${label}（${count} 張）</label><div>${Array.from({length:count},(_,i)=>`<button id="salesPhoto_${kind}_${i}" class="btn ghost" style="margin:4px" onclick="loadSalesPhoto('${esc(carId)}','${kind}',${i})">📷 第 ${i+1} 張</button>`).join('')}</div></div>`:`<div class="muted">${label}：沒有照片</div>`;
+ $('modal').innerHTML=`<h2>${esc(c.plate)}｜${esc(c.model)}</h2><div class="notice">照片保存在車行主機。你點哪一張，系統才即時向 Dealer Node 讀取哪一張；中央資料庫不永久保存照片。</div>${buttons('intake',a,'入庫照片')}${buttons('inspection',b,'檢驗證照片')}<div class="row"><button class="btn ghost full" onclick="closeModal()">關閉</button></div>`;
+ $('modalBg').classList.add('show');
+}
+async function loadSalesPhoto(carId,kind,index){
+ const b=$(`salesPhoto_${kind}_${index}`);if(b){b.disabled=true;b.textContent='讀取中…'}
+ try{
+   const q=await api('/sales/node-photo/request',{method:'POST',body:JSON.stringify({carId,kind,index})});
+   const deadline=Date.now()+65000;
+   while(Date.now()<deadline){
+     await new Promise(r=>setTimeout(r,650));
+     const r=await api('/sales/node-photo-requests/'+encodeURIComponent(q.requestId));
+     if(r.status==='completed'){
+       if(!r.result?.src)throw new Error('車行主機沒有回傳照片');
+       openImage(r.result.src);
+       if(b){b.disabled=false;b.textContent=`📷 第 ${index+1} 張`}
+       return;
+     }
+     if(r.status==='failed'||r.status==='expired')throw new Error(r.error||'照片讀取失敗');
+   }
+   throw new Error('照片讀取逾時');
+ }catch(e){
+   if(b){b.disabled=false;b.textContent=`📷 第 ${index+1} 張`}
+   alert(e.message||'照片讀取失敗');
+ }
+}
 function monthlyBonusInfo(){let mk=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'}).slice(0,7),rs=(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk),bonus=rs.reduce((sum,r)=>sum+Number((r.finalCommission??r.expectedCommission)||0),0);return {mk,rs,bonus}}
 function renderBonusSummary(){let x=monthlyBonusInfo(),el=$('bonusSummary');if(!el)return;el.innerHTML=`<div class="card"><div class="muted">💰 本月目前獎金</div><div class="big" style="font-size:30px;margin-top:4px">${money(x.bonus)}</div><div class="muted" style="margin-top:6px">本月已確認成交 ${x.rs.length} 台</div></div>`}
 function render(){renderBonusSummary();if(currentPage==='cars')renderCars();else renderRequests()}
@@ -61,5 +95,5 @@ function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===Strin
 async function submitApply(carId){let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');try{let j=await api('/sales/request',{method:'POST',body:JSON.stringify({carId,sellPrice:sell,saleDate:date})});data=j.snapshot||data;version=Number(j.version||version);closeModal();showPage('requests');alert('成交申請已送出，等待車行後台確認。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>token?sync():health());window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=8.8',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
+(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.2',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>
