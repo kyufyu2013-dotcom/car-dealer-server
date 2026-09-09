@@ -115,6 +115,19 @@ function salesSafeSnapshot(snapshot,user){
     saleRequests:requests
   };
 }
+function cloudOperationalSnapshot(snapshot){
+  const d=JSON.parse(JSON.stringify(snapshot||{}));
+  d.cars=(Array.isArray(d.cars)?d.cars:[]).map(c=>{
+    const x={...c};
+    // Phase 3: these fields are Dealer Node local-only and are never persisted in PostgreSQL snapshots.
+    for(const k of ['purchasePrice','costs','totalCost','source','sourceNote','inspectionCertPhotos','intakePhotos','companyProfit','saleTransferFee','saleFuelFee','saleLicenseTax','saleOtherFee','saleOtherFeeName','saleExtraCost']) delete x[k];
+    return x;
+  });
+  // Detailed operation/salary history is authoritative on the Dealer Node.
+  delete d.operationLogs;
+  delete d.salaryHistory;
+  return d;
+}
 function snapshotForUser(snapshot,user){
   return user?.role==='sales'?salesSafeSnapshot(snapshot,user):snapshot;
 }
@@ -269,7 +282,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.1'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.2',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -439,7 +452,7 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       INSERT INTO snapshots(company_id,version,json,updated_at)
       VALUES($1,$2,$3::jsonb,$4)
       ON CONFLICT(company_id) DO UPDATE SET version=EXCLUDED.version,json=EXCLUDED.json,updated_at=EXCLUDED.updated_at
-    `,[req.auth.companyId,ver,JSON.stringify(clean),now()]);
+    `,[req.auth.companyId,ver,JSON.stringify(cloudOperationalSnapshot(clean)),now()]);
     await client.query('COMMIT');
     res.json({ok:true,version:ver});
   }catch(e){
@@ -505,7 +518,7 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
       commissionRate:rate,expectedCommission:Math.max(0,sell-floor)*rate/100,status:'待確認'
     });
     const ver=existing.version+1;
-    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
     res.json({ok:true,version:ver,snapshot:salesSafeSnapshot(d,u)});
   }catch(e){
@@ -536,7 +549,7 @@ app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,re
     const r={id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,carId:c.id,plate:c.plate,model:c.model,floorPrice:floor,sellPrice:sell,saleDate:saleDate||today(),requestedAt:today(),salesId:u.id,salesName:u.name,commissionRate:rate,expectedCommission:Math.max(0,sell-floor)*rate/100,status:'待確認',directByAdmin:true};
     d.saleRequests.push(r);
     const ver=Number(lock.rows[0].version||0)+1;
-    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d,request:r});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
@@ -545,7 +558,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
   const client=await pool.connect();
   try{
     if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行後台可確認成交'});
-    const {requestId,transfer=0,fuel=0,license=0,other=0,otherName=''}=req.body||{};
+    const {requestId,transfer=0,fuel=0,license=0,other=0,otherName='',localTotalCost=0}=req.body||{};
     await client.query('BEGIN');
     const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
     if(!lock.rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'車行資料不存在'});}
@@ -559,7 +572,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
     if(d.saleRequests.some(x=>String(x.carId)===String(c.id)&&x.status==='已成交')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有成交紀錄，不可重複成交'});}
     const tr=Number(transfer||0),fu=Number(fuel||0),li=Number(license||0),ot=Number(other||0);
     const commission=Math.max(0,Number(r.sellPrice||0)-Number(r.floorPrice||0))*Number(r.commissionRate||0)/100;
-    const extra=tr+fu+li+ot,totalCost=Number(c.totalCost||c.purchasePrice||0);
+    const extra=tr+fu+li+ot,totalCost=Math.max(0,Number(localTotalCost||0));
     Object.assign(c,{status:'已售',outDate:r.saleDate,sellPrice:Number(r.sellPrice||0),salesId:r.salesId,salesName:r.salesName,commissionRate:Number(r.commissionRate||0),commissionAmount:commission,saleTransferFee:tr,saleFuelFee:fu,saleLicenseTax:li,saleOtherFee:ot,saleOtherFeeName:String(otherName||''),saleExtraCost:extra,companyProfit:Number(r.sellPrice||0)-totalCost-extra-commission});
     Object.assign(r,{status:'已成交',finalCommission:commission,confirmedAt:now()});
     d.operationLogs=Array.isArray(d.operationLogs)?d.operationLogs:[];
@@ -571,7 +584,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
       }
     }
     const ver=Number(lock.rows[0].version||0)+1;
-    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
@@ -617,7 +630,7 @@ app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=
     const ver=Number(lock.rows[0].version||0)+1;
     const integrity=validateSaleIntegrity(d);
     if(integrity){await client.query('ROLLBACK');return res.status(409).json({error:integrity});}
-    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
     res.json({ok:true,version:ver,snapshot:d,canceledRequestId:r.id});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
@@ -639,7 +652,7 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
     d.operationLogs=Array.isArray(d.operationLogs)?d.operationLogs:[];
     d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'駁回成交申請',carId:r.carId,plate:r.plate||'',requestId:r.id,reason:r.rejectReason,operatedAt:r.rejectedAt,operatedBy:req.auth.username||req.auth.sub});
     const ver=Number(lock.rows[0].version||0)+1;
-    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(d),now(),req.auth.companyId]);
+    await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
@@ -664,7 +677,7 @@ app.get('/api/super/companies',superAuth,async(req,res,next)=>{
 
 
 // Dealer Node heartbeat: the desktop identifies itself as the dealership's local data node.
-// This stores only node metadata; business data remains on the existing snapshot path during migration.
+// Phase 3: after a v5.3 Local-first node proves its local SQLite exists, the cloud snapshot is reduced to an operational shadow.
 app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可註冊節點'});
@@ -675,7 +688,16 @@ app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
       ON CONFLICT(company_id) DO UPDATE SET node_id=EXCLUDED.node_id,device_name=EXCLUDED.device_name,app_version=EXCLUDED.app_version,last_seen_at=EXCLUDED.last_seen_at,local_data_bytes=EXCLUDED.local_data_bytes,capabilities=EXCLUDED.capabilities`,
       [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify(b.capabilities||{})]);
-    res.json({ok:true,nodeId,serverTime:now()});
+    let localFirstActivated=false;
+    if(b.capabilities?.localFirst===true && Number(b.localDataBytes||0)>0){
+      const sr=await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId]);
+      if(sr.rows[0]){
+        const reduced=cloudOperationalSnapshot(sr.rows[0].json||{});
+        await pool.query('UPDATE snapshots SET json=$1::jsonb,updated_at=$2 WHERE company_id=$3',[JSON.stringify(reduced),now(),req.auth.companyId]);
+        localFirstActivated=true;
+      }
+    }
+    res.json({ok:true,nodeId,serverTime:now(),localFirstActivated});
   }catch(e){next(e)}
 });
 
