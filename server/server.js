@@ -180,7 +180,24 @@ async function initDb(){
       capabilities JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
+    CREATE TABLE IF NOT EXISTS dealer_node_requests(
+      id TEXT PRIMARY KEY,
+      company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      node_id TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'queued',
+      requested_at TEXT NOT NULL,
+      claimed_at TEXT,
+      completed_at TEXT,
+      expires_at TEXT NOT NULL,
+      result_json JSONB,
+      error_text TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON dealer_nodes(last_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_node_requests_lookup ON dealer_node_requests(company_id,node_id,status,requested_at);
+    CREATE INDEX IF NOT EXISTS idx_node_requests_expire ON dealer_node_requests(expires_at);
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
   `);
@@ -252,7 +269,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.0'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.1'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -664,6 +681,102 @@ app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
 
 app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
   try{const {rows}=await pool.query('SELECT * FROM dealer_nodes ORDER BY last_seen_at DESC');res.json({nodes:rows});}catch(e){next(e)}
+});
+
+// Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
+// The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
+const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto']);
+function nodeOnline(row,maxAgeMs=45000){
+  const t=Date.parse(row?.last_seen_at||'');
+  return Number.isFinite(t)&&(Date.now()-t)<=maxAgeMs;
+}
+async function cleanupNodeRequests(){
+  try{await pool.query("DELETE FROM dealer_node_requests WHERE expires_at < $1 OR (completed_at IS NOT NULL AND completed_at < $2)",[now(),new Date(Date.now()-5*60*1000).toISOString()]);}catch{}
+}
+
+app.post('/api/super/nodes/:companyId/request',superAuth,async(req,res,next)=>{
+  try{
+    await cleanupNodeRequests();
+    const companyId=String(req.params.companyId||'');
+    const resource=String(req.body?.resource||'');
+    const payload=(req.body?.payload&&typeof req.body.payload==='object')?req.body.payload:{};
+    if(!NODE_RESOURCES.has(resource))return res.status(400).json({error:'不支援的 Node 資料類型'});
+    const {rows}=await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[companyId]);
+    const n=rows[0];
+    if(!n)return res.status(409).json({error:'此車行尚未建立 Dealer Node'});
+    if(!nodeOnline(n))return res.status(409).json({error:'Dealer Node 目前離線，無法即時讀取'});
+    const id=`nreq_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    const requestedAt=now(),expiresAt=new Date(Date.now()+60000).toISOString();
+    await pool.query(`INSERT INTO dealer_node_requests(id,company_id,node_id,resource,payload,status,requested_at,expires_at)
+      VALUES($1,$2,$3,$4,$5::jsonb,'queued',$6,$7)`,[id,companyId,n.node_id,resource,JSON.stringify(payload),requestedAt,expiresAt]);
+    res.json({ok:true,requestId:id,nodeId:n.node_id,status:'queued',expiresAt});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/node-requests/:id',superAuth,async(req,res,next)=>{
+  try{
+    const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1',[req.params.id]);
+    const r=rows[0];
+    if(!r)return res.status(404).json({error:'Node 請求不存在或已結束'});
+    if(Date.parse(r.expires_at)<Date.now() && !['completed','failed'].includes(r.status)){
+      await pool.query("UPDATE dealer_node_requests SET status='expired',error_text='Node request timeout' WHERE id=$1",[r.id]);
+      return res.json({requestId:r.id,status:'expired',error:'Dealer Node 回應逾時'});
+    }
+    if(r.status==='completed'){
+      const result=r.result_json;
+      // Result is a relay payload, not permanent business storage. Consume and erase it after Super Admin receives it.
+      await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);
+      return res.json({requestId:r.id,status:'completed',resource:r.resource,result,completedAt:r.completed_at});
+    }
+    if(r.status==='failed'){
+      const err=r.error_text||'Dealer Node 讀取失敗';
+      await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);
+      return res.json({requestId:r.id,status:'failed',error:err});
+    }
+    res.json({requestId:r.id,status:r.status,resource:r.resource,requestedAt:r.requested_at,claimedAt:r.claimed_at,expiresAt:r.expires_at});
+  }catch(e){next(e)}
+});
+
+app.get('/api/node/commands',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端 Dealer Node 可接收命令'});
+    const nodeId=String(req.query.nodeId||'').trim();
+    if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
+    const n=(await client.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    if(!n||n.node_id!==nodeId)return res.status(403).json({error:'Dealer Node 身分不符'});
+    await client.query('BEGIN');
+    await client.query("UPDATE dealer_node_requests SET status='expired',error_text='Node request timeout' WHERE company_id=$1 AND node_id=$2 AND status IN ('queued','claimed') AND expires_at < $3",[req.auth.companyId,nodeId,now()]);
+    await client.query("UPDATE dealer_node_requests SET status='queued',claimed_at=NULL WHERE company_id=$1 AND node_id=$2 AND status='claimed' AND claimed_at < $3",[req.auth.companyId,nodeId,new Date(Date.now()-10000).toISOString()]);
+    const q=await client.query(`SELECT * FROM dealer_node_requests
+      WHERE company_id=$1 AND node_id=$2 AND status='queued' AND expires_at >= $3
+      ORDER BY requested_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,[req.auth.companyId,nodeId,now()]);
+    if(!q.rows[0]){await client.query('COMMIT');return res.json({command:null});}
+    const r=q.rows[0];
+    const claimedAt=now();
+    await client.query("UPDATE dealer_node_requests SET status='claimed',claimed_at=$1 WHERE id=$2",[claimedAt,r.id]);
+    await client.query('COMMIT');
+    res.json({command:{id:r.id,resource:r.resource,payload:r.payload||{},requestedAt:r.requested_at,expiresAt:r.expires_at}});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
+app.post('/api/node/commands/:id/result',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端 Dealer Node 可回傳資料'});
+    const nodeId=String(req.body?.nodeId||'').trim();
+    const ok=req.body?.ok!==false;
+    const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
+    const r=rows[0];
+    if(!r)return res.status(404).json({error:'Node 請求不存在'});
+    if(r.node_id!==nodeId)return res.status(403).json({error:'Dealer Node 身分不符'});
+    if(!['queued','claimed'].includes(r.status))return res.status(409).json({error:'Node 請求已處理'});
+    if(ok){
+      await pool.query("UPDATE dealer_node_requests SET status='completed',completed_at=$1,result_json=$2::jsonb,error_text=NULL WHERE id=$3",[now(),JSON.stringify(req.body?.result??null),r.id]);
+    }else{
+      await pool.query("UPDATE dealer_node_requests SET status='failed',completed_at=$1,error_text=$2,result_json=NULL WHERE id=$3",[now(),String(req.body?.error||'Dealer Node 讀取失敗').slice(0,1000),r.id]);
+    }
+    res.json({ok:true});
+  }catch(e){next(e)}
 });
 
 app.get('/api/super/data',superAuth,async(req,res,next)=>{
