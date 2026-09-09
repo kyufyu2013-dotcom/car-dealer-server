@@ -286,7 +286,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.13',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.14',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -487,6 +487,27 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
 
 
 // ---- Password management v8.3 ----
+// Dealership admin settings: company display name is canonical in companies + snapshot settings.
+app.put('/api/admin/company/settings',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理員可修改車行設定'});
+    const companyName=String(req.body?.companyName||'').trim();
+    if(!companyName)return res.status(400).json({error:'車行名稱不能空白'});
+    if(companyName.length>80)return res.status(400).json({error:'車行名稱過長'});
+    await client.query('BEGIN');
+    await client.query('UPDATE companies SET name=$1 WHERE id=$2',[companyName,req.auth.companyId]);
+    const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
+    if(lock.rowCount){
+      const d=JSON.parse(JSON.stringify(lock.rows[0].json||{}));d.settings=d.settings||{};d.settings.companyName=companyName;
+      await client.query('UPDATE snapshots SET json=$1::jsonb,updated_at=$2 WHERE company_id=$3',[JSON.stringify(d),now(),req.auth.companyId]);
+    }
+    await client.query('COMMIT');
+    const c=(await pool.query('SELECT * FROM companies WHERE id=$1',[req.auth.companyId])).rows[0];
+    res.json({ok:true,company:companyDto(c)});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
 app.post('/api/account/change-password',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     const {currentPassword,newPassword}=req.body||{};
