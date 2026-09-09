@@ -153,8 +153,8 @@ function render(){renderBonusSummary();if(currentPage==='cars')renderCars();else
 let carSearchComposing=false;
 function carSearchValue(){return ($('searchCars')?.value||'').trim().toLowerCase()}
 function renderCarList(q=carSearchValue()){
- let cars=(data.cars||[]).filter(c=>(String(c.plate||'')+' '+String(c.model||'')+' '+String(c.year||'')).toLowerCase().includes(q));
- return cars.map(c=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(c.plate)}</div><div>${esc(c.model)}</div></div><span class="status approved">在庫</span></div><div class="row muted"><span>${esc(c.year||'-')} 年</span><span>｜</span><span>${Number(c.mileage||0).toLocaleString()} km</span></div><div class="price">公司底價 ${money(c.floorPrice)}</div>${carPhotos(c)}<button class="btn primary full" style="margin-top:12px" onclick="openApply('${esc(c.id)}')">提交成交申請</button></div>`).join('')||'<div class="card muted">目前沒有符合條件的在庫車輛</div>';
+ let cars=(data.cars||[]).filter(c=>(String(c.plate||'')+' '+String(c.model||'')+' '+String(c.year||'')+' '+String(c.salesNote||'')).toLowerCase().includes(q));
+ return cars.map(c=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(c.plate)}</div><div>${esc(c.model)}</div></div><span class="status approved">在庫</span></div><div class="row muted"><span>${esc(c.year||'-')} 年</span><span>｜</span><span>${Number(c.mileage||0).toLocaleString()} km</span></div><div class="price">公司底價 ${money(c.floorPrice)}</div>${c.salesNote?`<div class="notice" style="margin-top:10px"><b>📝 車輛備註</b><br>${esc(c.salesNote)}</div>`:""}${carPhotos(c)}<button class="btn primary full" style="margin-top:12px" onclick="openApply('${esc(c.id)}')">提交成交申請</button></div>`).join('')||'<div class="card muted">目前沒有符合條件的在庫車輛</div>';
 }
 function updateCarSearch(){
  if(carSearchComposing)return;
@@ -165,7 +165,7 @@ function updateCarSearch(){
 function finishCarSearchComposition(){carSearchComposing=false;updateCarSearch()}
 function renderCars(){
  let q=carSearchValue(),mk=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'}).slice(0,7),bonus=(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).reduce((s,r)=>s+Number((r.finalCommission??r.expectedCommission)||0),0);
- $('page').innerHTML=`<div class="card"><div class="kpi"><div><div class="muted">本月目前獎金</div><div class="big">${money(bonus)}</div></div><div><div class="muted">本月已成交</div><div class="big">${(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).length}</div></div></div></div><div class="card"><h2 style="margin-top:0">目前庫存</h2><input id="searchCars" class="search" placeholder="搜尋車牌／車型／年份" value="${esc(q)}" autocomplete="off" oncompositionstart="carSearchComposing=true" oncompositionend="finishCarSearchComposition()" oninput="updateCarSearch()"></div><div id="carSearchResults" class="cardsGrid">${renderCarList(q)}</div>`;
+ $('page').innerHTML=`<div class="card"><div class="kpi"><div><div class="muted">本月目前獎金</div><div class="big">${money(bonus)}</div></div><div><div class="muted">本月已成交</div><div class="big">${(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).length}</div></div></div></div><div class="card"><h2 style="margin-top:0">目前庫存</h2><input id="searchCars" class="search" placeholder="搜尋車牌／車型／年份／備註" value="${esc(q)}" autocomplete="off" oncompositionstart="carSearchComposing=true" oncompositionend="finishCarSearchComposition()" oninput="updateCarSearch()"></div><div id="carSearchResults" class="cardsGrid">${renderCarList(q)}</div>`;
  setTimeout(hydrateAutoPhotos,0);
 }
 function statusClass(s){return s==='待確認'?'pending':(s==='已確認'||s==='已成交'||s==='通過')?'approved':'rejected'}
@@ -175,5 +175,5 @@ function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===Strin
 async function submitApply(carId){let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');try{let j=await api('/sales/request',{method:'POST',body:JSON.stringify({carId,sellPrice:sell,saleDate:date})});data=j.snapshot||data;version=Number(j.version||version);closeModal();showPage('requests');alert('成交申請已送出，等待車行後台確認。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>token?sync():health());window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.7',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
+(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.2.8',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>

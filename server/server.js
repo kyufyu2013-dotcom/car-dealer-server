@@ -94,7 +94,7 @@ function salesSafeSnapshot(snapshot,user){
     .filter(c=>c&&c.status==='在庫')
     .map(c=>({
       id:c.id,plate:c.plate||'',model:c.model||'',year:c.year||'',mileage:Number(c.mileage||0),
-      inDate:c.inDate||'',floorPrice:Number(c.floorPrice||0),status:'在庫',
+      inDate:c.inDate||'',floorPrice:Number(c.floorPrice||0),status:'在庫',salesNote:String(c.salesNote||''),
       inspectionStatus:c.inspectionStatus||'',
       inspectionPhotoCount:Number(c.inspectionPhotoCount??(Array.isArray(c.inspectionCertPhotos)?c.inspectionCertPhotos.length:0)),
       intakePhotoCount:Number(c.intakePhotoCount??(Array.isArray(c.intakePhotos)?c.intakePhotos.length:0)),
@@ -124,7 +124,7 @@ function cloudOperationalSnapshot(snapshot){
     x.inspectionPhotoCount=Array.isArray(c.inspectionCertPhotos)?c.inspectionCertPhotos.length:Number(c.inspectionPhotoCount||0);
     x.intakePhotoCount=Array.isArray(c.intakePhotos)?c.intakePhotos.length:Number(c.intakePhotoCount||0);
     // Phase 3: actual photos and sensitive business fields stay Dealer Node local-only.
-    for(const k of ['purchasePrice','costs','totalCost','source','sourceNote','inspectionCertPhotos','intakePhotos','companyProfit','saleTransferFee','saleFuelFee','saleLicenseTax','saleOtherFee','saleOtherFeeName','saleExtraCost']) delete x[k];
+    for(const k of ['purchasePrice','costs','totalCost','source','sourceNote','salesNote','inspectionCertPhotos','intakePhotos','companyProfit','saleTransferFee','saleFuelFee','saleLicenseTax','saleOtherFee','saleOtherFeeName','saleExtraCost']) delete x[k];
     return x;
   });
   // Detailed operation/salary history is authoritative on the Dealer Node.
@@ -286,7 +286,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.9',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.10',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
