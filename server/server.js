@@ -170,6 +170,17 @@ async function initDb(){
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_by TEXT;
 
+    CREATE TABLE IF NOT EXISTS dealer_nodes(
+      company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      node_id TEXT NOT NULL,
+      device_name TEXT,
+      app_version TEXT,
+      last_seen_at TEXT NOT NULL,
+      local_data_bytes BIGINT NOT NULL DEFAULT 0,
+      capabilities JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON dealer_nodes(last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
   `);
@@ -241,7 +252,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.9'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.0'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -634,6 +645,27 @@ app.get('/api/super/companies',superAuth,async(req,res,next)=>{
   }catch(e){ next(e); }
 });
 
+
+// Dealer Node heartbeat: the desktop identifies itself as the dealership's local data node.
+// This stores only node metadata; business data remains on the existing snapshot path during migration.
+app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可註冊節點'});
+    const b=req.body||{};
+    const nodeId=String(b.nodeId||'').trim();
+    if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
+    await pool.query(`INSERT INTO dealer_nodes(company_id,node_id,device_name,app_version,last_seen_at,local_data_bytes,capabilities)
+      VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+      ON CONFLICT(company_id) DO UPDATE SET node_id=EXCLUDED.node_id,device_name=EXCLUDED.device_name,app_version=EXCLUDED.app_version,last_seen_at=EXCLUDED.last_seen_at,local_data_bytes=EXCLUDED.local_data_bytes,capabilities=EXCLUDED.capabilities`,
+      [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify(b.capabilities||{})]);
+    res.json({ok:true,nodeId,serverTime:now()});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
+  try{const {rows}=await pool.query('SELECT * FROM dealer_nodes ORDER BY last_seen_at DESC');res.json({nodes:rows});}catch(e){next(e)}
+});
+
 app.get('/api/super/data',superAuth,async(req,res,next)=>{
   try{
     const companies=(await pool.query(`
@@ -643,13 +675,15 @@ app.get('/api/super/data',superAuth,async(req,res,next)=>{
     `)).rows;
     const users=(await pool.query('SELECT * FROM users ORDER BY company_id,role,name')).rows;
     const snaps=(await pool.query('SELECT * FROM snapshots')).rows;
+    const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
+    const nodeBy=new Map(nodes.map(n=>[n.company_id,n]));
     const usersBy=new Map(),snapBy=new Map();
     for(const u of users){if(!usersBy.has(u.company_id))usersBy.set(u.company_id,[]);usersBy.get(u.company_id).push(userDto(u));}
     for(const s of snaps)snapBy.set(s.company_id,{snapshot:s.json,version:Number(s.version||0),updatedAt:s.updated_at});
     res.json({
       companies:companies.map(c=>{
         const s=snapBy.get(c.id)||{snapshot:{settings:{companyName:c.name,taxRate:0},users:[],cars:[],saleRequests:[]},version:0,updatedAt:null};
-        return {company:companyDto(c),users:usersBy.get(c.id)||[],snapshot:s.snapshot,version:s.version,updatedAt:s.updatedAt};
+        return {company:companyDto(c),users:usersBy.get(c.id)||[],snapshot:s.snapshot,version:s.version,updatedAt:s.updatedAt,node:nodeBy.get(c.id)||null};
       })
     });
   }catch(e){ next(e); }
