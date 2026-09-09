@@ -282,7 +282,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.2',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.3',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -687,7 +687,7 @@ app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
     await pool.query(`INSERT INTO dealer_nodes(company_id,node_id,device_name,app_version,last_seen_at,local_data_bytes,capabilities)
       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
       ON CONFLICT(company_id) DO UPDATE SET node_id=EXCLUDED.node_id,device_name=EXCLUDED.device_name,app_version=EXCLUDED.app_version,last_seen_at=EXCLUDED.last_seen_at,local_data_bytes=EXCLUDED.local_data_bytes,capabilities=EXCLUDED.capabilities`,
-      [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify(b.capabilities||{})]);
+      [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify({...b.capabilities,online:true})]);
     let localFirstActivated=false;
     if(b.capabilities?.localFirst===true && Number(b.localDataBytes||0)>0){
       const sr=await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId]);
@@ -698,6 +698,19 @@ app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
       }
     }
     res.json({ok:true,nodeId,serverTime:now(),localFirstActivated});
+  }catch(e){next(e)}
+});
+
+// Dealer Node explicit offline signal.
+app.post('/api/node/offline',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可變更節點狀態'});
+    const nodeId=String(req.body?.nodeId||'').trim();
+    if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
+    const offlineAt=new Date(0).toISOString();
+    const r=await pool.query(`UPDATE dealer_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{\"online\":false}'::jsonb WHERE company_id=$2 AND node_id=$3 RETURNING company_id,node_id`,[offlineAt,req.auth.companyId,nodeId]);
+    await pool.query(`UPDATE dealer_node_requests SET status='failed',error_text='Dealer Node 已登出或離線',completed_at=$1 WHERE company_id=$2 AND node_id=$3 AND status IN ('queued','claimed')`,[now(),req.auth.companyId,nodeId]);
+    res.json({ok:true,offline:true,nodeId,updated:r.rowCount>0});
   }catch(e){next(e)}
 });
 
