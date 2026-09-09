@@ -82,7 +82,9 @@ function userDto(u){
     role:u.role,
     commissionRate:Number(u.commission_rate||0),
     baseSalary:Number(u.base_salary||0),
-    enabled:!!u.enabled
+    enabled:!!u.enabled,
+    passwordChangedAt:u.password_changed_at||'',
+    passwordChangedBy:u.password_changed_by||''
   };
 }
 
@@ -119,7 +121,7 @@ function snapshotForUser(snapshot,user){
 
 function signUser(u){
   return jwt.sign(
-    {sub:u.id,companyId:u.company_id,role:u.role,username:u.username},
+    {sub:u.id,companyId:u.company_id,role:u.role,username:u.username,tokenVersion:Number(u.token_version||0)},
     JWT_SECRET,
     {expiresIn:'12h'}
   );
@@ -164,6 +166,9 @@ async function initDb(){
     );
 
     ALTER TABLE users ADD COLUMN IF NOT EXISTS base_salary DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_by TEXT;
 
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
@@ -192,13 +197,19 @@ async function getSnapshot(companyId, client=pool){
   return {version:0,snapshot:{settings:{companyName:'車行',taxRate:0},users:[],cars:[],saleRequests:[],operationLogs:[]},updatedAt:null};
 }
 
-function auth(req,res,next){
+async function auth(req,res,next){
   const token=(req.headers.authorization||'').replace(/^Bearer\s+/i,'');
   if(!token)return res.status(401).json({error:'未登入'});
   try{
     req.auth=jwt.verify(token,JWT_SECRET);
+    if(req.auth.role!=='platformAdmin'){
+      const {rows}=await pool.query('SELECT enabled,token_version FROM users WHERE id=$1 AND company_id=$2',[req.auth.sub,req.auth.companyId]);
+      const u=rows[0];
+      if(!u||!u.enabled)return res.status(401).json({error:'帳號已停用或不存在'});
+      if(Number(u.token_version||0)!==Number(req.auth.tokenVersion||0))return res.status(401).json({error:'密碼已變更，請使用新密碼重新登入'});
+    }
     next();
-  }catch{
+  }catch(e){
     return res.status(401).json({error:'登入已失效，請重新登入'});
   }
 }
@@ -230,7 +241,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.2'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.3.3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -408,6 +419,35 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
     if(e?.code==='23505')return res.status(409).json({error:'同一車行內帳號名稱不可重複'});
     next(e);
   }finally{ client.release(); }
+});
+
+
+// ---- Password management v8.3 ----
+app.post('/api/account/change-password',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    const {currentPassword,newPassword}=req.body||{};
+    if(!currentPassword||!newPassword)return res.status(400).json({error:'請輸入目前密碼與新密碼'});
+    if(String(newPassword).length<6)return res.status(400).json({error:'新密碼至少 6 碼'});
+    const {rows}=await pool.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId]);
+    const u=rows[0];
+    if(!u||!verifyPassword(currentPassword,u.password_hash))return res.status(401).json({error:'目前密碼錯誤'});
+    const changedAt=now();
+    await pool.query('UPDATE users SET password_hash=$1,token_version=token_version+1,password_changed_at=$2,password_changed_by=$3,updated_at=$2 WHERE id=$4 AND company_id=$5',[hashPassword(newPassword),changedAt,u.username,u.id,req.auth.companyId]);
+    res.json({ok:true,message:'密碼修改成功，請重新登入'});
+  }catch(e){next(e)}
+});
+
+app.post('/api/admin/users/:userId/reset-password',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理員可重設業務密碼'});
+    const newPassword=String(req.body?.newPassword||'');
+    if(newPassword.length<6)return res.status(400).json({error:'新密碼至少 6 碼'});
+    const {rows}=await pool.query("SELECT * FROM users WHERE id=$1 AND company_id=$2 AND role='sales' AND enabled=TRUE",[req.params.userId,req.auth.companyId]);
+    const target=rows[0]; if(!target)return res.status(404).json({error:'找不到此業務帳號'});
+    const changedAt=now();
+    await pool.query('UPDATE users SET password_hash=$1,token_version=token_version+1,password_changed_at=$2,password_changed_by=$3,updated_at=$2 WHERE id=$4',[hashPassword(newPassword),changedAt,req.auth.username,target.id]);
+    res.json({ok:true,passwordChangedAt:changedAt,passwordChangedBy:req.auth.username});
+  }catch(e){next(e)}
 });
 
 app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
@@ -702,6 +742,19 @@ app.patch('/api/super/companies/:id',superAuth,async(req,res,next)=>{
     if(e?.code==='23505')return res.status(409).json({error:'此車行內已有相同帳號'});
     next(e);
   }finally{client.release();}
+});
+
+
+app.post('/api/super/companies/:companyId/users/:userId/reset-password',superAuth,async(req,res,next)=>{
+  try{
+    const newPassword=String(req.body?.newPassword||'');
+    if(newPassword.length<6)return res.status(400).json({error:'新密碼至少 6 碼'});
+    const {rows}=await pool.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.params.userId,req.params.companyId]);
+    const target=rows[0]; if(!target)return res.status(404).json({error:'找不到此帳號'});
+    const changedAt=now();
+    await pool.query('UPDATE users SET password_hash=$1,token_version=token_version+1,password_changed_at=$2,password_changed_by=$3,updated_at=$2 WHERE id=$4',[hashPassword(newPassword),changedAt,SUPER_ADMIN_USER,target.id]);
+    res.json({ok:true,passwordChangedAt:changedAt,passwordChangedBy:SUPER_ADMIN_USER});
+  }catch(e){next(e)}
 });
 
 app.patch('/api/super/companies/:id/license',superAuth,async(req,res,next)=>{

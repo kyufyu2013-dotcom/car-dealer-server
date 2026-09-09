@@ -1,6 +1,6 @@
 {
-  "name": "車行業務行動端",
-  "short_name": "車行業務",
+  "name": "庫車掌盤業務端",
+  "short_name": "庫車掌盤",
   "start_url": "/sales/",
   "scope": "/sales/",
   "display": "standalone",

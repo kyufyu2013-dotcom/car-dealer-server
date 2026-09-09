@@ -1,31 +1,251 @@
-<!doctype html>
-<html lang="zh-Hant-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#111827"><title>車行業務行動端</title><link rel="manifest" href="manifest.webmanifest"><style>
-*{box-sizing:border-box}body{margin:0;font-family:"Microsoft JhengHei",system-ui,-apple-system,sans-serif;background:#f3f6fb;color:#111827}button,input{font:inherit}.hidden{display:none!important}.wrap{max-width:920px;margin:auto;padding:16px}.login{min-height:100vh;display:flex;align-items:center;background:linear-gradient(145deg,#111827,#1f2937)}.login .card{width:100%;max-width:460px;margin:auto}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 8px 28px #00000012}.brand{font-size:28px;font-weight:900;margin-bottom:4px}.muted{color:#64748b;font-size:13px}.field{margin:12px 0}.field label{display:block;font-weight:700;font-size:13px;margin-bottom:6px}input{width:100%;padding:13px;border:1px solid #cbd5e1;border-radius:12px;background:#fff}.btn{border:0;border-radius:11px;padding:11px 14px;cursor:pointer;font-weight:800}.primary{background:#111827;color:#fff}.full{width:100%}.ghost{background:#e8edf4;color:#111827}.dangerBtn{background:#fee2e2;color:#991b1b}.top{position:sticky;top:0;z-index:5;background:#f3f6fbdd;backdrop-filter:blur(10px);padding:10px 0;display:flex;justify-content:space-between;gap:10px;align-items:center}.badge{font-size:12px;padding:6px 10px;border-radius:999px;background:#dcfce7;color:#166534;white-space:nowrap}.badge.off{background:#fee2e2;color:#991b1b}.search{margin:10px 0}.car{border:1px solid #e2e8f0;border-radius:15px;padding:14px;margin:10px 0;background:#fff}.carhead{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.plate{font-size:18px;font-weight:900}.price{font-size:21px;font-weight:900;margin:8px 0}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.thumbs{display:flex;gap:8px;overflow:auto;margin-top:10px}.thumbs img{width:88px;height:66px;object-fit:cover;border-radius:10px;border:1px solid #e2e8f0;cursor:pointer}.tabs{position:sticky;bottom:0;display:grid;grid-template-columns:1fr 1fr 92px;gap:8px;background:#f3f6fb;padding:10px 0 calc(10px + env(safe-area-inset-bottom))}.tabs button{border:0;border-radius:12px;padding:12px;background:#e2e8f0;font-weight:800}.tabs button.active{background:#111827;color:#fff}.status{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px}.pending{background:#fef3c7;color:#92400e}.approved{background:#dcfce7;color:#166534}.rejected{background:#fee2e2;color:#991b1b}.notice{padding:11px;border-radius:11px;margin:10px 0;background:#eff6ff;color:#1e40af}.error{background:#fef2f2;color:#991b1b}.modalBg{position:fixed;inset:0;background:#0009;display:none;align-items:flex-end;justify-content:center;z-index:30;padding:0}.modalBg.show{display:flex}.modal{background:#fff;width:min(620px,100%);max-height:90vh;overflow:auto;border-radius:22px 22px 0 0;padding:18px}.modal h2{margin-top:0}.imageBg{position:fixed;inset:0;background:#000d;display:none;place-items:center;z-index:40;padding:20px}.imageBg.show{display:grid}.imageBg img{max-width:100%;max-height:92vh;border-radius:10px}.kpi{display:grid;grid-template-columns:1fr 1fr;gap:10px}.kpi>div{background:#f8fafc;border-radius:12px;padding:10px}.big{font-size:20px;font-weight:900}@media(min-width:760px){.modalBg{align-items:center;padding:20px}.modal{border-radius:20px}.cardsGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.car{margin:0}}
-</style></head><body>
-<div id="loginPage" class="login"><div class="wrap"><div class="card"><div class="brand">🚗 車行業務行動端</div><div class="muted">帳號由車行後台建立。登入與資料同步都走中央伺服器。</div><div class="field"><label>車行代碼</label><input id="companyCode" autocomplete="organization" placeholder="例如 TEST001"></div><div class="field"><label>業務帳號</label><input id="username" autocomplete="username" placeholder="例如 sales1"></div><div class="field"><label>密碼</label><input id="password" type="password" autocomplete="current-password"></div><button id="loginBtn" class="btn primary full" onclick="doLogin()">登入</button><div id="netState" class="notice">正在檢查中央伺服器…</div></div></div></div>
-<div id="app" class="hidden"><div class="wrap"><div class="top"><div><b id="who"></b><div class="muted" id="shop"></div></div><span id="cloud" class="badge">☁ 已連線</span></div><div id="page"></div><div class="tabs"><button id="tabCars" onclick="showPage('cars')">🚙 庫存</button><button id="tabReq" onclick="showPage('requests')">📝 我的申請</button><button onclick="logout()">登出</button></div></div></div>
-<div id="modalBg" class="modalBg" onclick="if(event.target===this)closeModal()"><div id="modal" class="modal"></div></div><div id="imageBg" class="imageBg" onclick="closeImage()"><img id="bigImage"></div>
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>庫車掌盤｜Super Admin 資料中心</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:"Microsoft JhengHei","Noto Sans TC",Arial,sans-serif;background:#f5f7fb;color:#1f2937}
+button,input,select{font:inherit}button{cursor:pointer}
+#loginPage{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#e8eefc,#f8fafc)}
+.login{width:min(430px,92vw);background:#fff;padding:30px;border-radius:18px;box-shadow:0 18px 60px #0002}
+.login h1{margin:0 0 8px}.muted{color:#6b7280;font-size:13px}.login input{width:100%;padding:12px;margin:7px 0 14px;border:1px solid #d1d5db;border-radius:9px}
+.btn{border:0;border-radius:9px;padding:9px 13px;background:#111827;color:#fff}
+.btn2{border:1px solid #d1d5db;border-radius:9px;padding:8px 11px;background:#fff;color:#111827}
+.btn-danger{border:1px solid #fecaca;border-radius:9px;padding:8px 11px;background:#fee2e2;color:#991b1b}
+#app{display:none;min-height:100vh}.layout{display:flex;min-height:100vh}
+.sidebar{width:245px;background:#111827;color:#fff;padding:18px;flex-shrink:0}
+.brand{font-size:20px;font-weight:700;margin-bottom:5px}.subbrand{font-size:12px;color:#9ca3af;margin-bottom:22px}
+.nav button{width:100%;text-align:left;border:0;background:transparent;color:#d1d5db;padding:11px;border-radius:8px;margin:2px 0}
+.nav button:hover,.nav button.active{background:#374151;color:#fff}
+.content{flex:1;min-width:0;padding:22px}.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+.top h1{font-size:25px;margin:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;margin-bottom:18px}
+.card,.panel{background:#fff;border-radius:14px;padding:18px;box-shadow:0 4px 18px #0000000b}
+.card .num{font-size:27px;font-weight:700;margin-top:5px}.panel{margin-bottom:18px}
+.panel-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:13px}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:nowrap;font-size:14px}th{background:#f9fafb}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px}
+.ok{background:#dcfce7;color:#166534}.warn{background:#fef3c7;color:#92400e}.bad{background:#fee2e2;color:#991b1b}.info{background:#dbeafe;color:#1e40af}
+.tools{display:flex;gap:8px;flex-wrap:wrap}.tools input,.tools select{padding:9px;border:1px solid #d1d5db;border-radius:8px;min-width:150px}
+.modal-bg{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;padding:18px;z-index:50}
+.modal-bg.show{display:flex}.modal{width:min(1000px,97vw);max-height:93vh;overflow:auto;background:#fff;border-radius:15px;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.grid label{font-weight:700;font-size:14px}.grid input{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px}
+.actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:16px}
+.detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:12px 0}
+.detail-item{background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:11px}.detail-item b{display:block;font-size:12px;color:#6b7280;margin-bottom:4px}
+.notice{padding:11px 13px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe;margin-bottom:14px;line-height:1.6}
+.thumb{width:110px;height:82px;object-fit:cover;border-radius:8px;border:1px solid #ddd;cursor:pointer;margin:4px}
+@media(max-width:760px){.layout{display:block}.sidebar{width:100%}.nav{display:grid;grid-template-columns:repeat(2,1fr)}.content{padding:12px}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="loginPage">
+  <div class="login">
+    <h1>🔐 Super Admin</h1>
+    <p class="muted">系統總管理獨立入口。車行端不顯示這個入口。</p>
+    <label>管理員帳號</label><input id="loginUser" autocomplete="username">
+    <label>密碼</label><input id="loginPass" type="password" autocomplete="current-password">
+    <button class="btn" style="width:100%" onclick="doLogin()">登入超級管理後台</button>
+    <div class="muted" style="margin-top:10px">Super Admin 專用登入</div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">🚘 Super Admin</div>
+      <div class="subbrand">全車行資料中心</div>
+      <div class="nav">
+        <button id="navOverview" class="active" onclick="showPage('overview')">🏢 車行總覽</button>
+        <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
+        <button id="navSales" onclick="showPage('sales')">💰 全部成交</button>
+        <button id="navUsers" onclick="showPage('users')">👥 全部帳號</button>
+      </div>
+    </aside>
+    <main class="content">
+      <div class="top">
+        <div><h1 id="pageTitle">車行總覽</h1><div class="muted">最高權限：可查閱所有車行的成本、底價、成交與人員資料；帳號以 companyId + username 區分</div></div>
+        <div style="display:flex;align-items:center;gap:8px"><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
+      </div>
+      <div id="main"></div>
+    </main>
+  </div>
+</div>
+
+<div id="modalBg" class="modal-bg"><div id="modal" class="modal"></div></div>
+
 <script>
-const API='/api';const SESSION='carDealerSalesWebSession_v7';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null;
-const $=id=>document.getElementById(id);const money=n=>'NT$ '+Number(n||0).toLocaleString('zh-TW');const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const rate=v=>{let n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')};
-async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})};let r=await fetch(API+path,opt);let j={};try{j=await r.json()}catch{};if((r.status===401||r.status===403)&&token){logout(j.error||'登入或授權已失效');throw new Error(j.error||'授權失效')}if(!r.ok)throw new Error(j.error||'操作失敗');return j}
-async function health(){try{let r=await fetch(API+'/health',{cache:'no-store'});if(!r.ok)throw 0;$('netState').className='notice';$('netState').textContent='🟢 中央伺服器連線正常';return true}catch{$('netState').className='notice error';$('netState').textContent='🔴 無法連線。沒有網路或伺服器離線時不能登入';return false}}
-async function doLogin(){if(!(await health()))return;let b=$('loginBtn');b.disabled=true;b.textContent='登入中…';try{let j=await api('/auth/login',{method:'POST',body:JSON.stringify({companyCode:$('companyCode').value.trim(),username:$('username').value.trim(),password:$('password').value})});if(j.user?.role!=='sales')throw new Error('這個入口只允許業務帳號登入');token=j.token;me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);saveSession();enter()}catch(e){alert(e.message)}finally{b.disabled=false;b.textContent='登入'}}
-function saveSession(){if(token)localStorage.setItem(SESSION,JSON.stringify({token,page:currentPage}))}
-function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;showPage(currentPage||'cars');clearInterval(timer);timer=setInterval(sync,3000)}
-function logout(msg=''){clearInterval(timer);timer=null;token='';me=null;company=null;data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
-async function restore(){let s;try{s=JSON.parse(localStorage.getItem(SESSION))}catch{};if(!s?.token)return false;token=s.token;currentPage=s.page||'cars';try{let j=await api('/session/restore');if(j.user?.role!=='sales')throw new Error('角色不符');me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);enter();return true}catch{token='';localStorage.removeItem(SESSION);return false}}
-async function sync(){if(!token)return;try{let j=await api('/company/snapshot');$('cloud').className='badge';$('cloud').textContent='☁ 已同步';company=j.company||company;if(j.user)me=j.user;if(Number(j.version||0)!==version){version=Number(j.version||0);data=j.snapshot||data;render()}}catch(e){if(token){$('cloud').className='badge off';$('cloud').textContent='🔴 離線'}}}
-function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');render()}
-function carPhotos(c){let p=[...(c.intakePhotos||[]),...(c.inspectionCertPhotos||[])];return p.length?`<div class="thumbs">${p.slice(0,8).map(x=>`<img src="${x}" onclick="openImage(this.src)">`).join('')}</div>`:''}
-function render(){if(currentPage==='cars')renderCars();else renderRequests()}
-function renderCars(){let q=($('searchCars')?.value||'').trim().toLowerCase(),cars=(data.cars||[]).filter(c=>(c.plate+' '+c.model+' '+c.year).toLowerCase().includes(q)),mk=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'}).slice(0,7),bonus=(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).reduce((s,r)=>s+Number((r.finalCommission??r.expectedCommission) || 0),0);$('page').innerHTML=`<div class="card"><div class="kpi"><div><div class="muted">本月目前獎金</div><div class="big">${money(bonus)}</div></div><div><div class="muted">本月已成交</div><div class="big">${(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).length}</div></div></div></div><div class="card"><h2 style="margin-top:0">目前庫存</h2><input id="searchCars" class="search" placeholder="搜尋車牌／車型／年份" value="${esc(q)}" oninput="renderCars()"></div><div class="cardsGrid">${cars.map(c=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(c.plate)}</div><div>${esc(c.model)}</div></div><span class="status approved">在庫</span></div><div class="row muted"><span>${esc(c.year||'-')} 年</span><span>｜</span><span>${Number(c.mileage||0).toLocaleString()} km</span></div><div class="price">公司底價 ${money(c.floorPrice)}</div>${carPhotos(c)}<button class="btn primary full" style="margin-top:12px" onclick="openApply('${esc(c.id)}')">提交成交申請</button></div>`).join('')||'<div class="card muted">目前沒有符合條件的在庫車輛</div>'}</div>`}
-function statusClass(s){return s==='待確認'?'pending':(s==='已確認'||s==='已成交'||s==='通過')?'approved':'rejected'}
-function renderRequests(){let rs=[...(data.saleRequests||[])].sort((a,b)=>String(b.requestedAt||'').localeCompare(String(a.requestedAt||''))),mk=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'}).slice(0,7),bonus=rs.filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk).reduce((s,r)=>s+Number((r.finalCommission??r.expectedCommission)||0),0);$('page').innerHTML=`<div class="card"><h2 style="margin-top:0">我的成交申請</h2><div class="kpi"><div><div class="muted">申請數</div><div class="big">${rs.length}</div></div><div><div class="muted">待確認</div><div class="big">${rs.filter(r=>r.status==='待確認').length}</div></div><div><div class="muted">本月目前獎金</div><div class="big">${money(bonus)}</div></div></div></div>${rs.map(r=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(r.plate)}</div><div>${esc(r.model)}</div></div><span class="status ${statusClass(r.status)}">${esc(r.status)}</span></div><div>成交售價：<b>${money(r.sellPrice)}</b></div><div>公司底價：${money(r.floorPrice)}</div><div>預估獎金：<b>${money(r.expectedCommission)}</b>（${rate(r.commissionRate)}%）</div><div class="muted">成交日 ${esc(r.saleDate||'-')}｜申請日 ${esc(r.requestedAt||'-')}</div>${r.rejectReason?`<div class="notice error">駁回原因：${esc(r.rejectReason)}</div>`:''}${r.cancelReason?`<div class="notice error">取消原因：${esc(r.cancelReason)}</div>`:''}${r.canceledAt?`<div class="muted">取消時間 ${esc(new Date(r.canceledAt).toLocaleString('zh-TW',{timeZone:'Asia/Taipei',hour12:false}))}</div>`:''}</div>`).join('')||'<div class="card muted">目前沒有成交申請</div>'}`}
-function openApply(id){let c=(data.cars||[]).find(x=>String(x.id)===String(id));if(!c)return;let today=new Date().toISOString().slice(0,10);$('modal').innerHTML=`<h2>提交成交申請</h2><div class="notice">${esc(c.plate)}｜${esc(c.model)}<br>公司底價：<b>${money(c.floorPrice)}</b><br>你的獎金比例：<b>${rate(me.commissionRate)}%</b></div><div class="field"><label>成交售價</label><input id="sellPrice" type="number" inputmode="numeric" value="${Number(c.floorPrice||0)}" oninput="updateCommission('${esc(id)}')"></div><div class="field"><label>成交日期</label><input id="saleDate" type="date" value="${today}"></div><div id="commissionPreview" class="notice"></div><div class="row"><button class="btn primary" style="flex:1" onclick="submitApply('${esc(id)}')">確認送出</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;$('modalBg').classList.add('show');updateCommission(id)}
-function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===String(id)),sell=Number($('sellPrice')?.value||0),diff=Math.max(0,sell-Number(c?.floorPrice||0)),bonus=diff*Number(me?.commissionRate||0)/100;if($('commissionPreview'))$('commissionPreview').innerHTML=`超過底價：<b>${money(diff)}</b><br>預估業務獎金：<b>${money(bonus)}</b>`}
-async function submitApply(carId){let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');try{let j=await api('/sales/request',{method:'POST',body:JSON.stringify({carId,sellPrice:sell,saleDate:date})});data=j.snapshot||data;version=Number(j.version||version);closeModal();showPage('requests');alert('成交申請已送出，等待車行後台確認。')}catch(e){alert(e.message)}}
-function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
-$('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>token?sync():health());window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{})})();
-</script></body></html>
+const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
+const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
+const AUTO_REFRESH_MS=3000;
+let superToken="",currentPage="overview",cloudRows=[],refreshing=false,lastCloudAt=0;
+
+function today(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
+function esc(v){return String(v??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+function money(v){return "$"+Number(v||0).toLocaleString("zh-TW")}
+function rate(v){const n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,"").replace(/\.$/,"")}
+function badgeFor(st){return st==="啟用中"?"ok":st==="尚未啟用"?"warn":"bad"}
+function setCloudState(text,kind="info"){const el=document.getElementById("cloudState");if(!el)return;el.className="badge "+kind;el.textContent=text}
+function getSession(){try{return JSON.parse(localStorage.getItem(SUPER_SESSION_KEY)||"null")}catch{return null}}
+function saveSession(){if(!superToken)return;localStorage.setItem(SUPER_SESSION_KEY,JSON.stringify({token:superToken,page:currentPage,savedAt:Date.now()}))}
+
+async function api(path,options={}){
+  const headers={"Content-Type":"application/json",...(options.headers||{})};
+  if(superToken)headers.Authorization="Bearer "+superToken;
+  let res;
+  try{res=await fetch(API_BASE+path,{...options,headers})}
+  catch(e){throw new Error("無法連線中央伺服器，請確認網路或 Render 狀態")}
+  let body={};try{body=await res.json()}catch{}
+  if(res.status===401&&superToken){logout("Super Admin 登入已失效，請重新登入");throw new Error(body.error||"登入已失效")}
+  if(!res.ok)throw new Error(body.error||("HTTP "+res.status));
+  return body;
+}
+
+function companyDataRow(id){return cloudRows.find(x=>x.company?.id===id)||null}
+function allCars(){const arr=[];for(const x of cloudRows){const cars=Array.isArray(x.snapshot?.cars)?x.snapshot.cars:[];for(const car of cars)arr.push({...car,_companyId:x.company.id,_companyName:x.company.name})}return arr}
+function allUsers(){const arr=[];for(const x of cloudRows){const users=Array.isArray(x.users)&&x.users.length?x.users:(Array.isArray(x.snapshot?.users)?x.snapshot.users:[]);for(const u of users)arr.push({...u,_companyId:x.company.id,_companyName:x.company.name})}return arr}
+function soldCars(){return allCars().filter(c=>c.status==="已售"||Number(c.sellPrice)>0)}
+
+async function doLogin(){
+  const u=loginUser.value.trim(),p=loginPass.value;
+  if(!u||!p){alert("請輸入 Super Admin 帳號與密碼");return}
+  try{
+    setLoginBusy(true);
+    const health=await fetch(API_BASE+"/health");if(!health.ok)throw new Error("中央伺服器目前無法使用");
+    const r=await fetch(API_BASE+"/super/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p})});
+    let b={};try{b=await r.json()}catch{}
+    if(!r.ok)throw new Error(b.error||"登入失敗");
+    superToken=b.token;
+    currentPage="overview";
+    saveSession();
+    loginPass.value="";
+    loginPage.style.display="none";app.style.display="block";
+    await refreshCloud(false);
+    showPage("overview");
+  }catch(e){alert(e.message)}finally{setLoginBusy(false)}
+}
+function setLoginBusy(v){const b=document.querySelector("#loginPage .btn");if(b){b.disabled=v;b.textContent=v?"連線登入中…":"登入超級管理後台"}}
+function logout(reason=""){
+  superToken="";cloudRows=[];localStorage.removeItem(SUPER_SESSION_KEY);
+  app.style.display="none";loginPage.style.display="flex";loginPass.value="";setCloudState("尚未連線","warn");
+  if(reason)alert(reason);
+}
+async function restoreSession(){
+  const s=getSession();if(!s?.token)return false;
+  superToken=s.token;currentPage=s.page||"overview";
+  loginPage.style.display="none";app.style.display="block";
+  try{await refreshCloud(false);showPage(currentPage);return true}catch(e){logout();return false}
+}
+loginPass.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
+
+function showPage(p){
+  currentPage=p;saveSession();
+  ["overview","vehicles","sales","users"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
+  const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號"};pageTitle.textContent=titles[p]||"Super Admin";
+  renderCurrent();
+}
+function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers()}
+function userIsEditing(){const a=document.activeElement;return !!(a&&(a.tagName==="INPUT"||a.tagName==="SELECT"||a.tagName==="TEXTAREA"||a.isContentEditable))}
+function modalIsOpen(){return modalBg.classList.contains("show")}
+async function refreshCloud(manual=false){
+  if(!superToken||refreshing)return;
+  refreshing=true;
+  try{
+    const r=await api("/super/data");cloudRows=Array.isArray(r.companies)?r.companies:[];lastCloudAt=Date.now();setCloudState("雲端已同步","ok");saveSession();
+    if(manual||(!modalIsOpen()&&!userIsEditing()))renderCurrent();
+  }catch(e){setCloudState("連線異常","bad");if(manual)alert(e.message);throw e}
+  finally{refreshing=false}
+}
+
+function renderOverview(){
+  const cars=allCars(),sold=soldCars(),stock=cars.filter(c=>c.status!=="已售");
+  const stockCost=stock.reduce((s,c)=>s+Number(c.totalCost||c.purchasePrice||0),0);
+  const soldProfit=sold.reduce((s,c)=>s+Number(c.companyProfit||0),0);
+  main.innerHTML=`
+  <div class="cards">
+    <div class="card"><div class="muted">車行數量</div><div class="num">${cloudRows.length}</div></div>
+    <div class="card"><div class="muted">全部庫存</div><div class="num">${stock.length} 台</div></div>
+    <div class="card"><div class="muted">庫存總成本</div><div class="num">${money(stockCost)}</div></div>
+    <div class="card"><div class="muted">累計已售</div><div class="num">${sold.length} 台</div></div>
+    <div class="card"><div class="muted">累計公司利潤</div><div class="num">${money(soldProfit)}</div></div>
+  </div>
+  <div class="notice">☁️ 目前資料直接來自 Render + PostgreSQL。這個 Super Admin 不再讀取車行電腦的 localStorage。</div>
+  <div class="panel">
+    <div class="panel-head"><div><h2 style="margin:0">🏢 車行授權與資料</h2><div class="muted">自助註冊與 Super Admin 手動建立的車行都會顯示在這裡</div></div><button class="btn" onclick="openCompany()">＋新增車行</button></div>
+    <div class="table-wrap"><table><thead><tr><th>車行</th><th>車行代碼</th><th>建立方式</th><th>主帳號</th><th>授權</th><th>啟用日</th><th>到期日</th><th>庫存</th><th>已售</th><th>庫存成本</th><th>操作</th></tr></thead><tbody>
+    ${cloudRows.map(x=>{const c=x.company,d=x.snapshot||{},cars=Array.isArray(d.cars)?d.cars:[],stock=cars.filter(v=>v.status!=="已售"),sold=cars.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),sc=stock.reduce((s,v)=>s+Number(v.totalCost||v.purchasePrice||0),0);return `<tr>
+      <td><b>${esc(c.name)}</b>${c.trial?` <span class="badge info">試用</span>`:""}</td><td><code>${esc(c.id)}</code></td><td>${c.createdBy==="self"?"自助註冊":"管理員建立"}</td><td>${esc(c.mainUsername||((x.users||[]).find(u=>u.role==="admin")?.username)||"-")}</td><td><span class="badge ${badgeFor(c.status)}">${esc(c.status)}</span></td>
+      <td>${esc(c.startDate||"立即")}</td><td>${esc(c.expiresAt||"不限期")}</td><td>${stock.length}</td><td>${sold.length}</td><td>${money(sc)}</td>
+      <td><button class="btn" onclick="openCompanyData('${esc(c.id)}')">查看全部資料</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權設定</button> <button class="btn2" onclick="toggleCompany('${esc(c.id)}')">${c.enabled?"停用":"啟用"}</button></td></tr>`}).join("")||`<tr><td colspan="11">目前 PostgreSQL 尚無車行</td></tr>`}
+    </tbody></table></div>
+  </div>`;
+}
+
+function renderVehicles(){
+  const cars=allCars();main.innerHTML=`<div class="panel"><div class="panel-head"><div><h2 style="margin:0">🚗 全車行車輛資料</h2><div class="muted">Super Admin 可查閱購入價、總成本、底價、來源與成交資訊</div></div><div class="tools"><input id="vehicleQ" placeholder="搜尋車牌 / 車型 / 車行" oninput="filterVehicleTable()"><select id="vehicleStatus" onchange="filterVehicleTable()"><option value="">全部狀態</option><option>在庫</option><option>已售</option></select></div></div><div class="table-wrap"><table><thead><tr><th>車行</th><th>車牌</th><th>車型</th><th>年份</th><th>里程</th><th>購入價</th><th>整備/總成本</th><th>公司底價</th><th>售價</th><th>公司利潤</th><th>狀態</th><th>詳細</th></tr></thead><tbody id="vehicleRows">${vehicleRows(cars)}</tbody></table></div></div>`;
+}
+function vehicleRows(cars){return cars.map(c=>`<tr data-search="${esc((c._companyName+" "+(c.plate||"")+" "+(c.model||"")).toLowerCase())}" data-status="${esc(c.status||"在庫")}"><td>${esc(c._companyName)}</td><td><b>${esc(c.plate||"")}</b></td><td>${esc(c.model||"")}</td><td>${esc(c.year||"")}</td><td>${Number(c.mileage||0).toLocaleString()}</td><td>${money(c.purchasePrice)}</td><td>${money(c.totalCost||c.purchasePrice)}</td><td><b>${money(c.floorPrice)}</b></td><td>${c.sellPrice?money(c.sellPrice):"-"}</td><td>${c.status==="已售"?money(c.companyProfit):"-"}</td><td><span class="badge ${c.status==="已售"?"bad":"ok"}">${esc(c.status||"在庫")}</span></td><td><button class="btn2" onclick="openVehicle('${esc(c._companyId)}','${esc(c.id)}')">查看</button></td></tr>`).join("")||`<tr><td colspan="12">目前沒有車輛資料</td></tr>`}
+function filterVehicleTable(){const q=vehicleQ.value.trim().toLowerCase(),st=vehicleStatus.value;document.querySelectorAll("#vehicleRows tr[data-search]").forEach(r=>r.style.display=(!q||r.dataset.search.includes(q))&&(!st||r.dataset.status===st)?"":"none")}
+
+function renderSales(){
+  const rows=soldCars().sort((a,b)=>String(b.outDate||"").localeCompare(String(a.outDate||""))),totalSales=rows.reduce((s,c)=>s+Number(c.sellPrice||0),0),totalProfit=rows.reduce((s,c)=>s+Number(c.companyProfit||0),0),totalCommission=rows.reduce((s,c)=>s+Number(c.commissionAmount||0),0);
+  main.innerHTML=`<div class="cards"><div class="card"><div class="muted">成交總額</div><div class="num">${money(totalSales)}</div></div><div class="card"><div class="muted">佣金總額</div><div class="num">${money(totalCommission)}</div></div><div class="card"><div class="muted">公司實際利潤</div><div class="num">${money(totalProfit)}</div></div></div><div class="panel"><div class="panel-head"><div><h2 style="margin:0">💰 全車行成交</h2></div><div class="tools"><input id="saleQ" placeholder="搜尋車牌 / 業務 / 車行" oninput="filterSales()"><input id="saleMonth" type="month" oninput="filterSales()"></div></div><div class="table-wrap"><table><thead><tr><th>成交日</th><th>車行</th><th>車牌</th><th>業務</th><th>總成本</th><th>底價</th><th>售價</th><th>佣金%</th><th>佣金</th><th>交易費用</th><th>公司利潤</th></tr></thead><tbody id="saleRows">${rows.map(c=>`<tr data-search="${esc((c._companyName+" "+(c.plate||"")+" "+(c.salesName||"")).toLowerCase())}" data-month="${esc(String(c.outDate||"").slice(0,7))}"><td>${esc(c.outDate||"")}</td><td>${esc(c._companyName)}</td><td>${esc(c.plate||"")}</td><td>${esc(c.salesName||"-")}</td><td>${money(c.totalCost||c.purchasePrice)}</td><td>${money(c.floorPrice)}</td><td>${money(c.sellPrice)}</td><td>${rate(c.commissionRate)}%</td><td>${money(c.commissionAmount)}</td><td>${money(c.saleExtraCost)}</td><td><b>${money(c.companyProfit)}</b></td></tr>`).join("")||`<tr><td colspan="11">目前沒有成交資料</td></tr>`}</tbody></table></div></div>`;
+}
+function filterSales(){const q=saleQ.value.trim().toLowerCase(),m=saleMonth.value;document.querySelectorAll("#saleRows tr[data-search]").forEach(r=>r.style.display=(!q||r.dataset.search.includes(q))&&(!m||r.dataset.month===m)?"":"none")}
+
+function renderUsers(){
+  const users=allUsers();main.innerHTML=`<div class="panel"><div class="panel-head"><div><h2 style="margin:0">👥 全車行帳號</h2><div class="muted">可查看帳號並重設密碼；舊密碼不會顯示</div></div><div class="tools"><input id="userQ" placeholder="搜尋姓名 / 帳號 / 車行" oninput="filterUsers()"></div></div><div class="table-wrap"><table><thead><tr><th>車行</th><th>車行代碼</th><th>姓名</th><th>帳號</th><th>角色</th><th>狀態</th><th>佣金比例</th><th>底薪</th><th>密碼管理</th></tr></thead><tbody id="userRows">${users.map(u=>`<tr data-search="${esc((u._companyName+" "+(u.name||"")+" "+(u.username||"")).toLowerCase())}"><td>${esc(u._companyName)}</td><td><code>${esc(u._companyId)}</code></td><td>${esc(u.name||"")}</td><td>${esc(u.username||"")}</td><td>${u.role==="admin"?"車行後台":"業務"}</td><td>${u.enabled===false?`<span class="badge bad">停用</span>`:`<span class="badge ok">啟用</span>`}</td><td>${u.role==="sales"?rate(u.commissionRate)+"%":"-"}</td><td>${u.role==="sales"?money(u.baseSalary||0):"-"}</td><td><button class="btn2" onclick="resetUserPassword('${esc(u._companyId)}','${esc(u.id)}','${esc(u.username)}')">重設密碼</button></td></tr>`).join("")||`<tr><td colspan="9">沒有帳號資料</td></tr>`}</tbody></table></div></div>`;
+}
+function filterUsers(){const q=userQ.value.trim().toLowerCase();document.querySelectorAll("#userRows tr[data-search]").forEach(r=>r.style.display=!q||r.dataset.search.includes(q)?"":"none")}
+
+async function resetUserPassword(companyId,userId,username){
+ const p=prompt(`請為 ${username} 設定新密碼（至少 6 碼）`);if(p===null)return;if(p.length<6){alert("新密碼至少 6 碼");return}
+ const p2=prompt("請再次輸入新密碼");if(p2!==p){alert("兩次新密碼不一致");return}
+ if(!confirm(`確定重設 ${username} 的密碼？重設後該帳號舊登入會失效。`))return;
+ try{await api(`/super/companies/${encodeURIComponent(companyId)}/users/${encodeURIComponent(userId)}/reset-password`,{method:"POST",body:JSON.stringify({newPassword:p})});alert("密碼已重設");await syncCloud(true)}catch(e){alert(e.message||"重設失敗")}
+}
+
+function openCompanyData(id){
+  const x=companyDataRow(id);if(!x)return;const c=x.company,d=x.snapshot||{},cars=Array.isArray(d.cars)?d.cars:[],stock=cars.filter(v=>v.status!=="已售"),sold=cars.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),stockCost=stock.reduce((s,v)=>s+Number(v.totalCost||v.purchasePrice||0),0),profit=sold.reduce((s,v)=>s+Number(v.companyProfit||0),0),users=Array.isArray(x.users)?x.users:[];
+  modal.innerHTML=`<div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><h2 style="margin:0">${esc(c.name)}｜最高權限資料</h2><div class="muted">PostgreSQL 雲端資料｜版本 ${Number(x.version||0)}</div></div><button class="btn2" onclick="closeModal()">關閉</button></div><div class="detail-grid"><div class="detail-item"><b>車行代碼 companyId</b>${esc(c.id)}</div><div class="detail-item"><b>建立方式</b>${c.createdBy==="self"?"客戶自助註冊":"Super Admin 手動建立"}</div><div class="detail-item"><b>授權狀態</b>${esc(c.status)}</div><div class="detail-item"><b>聯絡 Email</b>${esc(c.contactEmail||"-")}</div><div class="detail-item"><b>庫存</b>${stock.length} 台</div><div class="detail-item"><b>已售</b>${sold.length} 台</div><div class="detail-item"><b>庫存總成本</b>${money(stockCost)}</div><div class="detail-item"><b>累計公司利潤</b>${money(profit)}</div><div class="detail-item"><b>帳號數</b>${users.length}</div></div><h3>車輛資料</h3><div class="table-wrap"><table><thead><tr><th>車牌</th><th>車型</th><th>購入價</th><th>總成本</th><th>底價</th><th>售價</th><th>來源</th><th>狀態</th><th></th></tr></thead><tbody>${cars.map(v=>`<tr><td>${esc(v.plate||"")}</td><td>${esc(v.model||"")}</td><td>${money(v.purchasePrice)}</td><td>${money(v.totalCost||v.purchasePrice)}</td><td><b>${money(v.floorPrice)}</b></td><td>${v.sellPrice?money(v.sellPrice):"-"}</td><td>${esc(v.source||"-")}</td><td>${esc(v.status||"在庫")}</td><td><button class="btn2" onclick="openVehicle('${esc(c.id)}','${esc(v.id)}')">詳細</button></td></tr>`).join("")||`<tr><td colspan="9">無車輛資料</td></tr>`}</tbody></table></div><h3>人員帳號</h3><div class="table-wrap"><table><thead><tr><th>姓名</th><th>帳號</th><th>角色</th><th>佣金</th><th>底薪</th><th>狀態</th></tr></thead><tbody>${users.map(u=>`<tr><td>${esc(u.name||"")}</td><td>${esc(u.username||"")}</td><td>${u.role==="admin"?"後台":"業務"}</td><td>${u.role==="sales"?rate(u.commissionRate)+"%":"-"}</td><td>${u.role==="sales"?money(u.baseSalary||0):"-"}</td><td>${u.enabled===false?"停用":"啟用"}</td></tr>`).join("")||`<tr><td colspan="6">無帳號</td></tr>`}</tbody></table></div>`;
+  modalBg.classList.add("show");
+}
+
+function openVehicle(companyId,carId){
+  const x=companyDataRow(companyId);if(!x)return;const c=x.company,d=x.snapshot||{},v=(d.cars||[]).find(y=>String(y.id)===String(carId));if(!v)return;const costs=Array.isArray(v.costs)?v.costs:[],fee=Number(v.saleExtraCost||0);
+  modal.innerHTML=`<div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><h2 style="margin:0">${esc(v.plate||"")}｜${esc(v.model||"")}</h2><div class="muted">${esc(c.name)}</div></div><button class="btn2" onclick="closeModal()">關閉</button></div><div class="detail-grid"><div class="detail-item"><b>購入價格</b>${money(v.purchasePrice)}</div><div class="detail-item"><b>整備後總成本</b>${money(v.totalCost||v.purchasePrice)}</div><div class="detail-item"><b>公司底價</b>${money(v.floorPrice)}</div><div class="detail-item"><b>成交售價</b>${v.sellPrice?money(v.sellPrice):"-"}</div><div class="detail-item"><b>車輛來源</b>${esc(v.source||"-")}</div><div class="detail-item"><b>來源備註</b>${esc(v.sourceNote||"-")}</div><div class="detail-item"><b>業務</b>${esc(v.salesName||"-")}</div><div class="detail-item"><b>業務佣金</b>${money(v.commissionAmount)} (${rate(v.commissionRate)}%)</div><div class="detail-item"><b>交易費用</b>${money(fee)}</div><div class="detail-item"><b>公司實際利潤</b>${v.status==="已售"?money(v.companyProfit):"-"}</div><div class="detail-item"><b>入庫日</b>${esc(v.inDate||"-")}</div><div class="detail-item"><b>售出日</b>${esc(v.outDate||"-")}</div></div><h3>整備/成本明細</h3>${costs.length?`<div class="table-wrap"><table><thead><tr><th>項目</th><th>金額</th></tr></thead><tbody>${costs.map(q=>`<tr><td>${esc(q.name||q.item||"整備費")}</td><td>${money(q.amount||q.price)}</td></tr>`).join("")}</tbody></table></div>`:`<div class="muted">沒有整備明細</div>`}${photoBlock("檢驗證照片",v.inspectionCertPhotos)}${photoBlock("入庫照片",v.intakePhotos)}`;
+  modalBg.classList.add("show");
+}
+function photoBlock(title,photos){photos=Array.isArray(photos)?photos:[];return `<h3>${title}</h3><div>${photos.length?photos.map(src=>`<img class="thumb" src="${src}" onclick="showImage(this.src)">`).join(""):`<span class="muted">沒有照片</span>`}</div>`}
+function showImage(src){modal.innerHTML=`<div style="text-align:right"><button class="btn2" onclick="closeModal()">關閉</button></div><div style="text-align:center"><img src="${src}" style="max-width:95%;max-height:80vh;border-radius:10px"></div>`;modalBg.classList.add("show")}
+
+function openCompany(id=""){
+  const x=id?companyDataRow(id):null,c=x?.company||null,admin=x?.users?.find(u=>u.role==="admin")||null;
+  modal.innerHTML=`<h2>${c?"編輯車行 / 授權":"新增車行"}</h2>${c?`<div class="notice">修改後會直接寫入中央 PostgreSQL。密碼留空代表不變。</div>`:`<div class="notice">這是 Super Admin 手動建立車行；建立後客戶可直接用車行代碼、主帳號、密碼登入。</div>`}<div class="grid"><label>車行名稱<input id="cn" value="${esc(c?.name||"")}"></label><label>車行代碼 companyId<input id="cid" ${c?"disabled":""} value="${esc(c?.id||"")}" placeholder="例如 abc_car"></label><label>負責人姓名<input id="co" value="${esc(admin?.name||"後台管理員")}"></label><label>聯絡 Email<input id="cmail" value="${esc(c?.contactEmail||"")}"></label><label>車行主帳號<input id="cu" value="${esc(c?.mainUsername||admin?.username||"")}"></label><label>主帳號密碼<input id="cp" type="password" value="" placeholder="${c?"留空＝不變":"請設定密碼"}"></label><label>啟用日<input id="cs" type="date" value="${esc(c?.startDate||today())}"></label><label>到期日<input id="ce" type="date" value="${esc(c?.expiresAt||"")}"></label><label style="display:flex;align-items:center;gap:8px;margin-top:26px"><input id="cena" style="width:auto" type="checkbox" ${c?.enabled!==false?"checked":""}> 手動啟用</label><label style="display:flex;align-items:center;gap:8px;margin-top:26px"><input id="ctrial" style="width:auto" type="checkbox" ${c?.trial?"checked":""}> 試用方案</label></div><div class="actions">${c?`<button class="btn-danger" onclick="deleteCompany('${esc(c.id)}')">刪除車行</button>`:""}<button class="btn2" onclick="closeModal()">取消</button><button class="btn" onclick="saveCompany('${esc(id)}')">儲存到雲端</button></div>`;
+  modalBg.classList.add("show");
+}
+async function saveCompany(id){
+  const payloadBase={companyName:cn.value.trim(),companyCode:cid.value.trim(),ownerName:co.value.trim(),email:cmail.value.trim(),username:cu.value.trim(),password:cp.value,startDate:cs.value,expiresAt:ce.value,enabled:cena.checked,trial:ctrial.checked};
+  if(!payloadBase.companyName||!payloadBase.username||(!id&&!payloadBase.password)){alert("請完整填寫車行名稱、主帳號"+(id?"":"、密碼"));return}
+  if(!id&&!/^[A-Za-z0-9_-]{3,40}$/.test(payloadBase.companyCode)){alert("車行代碼只能使用英數、底線、減號，長度 3-40");return}
+  if(payloadBase.startDate&&payloadBase.expiresAt&&payloadBase.expiresAt<payloadBase.startDate){alert("到期日不能早於啟用日");return}
+  try{
+    if(id){await api("/super/companies/"+encodeURIComponent(id),{method:"PATCH",body:JSON.stringify({name:payloadBase.companyName,ownerName:payloadBase.ownerName,contactEmail:payloadBase.email,mainUsername:payloadBase.username,password:payloadBase.password,startDate:payloadBase.startDate,expiresAt:payloadBase.expiresAt,enabled:payloadBase.enabled,trial:payloadBase.trial})})}
+    else{await api("/super/companies",{method:"POST",body:JSON.stringify(payloadBase)})}
+    closeModal();await refreshCloud(true);
+  }catch(e){alert(e.message)}
+}
+async function toggleCompany(id){const x=companyDataRow(id);if(!x)return;const c=x.company,next=!c.enabled;if(!confirm(`確定要${next?"啟用":"停用"}「${c.name}」？`))return;try{await api("/super/companies/"+encodeURIComponent(id)+"/license",{method:"PATCH",body:JSON.stringify({enabled:next})});await refreshCloud(true)}catch(e){alert(e.message)}}
+async function deleteCompany(id){const x=companyDataRow(id);if(!x)return;const c=x.company;if(!confirm(`確定永久刪除「${c.name}」？\n\n這會刪除 PostgreSQL 內該車行帳號與雲端資料，無法復原。`))return;const typed=prompt(`再次確認：請輸入車行代碼 ${c.id}`);if(typed!==c.id){alert("車行代碼不符，已取消");return}try{await api("/super/companies/"+encodeURIComponent(id),{method:"DELETE"});closeModal();await refreshCloud(true)}catch(e){alert(e.message)}}
+function closeModal(){modalBg.classList.remove("show")}
+modalBg.addEventListener("click",e=>{if(e.target===modalBg)closeModal()});document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal()});
+
+(async function init(){
+  const ok=await restoreSession();if(!ok){loginPage.style.display="flex";app.style.display="none"}
+  setInterval(()=>{if(superToken)refreshCloud(false).catch(()=>{})},AUTO_REFRESH_MS);
+})();
+</script>
+</body>
+</html>
