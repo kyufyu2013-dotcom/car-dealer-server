@@ -286,10 +286,21 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.5',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.6',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
+});
+
+app.get('/api/public/node-status',async(req,res,next)=>{
+  try{
+    const companyCode=String(req.query.companyCode||'').trim();
+    if(!companyCode)return res.json({ok:true,known:false,online:false});
+    const c=await getCompany(companyCode);
+    if(!c)return res.json({ok:true,known:false,online:false});
+    const n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[companyCode])).rows[0];
+    res.json({ok:true,known:true,online:!!(n&&nodeOnline(n)),lastSeenAt:n?.last_seen_at||null});
+  }catch(e){next(e)}
 });
 
 app.post('/api/company/register',async(req,res,next)=>{
@@ -352,7 +363,8 @@ app.post('/api/auth/login',async(req,res,next)=>{
     if(!u||!verifyPassword(password,u.password_hash))return res.status(401).json({error:'帳號或密碼錯誤'});
 
     const snap=await getSnapshot(companyCode);
-    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
+    const nodeRow=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[companyCode])).rows[0];
+    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,nodeOnline:!!(nodeRow&&nodeOnline(nodeRow))});
   }catch(e){ next(e); }
 });
 
@@ -724,7 +736,7 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 
 // Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
-const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto']);
+const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle']);
 function nodeOnline(row,maxAgeMs=45000){
   const t=Date.parse(row?.last_seen_at||'');
   return Number.isFinite(t)&&(Date.now()-t)<=maxAgeMs;
@@ -778,6 +790,45 @@ app.get('/api/super/node-requests/:id',superAuth,async(req,res,next)=>{
 
 
 // Sales-safe on-demand photo relay: Sales can read only photos of in-stock cars in their own company.
+// Sales automatic photo strip: one Node command returns up to 8 photos for one in-stock vehicle.
+app.post('/api/sales/node-photos/request',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    await cleanupNodeRequests();
+    if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
+    const carId=String(req.body?.carId||'').trim();
+    if(!carId)return res.status(400).json({error:'缺少車輛資料'});
+    const snapRow=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    const snap=snapRow?.json||{};
+    const car=(Array.isArray(snap.cars)?snap.cars:[]).find(c=>String(c?.id)===carId && c?.status==='在庫');
+    if(!car)return res.status(404).json({error:'找不到可供業務查看的在庫車輛'});
+    const n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    if(!n||!nodeOnline(n))return res.status(409).json({error:'車行主機目前離線，暫時無法讀取照片'});
+    const id=`sphotos_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+    const requestedAt=now(),expiresAt=new Date(Date.now()+60000).toISOString();
+    const payload={carId,max:8,requesterSalesId:String(req.auth.sub)};
+    await pool.query(`INSERT INTO dealer_node_requests(id,company_id,node_id,resource,payload,status,requested_at,expires_at)
+      VALUES($1,$2,$3,'vehiclePhotoBundle',$4::jsonb,'queued',$5,$6)`,
+      [id,req.auth.companyId,n.node_id,JSON.stringify(payload),requestedAt,expiresAt]);
+    res.json({ok:true,requestId:id,status:'queued',expiresAt});
+  }catch(e){next(e)}
+});
+
+app.get('/api/sales/node-photo-bundles/:id',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
+    const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
+    const r=rows[0];
+    if(!r||r.resource!=='vehiclePhotoBundle'||String(r.payload?.requesterSalesId||'')!==String(req.auth.sub))return res.status(404).json({error:'照片請求不存在'});
+    if(Date.parse(r.expires_at)<Date.now()&&!['completed','failed'].includes(r.status)){
+      await pool.query("UPDATE dealer_node_requests SET status='expired',error_text='Node request timeout' WHERE id=$1",[r.id]);
+      return res.json({requestId:r.id,status:'expired',error:'車行主機回應逾時'});
+    }
+    if(r.status==='completed'){const result=r.result_json;await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);return res.json({requestId:r.id,status:'completed',result});}
+    if(r.status==='failed'){const err=r.error_text||'車行主機讀取照片失敗';await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[r.id]);return res.json({requestId:r.id,status:'failed',error:err});}
+    res.json({requestId:r.id,status:r.status,expiresAt:r.expires_at});
+  }catch(e){next(e)}
+});
+
 app.post('/api/sales/node-photo/request',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     await cleanupNodeRequests();
