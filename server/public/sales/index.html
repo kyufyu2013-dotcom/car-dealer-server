@@ -179,7 +179,7 @@ async function refreshNodeStateAndInventory(showLoginAlert=false){
  if(online)await refreshNodeInventory();
 }
 function stopLiveInventoryPush(){clearTimeout(liveRestartTimer);clearTimeout(liveInventoryTimer);if(liveEventSource){try{liveEventSource.close()}catch{}liveEventSource=null}}
-function scheduleLiveInventoryRefresh(){clearTimeout(liveInventoryTimer);liveInventoryTimer=setTimeout(async()=>{if(!token||LAN_MODE)return;try{await refreshNodeStatus(false);if(nodeIsOnline)await refreshNodeInventory();await sync()}catch{}},120)}
+function scheduleLiveInventoryRefresh(){clearTimeout(liveInventoryTimer);liveInventoryTimer=setTimeout(async()=>{if(!token||LAN_MODE)return;try{await refreshNodeStatus(false);if(nodeIsOnline)await refreshNodeInventory();await sync();setTimeout(async()=>{if(!token||LAN_MODE)return;try{await refreshNodeStatus(false);if(nodeIsOnline)await refreshNodeInventory()}catch{}},1200)}catch{}},180)}
 async function startLiveInventoryPush(){
  if(LAN_MODE||!token||typeof EventSource==='undefined')return;
  stopLiveInventoryPush();
