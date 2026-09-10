@@ -24,6 +24,12 @@ const OFFLINE_LICENSE_PUBLIC_KEY = (process.env.OFFLINE_LICENSE_PUBLIC_KEY || `-
 MCowBQYDK2VwAyEA9HcbP6jcb7lfwCpp5gw1Jm5lB6aDGyCy2XbY4/uyXJU=
 -----END PUBLIC KEY-----`).replace(/\\n/g,'\n');
 const OFFLINE_GRACE_SECONDS = 72*60*60;
+// Phase 6A: desktop update policy metadata is signed separately from login/offline authorization.
+// Replace UPDATE_SIGNING_PRIVATE_KEY before paid production; the desktop bundles the matching public key.
+const UPDATE_SIGNING_PRIVATE_KEY = (process.env.UPDATE_SIGNING_PRIVATE_KEY || `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEINJNyM8Z3NP+A+nNSTsGntFeJovtB25kFHjt1DLw9bCV
+-----END PRIVATE KEY-----`).replace(/\\n/g,'\n');
+const UPDATE_SIGNING_KEY_ID = process.env.UPDATE_SIGNING_KEY_ID || 'desktop-update-ed25519-v1';
 function b64url(v){return Buffer.from(v).toString('base64url')}
 function offlineVerifier(password){const salt=crypto.randomBytes(16).toString('hex');const hash=crypto.scryptSync(String(password),salt,64,{N:16384,r:8,p:1}).toString('hex');return `${salt}:${hash}`;}
 function issueOfflineTicket(company,user,password,seconds=OFFLINE_GRACE_SECONDS){
@@ -178,6 +184,25 @@ function signSuper(){
   return jwt.sign({sub:'platform-admin',role:'platformAdmin'},JWT_SECRET,{expiresIn:'12h'});
 }
 
+function cleanSemver(v){
+  const m=String(v||'').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  return m?`${Number(m[1])}.${Number(m[2])}.${Number(m[3])}`:'0.0.0';
+}
+function compareSemver(a,b){
+  const aa=cleanSemver(a).split('.').map(Number),bb=cleanSemver(b).split('.').map(Number);
+  for(let i=0;i<3;i++){if(aa[i]>bb[i])return 1;if(aa[i]<bb[i])return -1}return 0;
+}
+async function getDesktopUpdatePolicy(client=pool){
+  const {rows}=await client.query('SELECT * FROM desktop_update_policy WHERE id=1');
+  const r=rows[0]||{};
+  return {enabled:!!r.enabled,channel:String(r.channel||'stable'),latestVersion:cleanSemver(r.latest_version||'0.9.3'),minimumVersion:cleanSemver(r.minimum_version||'0.0.0'),downloadUrl:String(r.download_url||''),releaseNotes:String(r.release_notes||''),packageSha256:String(r.package_sha256||'').toLowerCase(),packageSignature:String(r.package_signature||''),updatedAt:r.updated_at||'',updatedBy:r.updated_by||''};
+}
+function signUpdateManifestPayload(payload){
+  const body=b64url(JSON.stringify(payload));
+  const signature=crypto.sign(null,Buffer.from(body),UPDATE_SIGNING_PRIVATE_KEY).toString('base64url');
+  return {body,signature,keyId:UPDATE_SIGNING_KEY_ID,algorithm:'Ed25519'};
+}
+
 // Phase 3C: lightweight realtime push hub for Sales inventory changes.
 // Streams carry only change notifications; actual inventory still comes through Sales-safe Node APIs.
 const salesLiveClients=new Map();
@@ -235,7 +260,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=3;
+const SERVER_SCHEMA_TARGET=4;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -373,6 +398,28 @@ const SERVER_MIGRATIONS=[
       CREATE UNIQUE INDEX IF NOT EXISTS idx_diag_dedupe ON diagnostic_events(company_id,error_code,module,fingerprint);
       CREATE INDEX IF NOT EXISTS idx_diag_company_time ON diagnostic_events(company_id,last_seen_at DESC);
       CREATE INDEX IF NOT EXISTS idx_diag_severity_time ON diagnostic_events(severity,last_seen_at DESC);
+    `
+  },
+  {
+    version:4,
+    name:'phase6a-desktop-update-policy',
+    sql:`
+      CREATE TABLE IF NOT EXISTS desktop_update_policy(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        channel TEXT NOT NULL DEFAULT 'stable',
+        latest_version TEXT NOT NULL DEFAULT '0.9.3',
+        minimum_version TEXT NOT NULL DEFAULT '0.0.0',
+        download_url TEXT NOT NULL DEFAULT '',
+        release_notes TEXT NOT NULL DEFAULT '',
+        package_sha256 TEXT NOT NULL DEFAULT '',
+        package_signature TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL DEFAULT ''
+      );
+      INSERT INTO desktop_update_policy(id,enabled,channel,latest_version,minimum_version,download_url,release_notes,package_sha256,package_signature,updated_at,updated_by)
+      VALUES(1,FALSE,'stable','0.9.3','0.0.0','','','','',CURRENT_TIMESTAMP::text,'migration')
+      ON CONFLICT(id) DO NOTHING;
     `
   }
 ];
@@ -512,7 +559,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.40',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase5b-agent-self-recovery'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.41',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6a-signed-update-policy'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -988,6 +1035,34 @@ app.post('/api/super/login',(req,res)=>{
   res.json({token:signSuper(),user:{username:SUPER_ADMIN_USER,role:'platformAdmin'}});
 });
 
+app.get('/api/update/desktop-manifest',async(req,res,next)=>{
+  try{
+    const policy=await getDesktopUpdatePolicy();
+    const payload={v:1,product:'used-car-dealer-desktop',enabled:policy.enabled,channel:policy.channel,latestVersion:policy.latestVersion,minimumVersion:policy.minimumVersion,downloadUrl:policy.downloadUrl,releaseNotes:policy.releaseNotes,packageSha256:policy.packageSha256,packageSignature:policy.packageSignature,issuedAt:now(),policyUpdatedAt:policy.updatedAt};
+    res.json(signUpdateManifestPayload(payload));
+  }catch(e){next(e)}
+});
+app.get('/api/super/update-policy',superAuth,async(req,res,next)=>{
+  try{res.json({policy:await getDesktopUpdatePolicy(),keyId:UPDATE_SIGNING_KEY_ID});}catch(e){next(e)}
+});
+app.patch('/api/super/update-policy',superAuth,async(req,res,next)=>{
+  try{
+    const old=await getDesktopUpdatePolicy(),b=req.body||{};
+    const latest=cleanSemver(b.latestVersion===undefined?old.latestVersion:b.latestVersion);
+    const minimum=cleanSemver(b.minimumVersion===undefined?old.minimumVersion:b.minimumVersion);
+    if(compareSemver(minimum,latest)>0)return res.status(400).json({error:'最低允許版本不能高於最新版本'});
+    const channel=String(b.channel===undefined?old.channel:b.channel||'stable').trim().slice(0,30)||'stable';
+    const downloadUrl=String(b.downloadUrl===undefined?old.downloadUrl:b.downloadUrl||'').trim().slice(0,2000);
+    const releaseNotes=String(b.releaseNotes===undefined?old.releaseNotes:b.releaseNotes||'').slice(0,12000);
+    const packageSha256=String(b.packageSha256===undefined?old.packageSha256:b.packageSha256||'').trim().toLowerCase();
+    if(packageSha256 && !/^[a-f0-9]{64}$/.test(packageSha256))return res.status(400).json({error:'SHA-256 必須是 64 位十六進位字串'});
+    const packageSignature=String(b.packageSignature===undefined?old.packageSignature:b.packageSignature||'').trim().slice(0,4000);
+    await pool.query(`UPDATE desktop_update_policy SET enabled=$1,channel=$2,latest_version=$3,minimum_version=$4,download_url=$5,release_notes=$6,package_sha256=$7,package_signature=$8,updated_at=$9,updated_by=$10 WHERE id=1`,
+      [b.enabled===undefined?old.enabled:!!b.enabled,channel,latest,minimum,downloadUrl,releaseNotes,packageSha256,packageSignature,now(),SUPER_ADMIN_USER]);
+    res.json({ok:true,policy:await getDesktopUpdatePolicy()});
+  }catch(e){next(e)}
+});
+
 app.get('/api/super/companies',superAuth,async(req,res,next)=>{
   try{
     const {rows}=await pool.query(`
@@ -1026,7 +1101,8 @@ app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
     const lanSeconds=offlineTest?.enabled?Number(offlineTest.duration_seconds||60):OFFLINE_GRACE_SECONDS;
     const companyRow=await getCompany(req.auth.companyId);
     const salesLanAuthBundle=offlineTest?.enabled&&offlineTest?.simulate_outage?null:issueSalesLanAuthBundle(companyRow,salesUsers,lanSeconds);
-    res.json({ok:true,nodeId,serverTime:now(),localFirstActivated,salesLanAuthBundle,lanAuthExpiresInSeconds:salesLanAuthBundle?Math.max(5,Math.min(lanSeconds,OFFLINE_GRACE_SECONDS)):0});
+    const updatePolicy=await getDesktopUpdatePolicy();
+    res.json({ok:true,nodeId,serverTime:now(),localFirstActivated,salesLanAuthBundle,lanAuthExpiresInSeconds:salesLanAuthBundle?Math.max(5,Math.min(lanSeconds,OFFLINE_GRACE_SECONDS)):0,updatePolicy:{enabled:updatePolicy.enabled,latestVersion:updatePolicy.latestVersion,minimumVersion:updatePolicy.minimumVersion,channel:updatePolicy.channel}});
   }catch(e){next(e)}
 });
 
@@ -1331,6 +1407,7 @@ app.post('/api/super/diagnostics/:id/resolve',superAuth,async(req,res,next)=>{
 app.get('/api/super/health',superAuth,async(req,res,next)=>{
   try{
     const schema=await getServerSchemaStatus();
+    const updatePolicy=await getDesktopUpdatePolicy();
     const companies=(await pool.query('SELECT * FROM companies ORDER BY created_at DESC')).rows;
     const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
     const snaps=(await pool.query('SELECT company_id,updated_at FROM snapshots')).rows;
@@ -1352,9 +1429,9 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
       const localSchemaStatus=String(caps.localSchemaStatus||'unknown');
       const migrationSafetyStatus=String(caps.migrationSafetyStatus||'none');
       if(n&&localSchemaTarget>0&&(localSchemaStatus!=='ready'||localSchemaVersion<localSchemaTarget)){score=Math.max(0,score-15);issues.push(`SQLite Schema ${localSchemaStatus} v${localSchemaVersion}/${localSchemaTarget}`)}
-      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0),agentAutoRecovery:!!caps.agentAutoRecovery,agentWatchdog:!!caps.agentWatchdog,agentRecoveryCount:Number(caps.agentRecoveryCount||0),agentLastRecoveryAt:caps.agentLastRecoveryAt||null,agentHeartbeatFailures:Number(caps.agentHeartbeatFailures||0),agentCommandFailures:Number(caps.agentCommandFailures||0)};
+      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0),agentAutoRecovery:!!caps.agentAutoRecovery,agentWatchdog:!!caps.agentWatchdog,agentRecoveryCount:Number(caps.agentRecoveryCount||0),agentLastRecoveryAt:caps.agentLastRecoveryAt||null,agentHeartbeatFailures:Number(caps.agentHeartbeatFailures||0),agentCommandFailures:Number(caps.agentCommandFailures||0),latestDesktopVersion:updatePolicy.latestVersion,minimumDesktopVersion:updatePolicy.minimumVersion,updatePolicyEnabled:updatePolicy.enabled,desktopVersionState:!updatePolicy.enabled?'unmanaged':(compareSemver(n?.app_version||'0.0.0',updatePolicy.minimumVersion)<0?'blocked':(compareSemver(n?.app_version||'0.0.0',updatePolicy.latestVersion)<0?'update_available':'current'))};
     });
-    res.json({health:rows,generatedAt:now(),schema});
+    res.json({health:rows,generatedAt:now(),schema,updatePolicy});
   }catch(e){next(e)}
 });
 
