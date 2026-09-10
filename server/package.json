@@ -1,11 +1,12 @@
 {
   "name": "car-dealer-central-server",
-  "version": "2.4.44",
+  "version": "2.4.47",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "loadtest": "node tools/dealer-node-load-simulator.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

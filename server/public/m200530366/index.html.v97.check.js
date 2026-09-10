@@ -1,92 +1,8 @@
-<!DOCTYPE html>
-<html lang="zh-Hant-TW">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>庫車掌盤｜Super Admin 資料中心</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;font-family:"Microsoft JhengHei","Noto Sans TC",Arial,sans-serif;background:#f5f7fb;color:#1f2937}
-button,input,select{font:inherit}button{cursor:pointer}
-#loginPage{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#e8eefc,#f8fafc)}
-.login{width:min(430px,92vw);background:#fff;padding:30px;border-radius:18px;box-shadow:0 18px 60px #0002}
-.login h1{margin:0 0 8px}.muted{color:#6b7280;font-size:13px}.login input{width:100%;padding:12px;margin:7px 0 14px;border:1px solid #d1d5db;border-radius:9px}
-.btn{border:0;border-radius:9px;padding:9px 13px;background:#111827;color:#fff}
-.btn2{border:1px solid #d1d5db;border-radius:9px;padding:8px 11px;background:#fff;color:#111827}
-.btn-danger{border:1px solid #fecaca;border-radius:9px;padding:8px 11px;background:#fee2e2;color:#991b1b}
-#app{display:none;min-height:100vh}.layout{display:flex;min-height:100vh}
-.sidebar{width:245px;background:#111827;color:#fff;padding:18px;flex-shrink:0}
-.brand{font-size:20px;font-weight:700;margin-bottom:5px}.subbrand{font-size:12px;color:#9ca3af;margin-bottom:22px}
-.nav button{width:100%;text-align:left;border:0;background:transparent;color:#d1d5db;padding:11px;border-radius:8px;margin:2px 0}
-.nav button:hover,.nav button.active{background:#374151;color:#fff}
-.content{flex:1;min-width:0;padding:22px}.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px}
-.top h1{font-size:25px;margin:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;margin-bottom:18px}
-.card,.panel{background:#fff;border-radius:14px;padding:18px;box-shadow:0 4px 18px #0000000b}
-.card .num{font-size:27px;font-weight:700;margin-top:5px}.panel{margin-bottom:18px}
-.panel-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:13px}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:900px}
-th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:nowrap;font-size:14px}th{background:#f9fafb}
-.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px}
-.ok{background:#dcfce7;color:#166534}.warn{background:#fef3c7;color:#92400e}.bad{background:#fee2e2;color:#991b1b}.info{background:#dbeafe;color:#1e40af}
-.tools{display:flex;gap:8px;flex-wrap:wrap}.tools input,.tools select{padding:9px;border:1px solid #d1d5db;border-radius:8px;min-width:150px}
-.modal-bg{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;padding:18px;z-index:50}
-.modal-bg.show{display:flex}.modal{width:min(1000px,97vw);max-height:93vh;overflow:auto;background:#fff;border-radius:15px;padding:20px}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.grid label{font-weight:700;font-size:14px}.grid input{width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px}
-.actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:16px}
-.detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:12px 0}
-.detail-item{background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:11px}.detail-item b{display:block;font-size:12px;color:#6b7280;margin-bottom:4px}
-.notice{padding:11px 13px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe;margin-bottom:14px;line-height:1.6}
-.thumb{width:110px;height:82px;object-fit:cover;border-radius:8px;border:1px solid #ddd;cursor:pointer;margin:4px}.node-live{box-shadow:0 0 0 2px #bbf7d0 inset}.node-loading{display:flex;align-items:center;gap:10px;padding:18px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;margin:14px 0}.spinner{width:18px;height:18px;border:3px solid #bfdbfe;border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:760px){.layout{display:block}.sidebar{width:100%}.nav{display:grid;grid-template-columns:repeat(2,1fr)}.content{padding:12px}.grid{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<div id="loginPage">
-  <div class="login">
-    <h1>🔐 Super Admin</h1>
-    <p class="muted">系統總管理獨立入口。車行端不顯示這個入口。</p>
-    <label>管理員帳號</label><input id="loginUser" autocomplete="username">
-    <label>密碼</label><input id="loginPass" type="password" autocomplete="current-password">
-    <button class="btn" style="width:100%" onclick="doLogin()">登入超級管理後台</button>
-    <div class="muted" style="margin-top:10px">Super Admin 專用登入</div>
-  </div>
-</div>
 
-<div id="app">
-  <div class="layout">
-    <aside class="sidebar">
-      <div class="brand">🚘 Super Admin</div>
-      <div class="subbrand">全車行資料中心</div>
-      <div class="nav">
-        <button id="navOverview" class="active" onclick="showPage('overview')">🏢 車行總覽</button>
-        <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
-        <button id="navSales" onclick="showPage('sales')">💰 全部成交</button>
-        <button id="navUsers" onclick="showPage('users')">👥 全部帳號</button>
-        <button id="navHealth" onclick="showPage('health')">🩺 系統健康</button>
-        <button id="navDiagnostics" onclick="showPage('diagnostics')">🧰 錯誤診斷</button>
-        <button id="navUpdates" onclick="showPage('updates')">🚀 版本更新</button>
-        <button id="navBackups" onclick="showPage('backups')">🛡️ 中央備份</button>
-        <button id="navHa" onclick="showPage('ha')">🛰️ 容災架構</button>
-        <button id="navLoadtest" onclick="showPage('loadtest')">⚙️ 壓力測試</button>
-      </div>
-    </aside>
-    <main class="content">
-      <div class="top">
-        <div><h1 id="pageTitle">車行總覽</h1><div class="muted">最高權限：可查閱所有車行的成本、底價、成交與人員資料；帳號以 companyId + username 區分</div></div>
-        <div style="display:flex;align-items:center;gap:8px"><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
-      </div>
-      <div id="main"></div>
-    </main>
-  </div>
-</div>
-
-<div id="modalBg" class="modal-bg"><div id="modal" class="modal"></div></div>
-
-<script>
 const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
 const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
 const AUTO_REFRESH_MS=3000;
-let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0;
+let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0;
 const nodeCompanyCache=new Map(),nodeVehicleCache=new Map();
 
 function today(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
@@ -166,11 +82,11 @@ loginPass.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 
 function showPage(p){
   currentPage=p;saveSession();
-  ["overview","vehicles","sales","users","health","diagnostics","updates","backups","ha","loadtest"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
-  const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號",health:"系統健康",diagnostics:"錯誤診斷",updates:"版本更新",backups:"中央備份",ha:"容災架構",loadtest:"壓力測試"};pageTitle.textContent=titles[p]||"Super Admin";
-  if(p==="diagnostics"&&Date.now()-lastDiagnosticsAt>5000)refreshDiagnostics(false);else if(p==="backups"&&Date.now()-lastBackupsAt>5000)refreshBackups(false);else if(p==="ha"&&Date.now()-lastHaAt>5000)refreshHa(false);else if(p==="loadtest"&&Date.now()-lastLoadTestAt>5000)refreshLoadTests(false);else renderCurrent();
+  ["overview","vehicles","sales","users","health","diagnostics","updates","backups"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
+  const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號",health:"系統健康",diagnostics:"錯誤診斷",updates:"版本更新",backups:"中央備份"};pageTitle.textContent=titles[p]||"Super Admin";
+  if(p==="diagnostics"&&Date.now()-lastDiagnosticsAt>5000)refreshDiagnostics(false);else if(p==="backups"&&Date.now()-lastBackupsAt>5000)refreshBackups(false);else renderCurrent();
 }
-function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers();else if(currentPage==="health")renderHealth();else if(currentPage==="diagnostics")renderDiagnostics();else if(currentPage==="updates")renderUpdates();else if(currentPage==="backups")renderBackups();else if(currentPage==="ha")renderHa();else if(currentPage==="loadtest")renderLoadTests()}
+function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers();else if(currentPage==="health")renderHealth();else if(currentPage==="diagnostics")renderDiagnostics();else if(currentPage==="updates")renderUpdates();else if(currentPage==="backups")renderBackups()}
 function userIsEditing(){const a=document.activeElement;return !!(a&&(a.tagName==="INPUT"||a.tagName==="SELECT"||a.tagName==="TEXTAREA"||a.isContentEditable))}
 function modalIsOpen(){return modalBg.classList.contains("show")}
 
@@ -268,20 +184,6 @@ async function openMigrationStatus(){
  }catch(e){alert(e.message||'讀取 Migration 狀態失敗')}
 }
 
-
-async function refreshHa(showMsg=true){try{if(showMsg)setCloudState('正在檢查容災狀態…','warn');haData=await api('/super/ha');lastHaAt=Date.now();if(showMsg)setCloudState('容災狀態已更新','ok');if(currentPage==='ha')renderCurrentPreservingScroll()}catch(e){if(showMsg)alert(e.message||'讀取容災狀態失敗')}}
-function haRoleBadge(role){const r=String(role||'unknown');return `<span class="badge ${r==='primary'?'ok':r==='standby'?'warn':'bad'}">${r==='primary'?'PRIMARY 主機':r==='standby'?'STANDBY 備援':'未知'}</span>`}
-function renderHa(){const d=haData||{},r=d.runtime||{},peer=d.peer||{},cfg=d.config||{},events=Array.isArray(d.events)?d.events:[],wal=r.wal||{};const enabled=!!d.enabled;main.innerHTML=`<div class="cards"><div class="card"><div class="muted">HA 模式</div><div class="num" style="font-size:20px">${enabled?'已啟用':'未啟用'}</div></div><div class="card"><div class="muted">本機資料庫角色</div><div style="margin-top:10px">${haRoleBadge(r.dbRole)}</div></div><div class="card"><div class="muted">寫入服務</div><div class="num" style="font-size:20px">${r.writeReady?'✓ Ready':'待命 / 不可寫入'}</div></div><div class="card"><div class="muted">Schema</div><div class="num" style="font-size:20px">${r.schemaReady?'✓ Ready':'尚未就緒'}</div></div></div>
-<div class="panel"><div class="panel-head"><div><h2 style="margin:0">Primary / Standby 即時狀態</h2><div class="muted">Phase 7C：系統會直接讀取 PostgreSQL 的真實 primary / recovery 狀態。Standby 期間 API 自動禁止寫入；資料庫被正式 Promote 後，程式會偵測角色改變並恢復寫入服務。</div></div><button class="btn2" onclick="refreshHa(true)">立即檢查</button></div><div class="detail-grid"><div class="detail-item"><b>Instance ID</b><code>${esc(cfg.instanceId||'-')}</code></div><div class="detail-item"><b>機房 / Site</b>${esc(cfg.site||'-')}</div><div class="detail-item"><b>預期角色</b>${esc(cfg.expectedRole||'auto')}</div><div class="detail-item"><b>最後檢查</b>${fmtDateTime(r.lastCheckedAt)}</div><div class="detail-item"><b>目前 WAL</b><code>${esc(wal.currentLsn||wal.replayLsn||'-')}</code></div><div class="detail-item"><b>複寫延遲</b>${wal.replicationLagSeconds==null?'-':esc(wal.replicationLagSeconds)+' 秒'}</div></div>${r.lastError?`<div class="notice" style="border-color:#ef4444"><b>HA 檢查錯誤：</b>${esc(r.lastError)}</div>`:''}</div>
-<div class="panel"><div class="panel-head"><div><h2 style="margin:0">備援節點檢查</h2><div class="muted">Peer URL 只從 Server 環境變數 CENTRAL_HA_PEER_URL 讀取，不開放網頁任意輸入，避免管理介面變成任意網址探測器。</div></div></div>${peer.configured?`<div class="detail-grid"><div class="detail-item"><b>Peer</b><code>${esc(peer.url||'-')}</code></div><div class="detail-item"><b>連線</b>${peer.ok?'<span class="badge ok">可連線</span>':'<span class="badge bad">不可連線</span>'}</div><div class="detail-item"><b>HTTP</b>${esc(peer.httpStatus||'-')}</div><div class="detail-item"><b>Peer 角色</b>${haRoleBadge(peer.probe?.dbRole)}</div></div>`:'<div class="notice">尚未設定 <code>CENTRAL_HA_PEER_URL</code>。單機環境可以維持關閉；建立第二台中央主機時再設定。</div>'}</div>
-<div class="panel"><div class="panel-head"><div><h2 style="margin:0">容災事件</h2><div class="muted">資料庫 Promote 後的角色切換會留下稽核紀錄。實體 PostgreSQL streaming replication / Promote 本身由主機或雲端基礎設施負責，不由網頁直接執行。</div></div></div><div class="table-wrap"><table><thead><tr><th>時間</th><th>Instance</th><th>Site</th><th>事件</th><th>角色變化</th><th>說明</th></tr></thead><tbody>${events.map(x=>`<tr><td>${fmtDateTime(x.created_at)}</td><td><code>${esc(x.instance_id)}</code></td><td>${esc(x.site)}</td><td>${esc(x.event_type)}</td><td>${esc(x.from_role||'-')} → ${esc(x.to_role||'-')}</td><td>${esc(x.detail||'-')}</td></tr>`).join('')||'<tr><td colspan="6">尚無容災切換事件</td></tr>'}</tbody></table></div></div>
-<div class="notice"><b>正式部署原則</b><br>Primary：<code>CENTRAL_HA_ENABLED=true</code>，PostgreSQL 為可寫入主庫。<br>Standby：同樣啟用 HA，但 PostgreSQL 必須是真正的 streaming-replication recovery 節點。負載平衡器健康檢查使用 <code>/api/ready</code>；Standby 在 Promote 前會回 503，Promote 後會自動變成 Ready。</div>`}
-
-async function refreshLoadTests(showMsg=true){try{if(showMsg)setCloudState('正在讀取壓力測試結果…','warn');loadTestData=await api('/super/load-tests');lastLoadTestAt=Date.now();if(showMsg)setCloudState('壓力測試結果已更新','ok');if(currentPage==='loadtest')renderCurrentPreservingScroll()}catch(e){if(showMsg)alert(e.message||'讀取壓力測試結果失敗')}}
-function loadTestStatusBadge(s){return s==='completed'?'<span class="badge ok">完成</span>':s==='completed_with_errors'?'<span class="badge warn">完成・有錯誤</span>':s==='running'?'<span class="badge info">執行中</span>':'<span class="badge bad">'+esc(s||'未知')+'</span>'}
-function renderLoadTests(){const d=loadTestData||{},runs=Array.isArray(d.runs)?d.runs:[];main.innerHTML=`<div class="cards"><div class="card"><div class="muted">壓測端點</div><div class="num" style="font-size:20px">${d.enabled?'已啟用':'預設關閉'}</div></div><div class="card"><div class="muted">Server 安全上限</div><div class="num" style="font-size:20px">${Number(d.maxRps||0).toLocaleString()} RPS</div></div><div class="card"><div class="muted">近 60 秒虛擬節點</div><div class="num">${Number(d.activeVirtualNodes||0).toLocaleString()}</div></div><div class="card"><div class="muted">測試 Token</div><div class="num" style="font-size:20px">${d.tokenConfigured?'✓ 已設定':'尚未設定'}</div></div></div>
-<div class="panel"><div class="panel-head"><div><h2 style="margin:0">⚙️ Phase 8A｜Dealer Node 壓力測試</h2><div class="muted">測試資料寫入隔離表，不建立假車行、不污染正式 Dealer Node。預設 10,000 節點每 15 秒 heartbeat 約 666.7 req/s。第一次請從 staging 的 100 → 1,000 → 5,000 → 10,000 漸進測試。</div></div><button class="btn2" onclick="refreshLoadTests(true)">重新整理</button></div><div class="notice">為避免 Super Admin 誤觸造成大量流量，壓測由 Server ZIP 內的 <code>tools/dealer-node-load-simulator.mjs</code> 執行；遠端測試另外需要 <code>ALLOW_REMOTE_LOAD_TEST=true</code> 與確認字串。</div></div>
-<div class="panel"><div class="panel-head"><div><h2 style="margin:0">最近 50 次測試</h2><div class="muted">P95 / P99 越低越好；錯誤率應接近 0。結果要搭配 CPU、RAM、PostgreSQL connections 與網路頻寬一起判斷。</div></div></div><div class="table-wrap"><table><thead><tr><th>開始時間</th><th>狀態</th><th>節點</th><th>秒數</th><th>Interval</th><th>請求</th><th>成功</th><th>錯誤</th><th>RPS</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th></tr></thead><tbody>${runs.map(r=>`<tr><td>${fmtDateTime(r.started_at)}</td><td>${loadTestStatusBadge(r.status)}</td><td>${Number(r.target_nodes||0).toLocaleString()}</td><td>${Number(r.duration_seconds||0)}</td><td>${Number(r.heartbeat_interval_ms||0).toLocaleString()} ms</td><td>${Number(r.total_requests||0).toLocaleString()}</td><td>${Number(r.success_count||0).toLocaleString()}</td><td>${Number(r.error_count||0).toLocaleString()}</td><td>${Number(r.rps||0).toFixed(1)}</td><td>${Number(r.p50_ms||0).toFixed(1)} ms</td><td>${Number(r.p95_ms||0).toFixed(1)} ms</td><td>${Number(r.p99_ms||0).toFixed(1)} ms</td><td>${Number(r.max_ms||0).toFixed(1)} ms</td></tr>`).join('')||'<tr><td colspan="13">尚無壓力測試紀錄</td></tr>'}</tbody></table></div></div>`}
 
 async function refreshBackups(showMsg=true){try{if(showMsg)setCloudState('正在讀取中央備份…','warn');backupData=await api('/super/backups');lastBackupsAt=Date.now();if(showMsg)setCloudState('中央備份已更新','ok');if(currentPage==='backups')renderCurrentPreservingScroll()}catch(e){if(showMsg)alert(e.message||'讀取備份狀態失敗')}}
 function bytes(v){const n=Number(v||0);if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'}
@@ -451,6 +353,3 @@ modalBg.addEventListener("click",e=>{if(e.target===modalBg)closeModal()});docume
   const ok=await restoreSession();if(!ok){loginPage.style.display="flex";app.style.display="none"}
   setInterval(()=>{if(superToken)refreshCloud(false).catch(()=>{})},AUTO_REFRESH_MS);
 })();
-</script>
-</body>
-</html>

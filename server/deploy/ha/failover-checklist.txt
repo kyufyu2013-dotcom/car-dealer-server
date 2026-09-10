@@ -1,0 +1,11 @@
+Phase 7C controlled failover checklist
+
+[ ] Latest central backup verified
+[ ] Standby replication lag acceptable / WAL caught up
+[ ] Old Primary fenced from writes
+[ ] Promote Standby using PostgreSQL/cloud HA tooling
+[ ] /api/ready on promoted site = HTTP 200
+[ ] Super Admin > 容災架構 shows PRIMARY and writeReady
+[ ] Login / vehicle / sale / backup smoke tests pass
+[ ] Rebuild old Primary as new Standby
+[ ] Confirm peer redundancy restored

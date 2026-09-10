@@ -5,7 +5,7 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs/promises';
-import { gzipSync } from 'zlib';
+import { gzipSync, gunzipSync } from 'zlib';
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { fileURLToPath } from 'url';
 
@@ -43,6 +43,23 @@ const BACKUP_S3_PREFIX = String(process.env.BACKUP_S3_PREFIX || 'car-dealer-cent
 const BACKUP_S3_ACCESS_KEY_ID = process.env.BACKUP_S3_ACCESS_KEY_ID || '';
 const BACKUP_S3_SECRET_ACCESS_KEY = process.env.BACKUP_S3_SECRET_ACCESS_KEY || '';
 const BACKUP_S3_FORCE_PATH_STYLE = String(process.env.BACKUP_S3_FORCE_PATH_STYLE||'').toLowerCase()==='true';
+// Phase 7C: central Primary / Standby high-availability awareness.
+// PostgreSQL streaming replication and promotion are infrastructure responsibilities; the app detects
+// pg_is_in_recovery(), keeps a standby read-only, and becomes write-ready automatically after promotion.
+const CENTRAL_HA_ENABLED = String(process.env.CENTRAL_HA_ENABLED||'').toLowerCase()==='true';
+const CENTRAL_HA_INSTANCE_ID = String(process.env.CENTRAL_HA_INSTANCE_ID||process.env.RENDER_INSTANCE_ID||process.env.HOSTNAME||'central-1').slice(0,120);
+const CENTRAL_HA_SITE = String(process.env.CENTRAL_HA_SITE||'primary-site').slice(0,120);
+const CENTRAL_HA_EXPECTED_ROLE = ['primary','standby','auto'].includes(String(process.env.CENTRAL_HA_EXPECTED_ROLE||'auto').toLowerCase())?String(process.env.CENTRAL_HA_EXPECTED_ROLE||'auto').toLowerCase():'auto';
+const CENTRAL_HA_PEER_URL = String(process.env.CENTRAL_HA_PEER_URL||'').replace(/\/$/,'');
+const CENTRAL_HA_PEER_TIMEOUT_MS = Math.max(1000,Math.min(10000,Number(process.env.CENTRAL_HA_PEER_TIMEOUT_MS||3500)));
+let haRuntime={enabled:CENTRAL_HA_ENABLED,instanceId:CENTRAL_HA_INSTANCE_ID,site:CENTRAL_HA_SITE,expectedRole:CENTRAL_HA_EXPECTED_ROLE,dbRole:'unknown',schemaReady:false,writeReady:false,lastCheckedAt:null,lastRoleChangeAt:null,lastError:'',wal:{}};
+let haMigrationRunning=false;
+// Phase 8A: isolated Dealer Node load-test harness. Disabled by default and never writes into real dealership tables.
+const LOAD_TEST_ENABLED = String(process.env.LOAD_TEST_ENABLED||'').toLowerCase()==='true';
+const LOAD_TEST_TOKEN = String(process.env.LOAD_TEST_TOKEN||'');
+const LOAD_TEST_MAX_RPS = Math.max(10,Math.min(10000,Number(process.env.LOAD_TEST_MAX_RPS||2500)));
+let loadTestWindowSecond=0,loadTestWindowCount=0;
+
 function b64url(v){return Buffer.from(v).toString('base64url')}
 function offlineVerifier(password){const salt=crypto.randomBytes(16).toString('hex');const hash=crypto.scryptSync(String(password),salt,64,{N:16384,r:8,p:1}).toString('hex');return `${salt}:${hash}`;}
 function issueOfflineTicket(company,user,password,seconds=OFFLINE_GRACE_SECONDS){
@@ -273,7 +290,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=6;
+const SERVER_SCHEMA_TARGET=9;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -494,6 +511,89 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_central_backup_status ON central_backup_events(status,started_at DESC);
       UPDATE desktop_update_policy SET latest_version='0.9.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v6' WHERE id=1 AND updated_by='migration' AND latest_version='0.9.5';
     `
+  },
+  {
+    version:7,
+    name:'phase7b-backup-verify-restore',
+    sql:`
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending';
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS verified_at TEXT;
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS verification_error TEXT NOT NULL DEFAULT '';
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS drill_status TEXT NOT NULL DEFAULT 'not_run';
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS drill_at TEXT;
+      ALTER TABLE central_backup_events ADD COLUMN IF NOT EXISTS drill_error TEXT NOT NULL DEFAULT '';
+      CREATE TABLE IF NOT EXISTS central_restore_events(
+        id BIGSERIAL PRIMARY KEY,
+        restore_id TEXT NOT NULL UNIQUE,
+        backup_id TEXT NOT NULL DEFAULT '',
+        safety_backup_id TEXT NOT NULL DEFAULT '',
+        mode TEXT NOT NULL DEFAULT 'restore',
+        status TEXT NOT NULL DEFAULT 'running',
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        actor TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '',
+        error_text TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_central_restore_time ON central_restore_events(started_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.9.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v7' WHERE id=1 AND latest_version='0.9.6';
+    `
+  },
+  {
+    version:8,
+    name:'phase7c-primary-standby-ha',
+    sql:`
+      CREATE TABLE IF NOT EXISTS central_ha_events(
+        id BIGSERIAL PRIMARY KEY,
+        instance_id TEXT NOT NULL DEFAULT '',
+        site TEXT NOT NULL DEFAULT '',
+        event_type TEXT NOT NULL,
+        from_role TEXT NOT NULL DEFAULT '',
+        to_role TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_central_ha_time ON central_ha_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_central_ha_instance ON central_ha_events(instance_id,created_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.9.8',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v8' WHERE id=1 AND latest_version='0.9.7';
+    `
+  },
+  {
+    version:9,
+    name:'phase8a-dealer-node-load-simulator',
+    sql:`
+      CREATE TABLE IF NOT EXISTS load_test_nodes(
+        node_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL DEFAULT '',
+        virtual_company_id TEXT NOT NULL DEFAULT '',
+        app_version TEXT NOT NULL DEFAULT '',
+        last_seq BIGINT NOT NULL DEFAULT 0,
+        payload_bytes INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_load_test_nodes_run ON load_test_nodes(run_id,last_seen_at DESC);
+      CREATE TABLE IF NOT EXISTS load_test_runs(
+        run_id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        target_nodes INTEGER NOT NULL DEFAULT 0,
+        duration_seconds INTEGER NOT NULL DEFAULT 0,
+        heartbeat_interval_ms INTEGER NOT NULL DEFAULT 15000,
+        concurrency INTEGER NOT NULL DEFAULT 0,
+        total_requests BIGINT NOT NULL DEFAULT 0,
+        success_count BIGINT NOT NULL DEFAULT 0,
+        error_count BIGINT NOT NULL DEFAULT 0,
+        rps DOUBLE PRECISION NOT NULL DEFAULT 0,
+        p50_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        p99_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        max_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        detail JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_load_test_runs_time ON load_test_runs(started_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.9.9',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v9' WHERE id=1 AND latest_version='0.9.8';
+    `
   }
 ];
 
@@ -568,6 +668,54 @@ async function initDb(){
   console.log(`PostgreSQL connected: ${r.rows[0].now} | schema v${schema.currentVersion}/${schema.targetVersion}`);
 }
 
+async function inspectDatabaseHaRole(){
+  const {rows}=await pool.query(`SELECT pg_is_in_recovery() AS in_recovery,
+    CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_lsn()::text END AS current_wal_lsn,
+    pg_last_wal_receive_lsn()::text AS receive_lsn,
+    pg_last_wal_replay_lsn()::text AS replay_lsn,
+    pg_last_xact_replay_timestamp() AS replay_timestamp`);
+  const r=rows[0]||{};
+  const standby=!!r.in_recovery;
+  let lagSeconds=null;
+  if(standby&&r.replay_timestamp){const n=(Date.now()-new Date(r.replay_timestamp).getTime())/1000;if(Number.isFinite(n))lagSeconds=Math.max(0,Math.round(n*10)/10)}
+  return {dbRole:standby?'standby':'primary',wal:{currentLsn:r.current_wal_lsn||'',receiveLsn:r.receive_lsn||'',replayLsn:r.replay_lsn||'',replayTimestamp:r.replay_timestamp?new Date(r.replay_timestamp).toISOString():null,replicationLagSeconds:lagSeconds}};
+}
+async function recordHaEvent(eventType,fromRole,toRole,detail=''){
+  try{
+    // Physical standby is read-only, so audit insertion is only attempted on a writable primary.
+    if(toRole==='standby'||haRuntime.dbRole==='standby')return;
+    await pool.query('INSERT INTO central_ha_events(instance_id,site,event_type,from_role,to_role,detail,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)',[CENTRAL_HA_INSTANCE_ID,CENTRAL_HA_SITE,String(eventType||'role_change'),String(fromRole||''),String(toRole||''),String(detail||'').slice(0,1000),now()]);
+  }catch(e){console.warn('HA audit unavailable:',e?.message||e)}
+}
+async function refreshHaRuntime({allowMigration=false,recordTransition=true}={}){
+  const prev=haRuntime.dbRole;
+  try{
+    const db=await inspectDatabaseHaRole();
+    let schemaReady=false;
+    if(db.dbRole==='primary'&&allowMigration&&!haMigrationRunning){
+      haMigrationRunning=true;
+      try{await runServerMigrations()}finally{haMigrationRunning=false}
+    }
+    try{const schema=await getServerSchemaStatus();schemaReady=schema.status==='ready'&&schema.currentVersion===SERVER_SCHEMA_TARGET}catch{}
+    haRuntime={...haRuntime,dbRole:db.dbRole,wal:db.wal,schemaReady,writeReady:(!CENTRAL_HA_ENABLED||db.dbRole==='primary')&&schemaReady,lastCheckedAt:now(),lastError:''};
+    if(prev!=='unknown'&&prev!==db.dbRole){
+      haRuntime.lastRoleChangeAt=now();
+      if(recordTransition)await recordHaEvent('database_role_changed',prev,db.dbRole,`PostgreSQL role ${prev} -> ${db.dbRole}`);
+    }
+    return haRuntime;
+  }catch(e){haRuntime={...haRuntime,writeReady:false,lastCheckedAt:now(),lastError:String(e?.message||e).slice(0,500)};return haRuntime}
+}
+async function probeHaPeer(){
+  if(!CENTRAL_HA_PEER_URL)return {configured:false,ok:false,url:'',detail:'未設定 CENTRAL_HA_PEER_URL'};
+  const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),CENTRAL_HA_PEER_TIMEOUT_MS);
+  try{
+    const r=await fetch(`${CENTRAL_HA_PEER_URL}/api/ready`,{signal:ctl.signal,headers:{Accept:'application/json'}});
+    let body={};try{body=await r.json()}catch{}
+    return {configured:true,ok:r.ok,url:CENTRAL_HA_PEER_URL,httpStatus:r.status,probe:body};
+  }catch(e){return {configured:true,ok:false,url:CENTRAL_HA_PEER_URL,detail:e?.name==='AbortError'?'連線逾時':String(e?.message||e)}
+  }finally{clearTimeout(timer)}
+}
+
 async function getCompany(companyId, client=pool){
   const {rows}=await client.query('SELECT * FROM companies WHERE id=$1',[companyId]);
   return rows[0]||null;
@@ -629,10 +777,26 @@ app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366')
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
 app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 
+// A physical PostgreSQL standby must never accept mutations. After promotion,
+// refreshHaRuntime automatically flips writeReady and normal traffic resumes.
+app.use('/api',(req,res,next)=>{
+  if(CENTRAL_HA_ENABLED&&haRuntime.dbRole==='standby'&&!['GET','HEAD','OPTIONS'].includes(req.method)){
+    return res.status(503).json({error:'中央服務目前為備援待命狀態，請稍後重試',errorCode:'HA_STANDBY_READ_ONLY'});
+  }
+  next();
+});
+
+app.get('/api/ready',async(req,res)=>{
+  const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
+  const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.47',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  res.status(ready?200:503).json(body);
+});
+
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.44',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase7a-central-backup'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.47',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8a-load-tested-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1136,6 +1300,68 @@ app.patch('/api/super/update-policy',superAuth,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+function loadTestAuth(req,res,next){
+  if(!LOAD_TEST_ENABLED)return res.status(404).json({error:'Load test endpoint disabled'});
+  if(!LOAD_TEST_TOKEN||LOAD_TEST_TOKEN.length<16)return res.status(503).json({error:'LOAD_TEST_TOKEN not configured'});
+  const supplied=String(req.headers['x-loadtest-token']||req.headers.authorization||'').replace(/^Bearer\s+/i,'');
+  const a=Buffer.from(supplied),b=Buffer.from(LOAD_TEST_TOKEN);
+  if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:'Invalid load-test token'});
+  const sec=Math.floor(Date.now()/1000);if(sec!==loadTestWindowSecond){loadTestWindowSecond=sec;loadTestWindowCount=0}
+  if(++loadTestWindowCount>LOAD_TEST_MAX_RPS)return res.status(429).json({error:'Load-test server safety RPS limit reached',limit:LOAD_TEST_MAX_RPS});
+  next();
+}
+
+app.post('/api/load-test/run/start',loadTestAuth,async(req,res,next)=>{
+  try{
+    const b=req.body||{},runId=String(b.runId||`lt_${crypto.randomUUID()}`).slice(0,100);
+    const targetNodes=Math.max(1,Math.min(100000,Number(b.targetNodes||10000)));
+    const durationSeconds=Math.max(1,Math.min(86400,Number(b.durationSeconds||60)));
+    const heartbeatIntervalMs=Math.max(1000,Math.min(300000,Number(b.heartbeatIntervalMs||15000)));
+    const concurrency=Math.max(1,Math.min(5000,Number(b.concurrency||200)));
+    await pool.query('DELETE FROM load_test_nodes WHERE last_seen_at < $1',[new Date(Date.now()-24*3600*1000).toISOString()]);
+    await pool.query(`INSERT INTO load_test_runs(run_id,started_at,status,target_nodes,duration_seconds,heartbeat_interval_ms,concurrency,detail)
+      VALUES($1,$2,'running',$3,$4,$5,$6,$7::jsonb)
+      ON CONFLICT(run_id) DO UPDATE SET started_at=EXCLUDED.started_at,completed_at=NULL,status='running',target_nodes=EXCLUDED.target_nodes,duration_seconds=EXCLUDED.duration_seconds,heartbeat_interval_ms=EXCLUDED.heartbeat_interval_ms,concurrency=EXCLUDED.concurrency,total_requests=0,success_count=0,error_count=0,rps=0,p50_ms=0,p95_ms=0,p99_ms=0,max_ms=0,detail=EXCLUDED.detail`,
+      [runId,now(),targetNodes,durationSeconds,heartbeatIntervalMs,concurrency,JSON.stringify({source:'phase8a-simulator',serverInstance:CENTRAL_HA_INSTANCE_ID})]);
+    res.json({ok:true,runId,serverTime:now(),maxRps:LOAD_TEST_MAX_RPS});
+  }catch(e){next(e)}
+});
+
+app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
+  const started=process.hrtime.bigint();
+  try{
+    const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
+    if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.9.9').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
+      [nodeId,runId,virtualCompanyId,appVersion,seq,payloadBytes,now()]);
+    const ms=Number(process.hrtime.bigint()-started)/1e6;
+    res.json({ok:true,serverTime:now(),dbMs:Number(ms.toFixed(3))});
+  }catch(e){next(e)}
+});
+
+app.post('/api/load-test/run/finish',loadTestAuth,async(req,res,next)=>{
+  try{
+    const b=req.body||{},runId=String(b.runId||'').slice(0,100);if(!runId)return res.status(400).json({error:'runId required'});
+    const nums=k=>Math.max(0,Number(b[k]||0));
+    const detail=sanitizeDiagnosticContext(b.detail||{});
+    await pool.query(`UPDATE load_test_runs SET completed_at=$1,status=$2,total_requests=$3,success_count=$4,error_count=$5,rps=$6,p50_ms=$7,p95_ms=$8,p99_ms=$9,max_ms=$10,detail=COALESCE(detail,'{}'::jsonb)||$11::jsonb WHERE run_id=$12`,
+      [now(),String(b.status||'completed').slice(0,30),nums('totalRequests'),nums('successCount'),nums('errorCount'),nums('rps'),nums('p50Ms'),nums('p95Ms'),nums('p99Ms'),nums('maxMs'),JSON.stringify(detail),runId]);
+    const active=Number((await pool.query('SELECT COUNT(*)::int AS n FROM load_test_nodes WHERE run_id=$1',[runId])).rows[0]?.n||0);
+    res.json({ok:true,runId,virtualNodesSeen:active});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/load-tests',superAuth,async(req,res,next)=>{
+  try{
+    const {rows}=await pool.query('SELECT * FROM load_test_runs ORDER BY started_at DESC LIMIT 50');
+    const active=Number((await pool.query("SELECT COUNT(*)::int AS n FROM load_test_nodes WHERE last_seen_at >= $1",[new Date(Date.now()-60000).toISOString()])).rows[0]?.n||0);
+    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:rows});
+  }catch(e){next(e)}
+});
+
 app.get('/api/super/companies',superAuth,async(req,res,next)=>{
   try{
     const {rows}=await pool.query(`
@@ -1482,7 +1708,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy'];
+const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -1503,7 +1729,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.32',apiVersion:'2.4.44',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.35',apiVersion:'2.4.47',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -1511,15 +1737,56 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     await pruneLocalBackups(policy.retentionDays);
     const finalStatus=policy.offsiteEnabled&&offsiteStatus==='failed'?'partial':'success';
     await pool.query(`UPDATE central_backup_events SET status=$1,completed_at=$2,size_bytes=$3,sha256=$4,local_path=$5,offsite_provider=$6,offsite_key=$7,offsite_status=$8,table_count=$9,row_count=$10 WHERE backup_id=$11`,[finalStatus,now(),encrypted.length,hash,localPath,offsiteProvider,offsiteKey,offsiteStatus,CENTRAL_BACKUP_TABLES.length,rowCount,backupId]);
-    return {ok:true,backupId,status:finalStatus,sizeBytes:encrypted.length,sha256:hash,offsiteStatus,offsiteKey,tableCount:CENTRAL_BACKUP_TABLES.length,rowCount};
+    let verificationStatus='verified';try{await verifyCentralBackup(backupId,actor)}catch{verificationStatus='failed'}
+    return {ok:true,backupId,status:finalStatus,verificationStatus,sizeBytes:encrypted.length,sha256:hash,offsiteStatus,offsiteKey,tableCount:CENTRAL_BACKUP_TABLES.length,rowCount};
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
-async function centralBackupSummary(){const policy=await getCentralBackupPolicy(),events=(await pool.query('SELECT * FROM central_backup_events ORDER BY id DESC LIMIT 100')).rows,last=events[0]||null,lastSuccess=events.find(x=>x.status==='success'||x.status==='partial')||null;return {policy,events,last,lastSuccess,running:centralBackupRunning,storage:backupStorageStatus(),generatedAt:now()}}
+
+const CENTRAL_RESTORE_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs'];
+function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
+function decryptBackupBuffer(buf){
+  const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
+  const rest=buf.subarray(magic.length),nl=rest.indexOf(10);if(nl<1)throw new Error('備份標頭損壞');
+  const h=JSON.parse(rest.subarray(0,nl).toString('utf8'));if(h.format!=='CDBAK'||h.version!==1||h.encryption!=='AES-256-GCM')throw new Error('不支援的備份格式');
+  const decipher=crypto.createDecipheriv('aes-256-gcm',backupKeyBytes(),Buffer.from(h.iv,'base64'));decipher.setAuthTag(Buffer.from(h.tag,'base64'));
+  const compressed=Buffer.concat([decipher.update(rest.subarray(nl+1)),decipher.final()]);return gunzipSync(compressed);
+}
+async function loadBackupPayload(backupId){
+  const {rows}=await pool.query('SELECT * FROM central_backup_events WHERE backup_id=$1',[backupId]);const ev=rows[0];if(!ev)throw new Error('找不到此備份紀錄');if(!ev.local_path)throw new Error('此備份沒有本機檔案');
+  const encrypted=await fs.readFile(ev.local_path);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');if(ev.sha256&&hash!==ev.sha256)throw new Error('SHA-256 不一致，備份檔可能已損壞');
+  const payload=JSON.parse(decryptBackupBuffer(encrypted).toString('utf8'));return {ev,payload,hash,sizeBytes:encrypted.length};
+}
+function validateBackupPayload(payload){
+  if(!payload||payload.format!=='car-dealer-central-logical-backup'||payload.formatVersion!==1)throw new Error('備份內容格式不正確');
+  if(!payload.tables||typeof payload.tables!=='object')throw new Error('備份缺少資料表內容');
+  for(const t of CENTRAL_RESTORE_TABLES)if(!Array.isArray(payload.tables[t]))throw new Error(`備份缺少必要資料表：${t}`);
+  return {schemaVersion:Number(payload.schemaVersion||0),tableCount:Object.keys(payload.tables).length,rowCount:Object.values(payload.tables).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0),createdAt:payload.createdAt||''};
+}
+async function verifyCentralBackup(backupId,actor=SUPER_ADMIN_USER){
+  try{const {payload,hash,sizeBytes}=await loadBackupPayload(backupId),v=validateBackupPayload(payload),schema=await getServerSchemaStatus();if(v.schemaVersion!==schema.currentVersion)throw new Error(`Schema 不相容：備份 v${v.schemaVersion} / 目前 v${schema.currentVersion}`);await pool.query("UPDATE central_backup_events SET verification_status='verified',verified_at=$1,verification_error='' WHERE backup_id=$2",[now(),backupId]);return {ok:true,backupId,sha256:hash,sizeBytes,...v};}
+  catch(e){await pool.query("UPDATE central_backup_events SET verification_status='failed',verified_at=$1,verification_error=$2 WHERE backup_id=$3",[now(),String(e?.message||e).slice(0,2000),backupId]).catch(()=>{});await recordDiagnostic('','BACKUP_VERIFY_003','central_backup',e?.message||'備份驗證失敗',{severity:'error',actor,context:{backupId}});throw e}
+}
+async function insertRows(client,table,rows){for(const row of rows){const cols=Object.keys(row);if(!cols.length)continue;const vals=cols.map(c=>row[c]);await client.query(`INSERT INTO ${qIdent(table)} (${cols.map(qIdent).join(',')}) VALUES (${cols.map((_,i)=>'$'+(i+1)).join(',')})`,vals)}}
+async function drillCentralBackup(backupId,actor=SUPER_ADMIN_USER){
+  const restoreId=crypto.randomUUID();await pool.query("INSERT INTO central_restore_events(restore_id,backup_id,mode,status,started_at,actor) VALUES($1,$2,'drill','running',$3,$4)",[restoreId,backupId,now(),actor]);
+  const client=await pool.connect();try{const {payload}=await loadBackupPayload(backupId),v=validateBackupPayload(payload),schema=await getServerSchemaStatus();if(v.schemaVersion!==schema.currentVersion)throw new Error(`Schema 不相容：備份 v${v.schemaVersion} / 目前 v${schema.currentVersion}`);await client.query('BEGIN');for(const t of CENTRAL_RESTORE_TABLES){const temp=`drill_${t}_${restoreId.replaceAll('-','').slice(0,8)}`;await client.query(`CREATE TEMP TABLE ${qIdent(temp)} (LIKE ${qIdent(t)} INCLUDING DEFAULTS) ON COMMIT DROP`);await insertRows(client,temp,payload.tables[t]);const c=Number((await client.query(`SELECT COUNT(*)::bigint AS n FROM ${qIdent(temp)}`)).rows[0].n);if(c!==payload.tables[t].length)throw new Error(`演練筆數不一致：${t}`)}await client.query('ROLLBACK');await pool.query("UPDATE central_backup_events SET drill_status='passed',drill_at=$1,drill_error='' WHERE backup_id=$2",[now(),backupId]);await pool.query("UPDATE central_restore_events SET status='success',completed_at=$1,detail=$2 WHERE restore_id=$3",[now(),`驗證 ${v.tableCount} tables / ${v.rowCount} rows`,restoreId]);return {ok:true,restoreId,backupId,...v};}
+  catch(e){try{await client.query('ROLLBACK')}catch{};await pool.query("UPDATE central_backup_events SET drill_status='failed',drill_at=$1,drill_error=$2 WHERE backup_id=$3",[now(),String(e?.message||e).slice(0,2000),backupId]).catch(()=>{});await pool.query("UPDATE central_restore_events SET status='failed',completed_at=$1,error_text=$2 WHERE restore_id=$3",[now(),String(e?.message||e).slice(0,2000),restoreId]).catch(()=>{});await recordDiagnostic('','BACKUP_DRILL_004','central_backup',e?.message||'復原演練失敗',{severity:'error',actor,context:{backupId,restoreId}});throw e}finally{client.release()}
+}
+async function restoreCentralBackup(backupId,actor=SUPER_ADMIN_USER){
+  const verified=await verifyCentralBackup(backupId,actor);const safety=await createCentralBackup('pre_restore_safety',actor);await verifyCentralBackup(safety.backupId,actor);
+  const restoreId=crypto.randomUUID();await pool.query("INSERT INTO central_restore_events(restore_id,backup_id,safety_backup_id,mode,status,started_at,actor) VALUES($1,$2,$3,'restore','running',$4,$5)",[restoreId,backupId,safety.backupId,now(),actor]);
+  const {payload}=await loadBackupPayload(backupId),client=await pool.connect();try{await client.query('BEGIN');for(const t of [...CENTRAL_RESTORE_TABLES].reverse())await client.query(`DELETE FROM ${qIdent(t)}`);for(const t of CENTRAL_RESTORE_TABLES){await insertRows(client,t,payload.tables[t]);try{const seq=(await client.query(`SELECT pg_get_serial_sequence($1,'id') AS s`,[t])).rows[0]?.s;if(seq){const mx=Number((await client.query(`SELECT COALESCE(MAX(id),0) AS m FROM ${qIdent(t)}`)).rows[0]?.m||0);if(mx>0)await client.query('SELECT setval($1,$2,true)',[seq,mx])}}catch{}}await client.query('COMMIT');await pool.query("UPDATE central_restore_events SET status='success',completed_at=$1,detail=$2 WHERE restore_id=$3",[now(),`Safety backup: ${safety.backupId}`,restoreId]);return {ok:true,restoreId,backupId,safetyBackupId:safety.backupId,verified};}
+  catch(e){try{await client.query('ROLLBACK')}catch{};await pool.query("UPDATE central_restore_events SET status='failed',completed_at=$1,error_text=$2 WHERE restore_id=$3",[now(),String(e?.message||e).slice(0,2000),restoreId]).catch(()=>{});await recordDiagnostic('','BACKUP_RESTORE_005','central_backup',e?.message||'正式復原失敗',{severity:'critical',actor,context:{backupId,restoreId,safetyBackupId:safety.backupId}});throw e}finally{client.release()}
+}
+async function centralBackupSummary(){const policy=await getCentralBackupPolicy(),events=(await pool.query('SELECT * FROM central_backup_events ORDER BY id DESC LIMIT 100')).rows,restoreEvents=(await pool.query('SELECT * FROM central_restore_events ORDER BY id DESC LIMIT 50')).rows,last=events[0]||null,lastSuccess=events.find(x=>x.status==='success'||x.status==='partial')||null;return {policy,events,restoreEvents,last,lastSuccess,running:centralBackupRunning,storage:backupStorageStatus(),generatedAt:now()}}
 async function maybeRunScheduledCentralBackup(){try{const policy=await getCentralBackupPolicy();if(!policy.enabled||centralBackupRunning)return;const d=new Date(),parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(d),get=t=>parts.find(x=>x.type===t)?.value||'';if(Number(get('hour'))!==policy.dailyHourTaipei)return;const day=`${get('year')}-${get('month')}-${get('day')}`,dayStart=new Date(`${day}T00:00:00+08:00`).toISOString();const {rows}=await pool.query("SELECT id FROM central_backup_events WHERE trigger_type='scheduled' AND started_at >= $1 AND status IN ('running','success','partial') LIMIT 1",[dayStart]);if(rows.length)return;await createCentralBackup('scheduled','scheduler')}catch(e){console.warn('scheduled central backup:',e?.message||e)}}
 
 app.get('/api/super/backups',superAuth,async(req,res,next)=>{try{res.json(await centralBackupSummary())}catch(e){next(e)}});
 app.patch('/api/super/backups/policy',superAuth,async(req,res,next)=>{try{const b=req.body||{},hour=Math.max(0,Math.min(23,Number(b.dailyHourTaipei??3))),days=Math.max(1,Math.min(365,Number(b.retentionDays||14)));await pool.query(`UPDATE central_backup_policy SET enabled=$1,daily_hour_taipei=$2,retention_days=$3,offsite_enabled=$4,updated_at=$5,updated_by=$6 WHERE id=1`,[!!b.enabled,hour,days,!!b.offsiteEnabled,now(),SUPER_ADMIN_USER]);res.json({ok:true,...await centralBackupSummary()})}catch(e){next(e)}});
 app.post('/api/super/backups/run',superAuth,async(req,res,next)=>{try{const result=await createCentralBackup('manual',SUPER_ADMIN_USER);res.json(result)}catch(e){next(e)}});
+app.post('/api/super/backups/:backupId/verify',superAuth,async(req,res,next)=>{try{res.json(await verifyCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
+app.post('/api/super/backups/:backupId/drill',superAuth,async(req,res,next)=>{try{res.json(await drillCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
+app.post('/api/super/backups/:backupId/restore',superAuth,async(req,res,next)=>{try{const phrase=String(req.body?.confirmPhrase||'');if(phrase!==`RESTORE ${req.params.backupId}`)return res.status(400).json({error:'復原確認文字不正確'});res.json(await restoreCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
 
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
   try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
@@ -1571,6 +1838,24 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
       return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0),agentAutoRecovery:!!caps.agentAutoRecovery,agentWatchdog:!!caps.agentWatchdog,agentRecoveryCount:Number(caps.agentRecoveryCount||0),agentLastRecoveryAt:caps.agentLastRecoveryAt||null,agentHeartbeatFailures:Number(caps.agentHeartbeatFailures||0),agentCommandFailures:Number(caps.agentCommandFailures||0),latestDesktopVersion:updatePolicy.latestVersion,minimumDesktopVersion:updatePolicy.minimumVersion,updatePolicyEnabled:updatePolicy.enabled,desktopVersionState:!updatePolicy.enabled?'unmanaged':(compareSemver(n?.app_version||'0.0.0',updatePolicy.minimumVersion)<0?'blocked':(compareSemver(n?.app_version||'0.0.0',updatePolicy.latestVersion)<0?'update_available':'current'))};
     });
     res.json({health:rows,generatedAt:now(),schema,updatePolicy});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/ha',superAuth,async(req,res,next)=>{
+  try{
+    const runtime=await refreshHaRuntime({allowMigration:false,recordTransition:false});
+    const peer=await probeHaPeer();
+    let events=[];try{events=(await pool.query('SELECT * FROM central_ha_events ORDER BY id DESC LIMIT 100')).rows}catch{}
+    const schema=await getServerSchemaStatus();
+    res.json({
+      enabled:CENTRAL_HA_ENABLED,
+      runtime,
+      peer,
+      schema,
+      config:{instanceId:CENTRAL_HA_INSTANCE_ID,site:CENTRAL_HA_SITE,expectedRole:CENTRAL_HA_EXPECTED_ROLE,peerUrl:CENTRAL_HA_PEER_URL||'',peerTimeoutMs:CENTRAL_HA_PEER_TIMEOUT_MS},
+      events,
+      guidance:{promotionManagedExternally:true,standbyWriteGuard:true,automaticRoleDetection:true,readinessEndpoint:'/api/ready'}
+    });
   }catch(e){next(e)}
 });
 
@@ -1732,9 +2017,22 @@ app.use((err,req,res,next)=>{
 });
 
 async function start(){
-  await initDb();
-  setInterval(()=>{maybeRunScheduledCentralBackup()},15*60*1000).unref();
-  setTimeout(()=>{maybeRunScheduledCentralBackup()},15*1000).unref();
-  app.listen(PORT,()=>console.log(`Car Dealer Central API listening on http://localhost:${PORT}`));
+  if(CENTRAL_HA_ENABLED){
+    const initial=await refreshHaRuntime({allowMigration:false,recordTransition:false});
+    if(initial.dbRole==='primary'){
+      await initDb();
+      await refreshHaRuntime({allowMigration:false,recordTransition:false});
+    }else if(initial.dbRole==='standby'){
+      // Standby PostgreSQL is read-only. Never run migrations here; they arrive through WAL replication.
+      console.log(`HA standby detected | instance=${CENTRAL_HA_INSTANCE_ID} site=${CENTRAL_HA_SITE} | waiting for promotion`);
+    }else throw new Error(`Unable to determine PostgreSQL HA role: ${initial.lastError||'unknown'}`);
+    setInterval(()=>{refreshHaRuntime({allowMigration:true,recordTransition:true}).catch(()=>{})},5000).unref();
+  }else{
+    await initDb();
+    await refreshHaRuntime({allowMigration:false,recordTransition:false});
+  }
+  setInterval(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*60*1000).unref();
+  setTimeout(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*1000).unref();
+  app.listen(PORT,()=>console.log(`Car Dealer Central API listening on http://localhost:${PORT} | HA=${CENTRAL_HA_ENABLED?'on':'off'} role=${haRuntime.dbRole}`));
 }
 start().catch(err=>{console.error('Server startup failed:',err);process.exit(1);});
