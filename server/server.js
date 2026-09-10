@@ -202,102 +202,165 @@ async function recordSyncEvent(companyId,eventType,message='',opts={}){
   }catch(e){console.warn('sync event log failed:',e?.message||e)}
 }
 
-async function initDb(){
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS companies(
-      id TEXT PRIMARY KEY,
+const SERVER_SCHEMA_TARGET=1;
+const SERVER_MIGRATIONS=[
+  {
+    version:1,
+    name:'baseline-commercial-schema',
+    sql:`
+      CREATE TABLE IF NOT EXISTS companies(
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        start_date TEXT,
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'self',
+        contact_email TEXT,
+        trial BOOLEAN NOT NULL DEFAULT TRUE,
+        last_auth_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS users(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        username TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        commission_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+        base_salary DOUBLE PRECISION NOT NULL DEFAULT 0,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        updated_at TEXT NOT NULL,
+        UNIQUE(company_id, username)
+      );
+
+      CREATE TABLE IF NOT EXISTS snapshots(
+        company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL DEFAULT 0,
+        json JSONB NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS last_auth_at TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS base_salary DOUBLE PRECISION NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_by TEXT;
+
+      CREATE TABLE IF NOT EXISTS dealer_nodes(
+        company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        device_name TEXT,
+        app_version TEXT,
+        last_seen_at TEXT NOT NULL,
+        local_data_bytes BIGINT NOT NULL DEFAULT 0,
+        capabilities JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+
+      CREATE TABLE IF NOT EXISTS offline_license_tests(
+        company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        duration_seconds INTEGER NOT NULL DEFAULT 60,
+        simulate_outage BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_events(
+        id BIGSERIAL PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ok',
+        message TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL DEFAULT '',
+        operation_id TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS dealer_node_requests(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status TEXT NOT NULL DEFAULT 'queued',
+        requested_at TEXT NOT NULL,
+        claimed_at TEXT,
+        completed_at TEXT,
+        expires_at TEXT NOT NULL,
+        result_json JSONB,
+        error_text TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sync_events_company_time ON sync_events(company_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_sync_events_status ON sync_events(status,created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON dealer_nodes(last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_node_requests_lookup ON dealer_node_requests(company_id,node_id,status,requested_at);
+      CREATE INDEX IF NOT EXISTS idx_node_requests_expire ON dealer_node_requests(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
+      CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
+    `
+  }
+];
+
+async function ensureMigrationTable(client=pool){
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations(
+      version INTEGER PRIMARY KEY,
       name TEXT NOT NULL,
-      enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      start_date TEXT,
-      expires_at TEXT,
-      created_at TEXT NOT NULL,
-      created_by TEXT NOT NULL DEFAULT 'self',
-      contact_email TEXT,
-      trial BOOLEAN NOT NULL DEFAULT TRUE,
-      last_auth_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS users(
-      id TEXT PRIMARY KEY,
-      company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      username TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      name TEXT NOT NULL,
-      role TEXT NOT NULL,
-      commission_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
-      base_salary DOUBLE PRECISION NOT NULL DEFAULT 0,
-      enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      updated_at TEXT NOT NULL,
-      UNIQUE(company_id, username)
-    );
-
-    CREATE TABLE IF NOT EXISTS snapshots(
-      company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
-      version INTEGER NOT NULL DEFAULT 0,
-      json JSONB NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    ALTER TABLE companies ADD COLUMN IF NOT EXISTS last_auth_at TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS base_salary DOUBLE PRECISION NOT NULL DEFAULT 0;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_by TEXT;
-
-    CREATE TABLE IF NOT EXISTS dealer_nodes(
-      company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
-      node_id TEXT NOT NULL,
-      device_name TEXT,
-      app_version TEXT,
-      last_seen_at TEXT NOT NULL,
-      local_data_bytes BIGINT NOT NULL DEFAULT 0,
-      capabilities JSONB NOT NULL DEFAULT '{}'::jsonb
-    );
-
-    CREATE TABLE IF NOT EXISTS offline_license_tests(
-      company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
-      enabled BOOLEAN NOT NULL DEFAULT FALSE,
-      duration_seconds INTEGER NOT NULL DEFAULT 60,
-      simulate_outage BOOLEAN NOT NULL DEFAULT FALSE,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sync_events(
-      id BIGSERIAL PRIMARY KEY,
-      company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'ok',
-      message TEXT NOT NULL DEFAULT '',
-      actor TEXT NOT NULL DEFAULT '',
-      operation_id TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS dealer_node_requests(
-      id TEXT PRIMARY KEY,
-      company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-      node_id TEXT NOT NULL,
-      resource TEXT NOT NULL,
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      status TEXT NOT NULL DEFAULT 'queued',
-      requested_at TEXT NOT NULL,
-      claimed_at TEXT,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
       completed_at TEXT,
-      expires_at TEXT NOT NULL,
-      result_json JSONB,
       error_text TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_sync_events_company_time ON sync_events(company_id,created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_sync_events_status ON sync_events(status,created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON dealer_nodes(last_seen_at);
-    CREATE INDEX IF NOT EXISTS idx_node_requests_lookup ON dealer_node_requests(company_id,node_id,status,requested_at);
-    CREATE INDEX IF NOT EXISTS idx_node_requests_expire ON dealer_node_requests(expires_at);
-    CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
-    CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
+    )
   `);
+}
+
+async function getServerSchemaStatus(client=pool){
+  await ensureMigrationTable(client);
+  const {rows}=await client.query('SELECT version,name,status,started_at,completed_at,error_text FROM schema_migrations ORDER BY version ASC');
+  const completed=rows.filter(r=>r.status==='completed').map(r=>Number(r.version||0));
+  const currentVersion=completed.length?Math.max(...completed):0;
+  const failed=rows.filter(r=>r.status==='failed').slice(-1)[0]||null;
+  return {currentVersion,targetVersion:SERVER_SCHEMA_TARGET,status:failed&&Number(failed.version)>currentVersion?'failed':(currentVersion>=SERVER_SCHEMA_TARGET?'ready':'pending'),failedMigration:failed,history:rows};
+}
+
+async function runServerMigrations(){
+  const lockClient=await pool.connect();
+  try{
+    await ensureMigrationTable(lockClient);
+    await lockClient.query('SELECT pg_advisory_lock($1)',[938501]);
+    for(const m of SERVER_MIGRATIONS){
+      const prior=(await lockClient.query('SELECT status FROM schema_migrations WHERE version=$1',[m.version])).rows[0];
+      if(prior?.status==='completed')continue;
+      const started=now();
+      await lockClient.query(`INSERT INTO schema_migrations(version,name,status,started_at,completed_at,error_text)
+        VALUES($1,$2,'running',$3,NULL,NULL)
+        ON CONFLICT(version) DO UPDATE SET name=excluded.name,status='running',started_at=excluded.started_at,completed_at=NULL,error_text=NULL`,[m.version,m.name,started]);
+      try{
+        await lockClient.query('BEGIN');
+        await lockClient.query(m.sql);
+        await lockClient.query('COMMIT');
+        await lockClient.query("UPDATE schema_migrations SET status='completed',completed_at=$1,error_text=NULL WHERE version=$2",[now(),m.version]);
+        console.log(`PostgreSQL migration v${m.version} completed: ${m.name}`);
+      }catch(e){
+        try{await lockClient.query('ROLLBACK')}catch{}
+        try{await lockClient.query("UPDATE schema_migrations SET status='failed',completed_at=$1,error_text=$2 WHERE version=$3",[now(),String(e?.message||e).slice(0,2000),m.version])}catch{}
+        throw new Error(`PostgreSQL migration v${m.version} failed (${m.name}): ${e?.message||e}`);
+      }
+    }
+  }finally{
+    try{await lockClient.query('SELECT pg_advisory_unlock($1)',[938501])}catch{}
+    lockClient.release();
+  }
+}
+
+async function initDb(){
+  await runServerMigrations();
+  const schema=await getServerSchemaStatus();
+  if(schema.currentVersion!==SERVER_SCHEMA_TARGET||schema.status!=='ready')throw new Error(`PostgreSQL schema not ready: v${schema.currentVersion}/${SERVER_SCHEMA_TARGET}`);
   const r = await pool.query('SELECT NOW() AS now');
-  console.log('PostgreSQL connected:', r.rows[0].now);
+  console.log(`PostgreSQL connected: ${r.rows[0].now} | schema v${schema.currentVersion}/${schema.targetVersion}`);
 }
 
 async function getCompany(companyId, client=pool){
@@ -364,7 +427,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.32',architecture:'local-first-phase3c-push'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.33',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4a-migrations'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1146,8 +1209,13 @@ app.get('/api/super/companies/:id/sync-events',superAuth,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
+  try{res.json(await getServerSchemaStatus());}catch(e){next(e)}
+});
+
 app.get('/api/super/health',superAuth,async(req,res,next)=>{
   try{
+    const schema=await getServerSchemaStatus();
     const companies=(await pool.query('SELECT * FROM companies ORDER BY created_at DESC')).rows;
     const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
     const snaps=(await pool.query('SELECT company_id,updated_at FROM snapshots')).rows;
@@ -1160,9 +1228,13 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
       const authAge=Date.now()-Date.parse(c.last_auth_at||'');if(Number.isFinite(authAge)&&authAge<7*86400000)score+=20;else issues.push('最近 7 天無授權登入');
       const snapAge=Date.now()-Date.parse(st?.updated_at||'');if(Number.isFinite(snapAge)&&snapAge<2*86400000)score+=20;else if(Number.isFinite(snapAge)&&snapAge<7*86400000){score+=10;issues.push('資料同步超過 2 天')}else issues.push('資料同步超過 7 天');
       const failures=fb.get(c.id)||0;if(failures){score=Math.max(0,score-Math.min(20,failures*5));issues.push(`24 小時異常 ${failures} 筆`)}
-      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures};
+      const caps=n?.capabilities||{};
+      const localSchemaVersion=Number(caps.localSchemaVersion||0),localSchemaTarget=Number(caps.localSchemaTarget||0);
+      const localSchemaStatus=String(caps.localSchemaStatus||'unknown');
+      if(n&&localSchemaTarget>0&&(localSchemaStatus!=='ready'||localSchemaVersion<localSchemaTarget)){score=Math.max(0,score-15);issues.push(`SQLite Schema ${localSchemaStatus} v${localSchemaVersion}/${localSchemaTarget}`)}
+      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus};
     });
-    res.json({health:rows,generatedAt:now()});
+    res.json({health:rows,generatedAt:now(),schema});
   }catch(e){next(e)}
 });
 
