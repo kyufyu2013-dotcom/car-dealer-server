@@ -4,6 +4,9 @@ import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs/promises';
+import { gzipSync } from 'zlib';
+import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { fileURLToPath } from 'url';
 
 const { Pool } = pg;
@@ -30,6 +33,16 @@ const UPDATE_SIGNING_PRIVATE_KEY = (process.env.UPDATE_SIGNING_PRIVATE_KEY || `-
 MC4CAQAwBQYDK2VwBCIEINJNyM8Z3NP+A+nNSTsGntFeJovtB25kFHjt1DLw9bCV
 -----END PRIVATE KEY-----`).replace(/\\n/g,'\n');
 const UPDATE_SIGNING_KEY_ID = process.env.UPDATE_SIGNING_KEY_ID || 'desktop-update-ed25519-v1';
+// Phase 7A: encrypted central PostgreSQL logical backup. Secrets stay in server environment.
+const POSTGRES_BACKUP_DIR = process.env.POSTGRES_BACKUP_DIR || path.join(__dirname,'central-backups');
+const BACKUP_ENCRYPTION_KEY = process.env.BACKUP_ENCRYPTION_KEY || 'DEV_ONLY_CHANGE_BACKUP_KEY_BEFORE_PRODUCTION_0123456789';
+const BACKUP_S3_BUCKET = process.env.BACKUP_S3_BUCKET || '';
+const BACKUP_S3_REGION = process.env.BACKUP_S3_REGION || 'ap-northeast-1';
+const BACKUP_S3_ENDPOINT = process.env.BACKUP_S3_ENDPOINT || '';
+const BACKUP_S3_PREFIX = String(process.env.BACKUP_S3_PREFIX || 'car-dealer-central').replace(/^\/+|\/+$/g,'');
+const BACKUP_S3_ACCESS_KEY_ID = process.env.BACKUP_S3_ACCESS_KEY_ID || '';
+const BACKUP_S3_SECRET_ACCESS_KEY = process.env.BACKUP_S3_SECRET_ACCESS_KEY || '';
+const BACKUP_S3_FORCE_PATH_STYLE = String(process.env.BACKUP_S3_FORCE_PATH_STYLE||'').toLowerCase()==='true';
 function b64url(v){return Buffer.from(v).toString('base64url')}
 function offlineVerifier(password){const salt=crypto.randomBytes(16).toString('hex');const hash=crypto.scryptSync(String(password),salt,64,{N:16384,r:8,p:1}).toString('hex');return `${salt}:${hash}`;}
 function issueOfflineTicket(company,user,password,seconds=OFFLINE_GRACE_SECONDS){
@@ -195,7 +208,7 @@ function compareSemver(a,b){
 async function getDesktopUpdatePolicy(client=pool){
   const {rows}=await client.query('SELECT * FROM desktop_update_policy WHERE id=1');
   const r=rows[0]||{};
-  return {enabled:!!r.enabled,channel:String(r.channel||'stable'),latestVersion:cleanSemver(r.latest_version||'0.9.5'),minimumVersion:cleanSemver(r.minimum_version||'0.0.0'),downloadUrl:String(r.download_url||''),releaseNotes:String(r.release_notes||''),packageSha256:String(r.package_sha256||'').toLowerCase(),packageSignature:String(r.package_signature||''),updatedAt:r.updated_at||'',updatedBy:r.updated_by||''};
+  return {enabled:!!r.enabled,channel:String(r.channel||'stable'),latestVersion:cleanSemver(r.latest_version||'0.9.6'),minimumVersion:cleanSemver(r.minimum_version||'0.0.0'),downloadUrl:String(r.download_url||''),releaseNotes:String(r.release_notes||''),packageSha256:String(r.package_sha256||'').toLowerCase(),packageSignature:String(r.package_signature||''),updatedAt:r.updated_at||'',updatedBy:r.updated_by||''};
 }
 function signUpdateManifestPayload(payload){
   const body=b64url(JSON.stringify(payload));
@@ -260,7 +273,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=5;
+const SERVER_SCHEMA_TARGET=6;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -408,7 +421,7 @@ const SERVER_MIGRATIONS=[
         id INTEGER PRIMARY KEY CHECK(id=1),
         enabled BOOLEAN NOT NULL DEFAULT FALSE,
         channel TEXT NOT NULL DEFAULT 'stable',
-        latest_version TEXT NOT NULL DEFAULT '0.9.5',
+        latest_version TEXT NOT NULL DEFAULT '0.9.6',
         minimum_version TEXT NOT NULL DEFAULT '0.0.0',
         download_url TEXT NOT NULL DEFAULT '',
         release_notes TEXT NOT NULL DEFAULT '',
@@ -418,7 +431,7 @@ const SERVER_MIGRATIONS=[
         updated_by TEXT NOT NULL DEFAULT ''
       );
       INSERT INTO desktop_update_policy(id,enabled,channel,latest_version,minimum_version,download_url,release_notes,package_sha256,package_signature,updated_at,updated_by)
-      VALUES(1,FALSE,'stable','0.9.5','0.0.0','','','','',CURRENT_TIMESTAMP::text,'migration')
+      VALUES(1,FALSE,'stable','0.9.6','0.0.0','','','','',CURRENT_TIMESTAMP::text,'migration')
       ON CONFLICT(id) DO NOTHING;
     `
   },
@@ -441,6 +454,45 @@ const SERVER_MIGRATIONS=[
       CREATE UNIQUE INDEX IF NOT EXISTS idx_update_attempt ON desktop_update_events(company_id,attempt_id);
       CREATE INDEX IF NOT EXISTS idx_update_events_time ON desktop_update_events(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_update_events_company ON desktop_update_events(company_id,updated_at DESC);
+    `
+  },
+  {
+    version:6,
+    name:'phase7a-central-postgresql-backup',
+    sql:`
+      CREATE TABLE IF NOT EXISTS central_backup_policy(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        daily_hour_taipei INTEGER NOT NULL DEFAULT 3,
+        retention_days INTEGER NOT NULL DEFAULT 14,
+        offsite_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL DEFAULT ''
+      );
+      INSERT INTO central_backup_policy(id,enabled,daily_hour_taipei,retention_days,offsite_enabled,updated_at,updated_by)
+      VALUES(1,FALSE,3,14,FALSE,CURRENT_TIMESTAMP::text,'migration') ON CONFLICT(id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS central_backup_events(
+        id BIGSERIAL PRIMARY KEY,
+        backup_id TEXT NOT NULL UNIQUE,
+        trigger_type TEXT NOT NULL DEFAULT 'manual',
+        status TEXT NOT NULL DEFAULT 'running',
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        size_bytes BIGINT NOT NULL DEFAULT 0,
+        sha256 TEXT NOT NULL DEFAULT '',
+        local_path TEXT NOT NULL DEFAULT '',
+        offsite_provider TEXT NOT NULL DEFAULT '',
+        offsite_key TEXT NOT NULL DEFAULT '',
+        offsite_status TEXT NOT NULL DEFAULT 'disabled',
+        encryption TEXT NOT NULL DEFAULT 'AES-256-GCM',
+        table_count INTEGER NOT NULL DEFAULT 0,
+        row_count BIGINT NOT NULL DEFAULT 0,
+        error_text TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_central_backup_time ON central_backup_events(started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_central_backup_status ON central_backup_events(status,started_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.9.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v6' WHERE id=1 AND updated_by='migration' AND latest_version='0.9.5';
     `
   }
 ];
@@ -580,7 +632,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.43',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6c-update-observability'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.44',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase7a-central-backup'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1429,6 +1481,46 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
   }catch(e){next(e)}
 });
 
+
+const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy'];
+let centralBackupRunning=false;
+function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
+function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
+async function getCentralBackupPolicy(client=pool){
+  const {rows}=await client.query('SELECT * FROM central_backup_policy WHERE id=1');const p=rows[0]||{};
+  return {enabled:!!p.enabled,dailyHourTaipei:Math.max(0,Math.min(23,Number(p.daily_hour_taipei??3))),retentionDays:Math.max(1,Math.min(365,Number(p.retention_days||14))),offsiteEnabled:!!p.offsite_enabled,updatedAt:p.updated_at||'',updatedBy:p.updated_by||''};
+}
+function encryptBackupBuffer(plain){const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',backupKeyBytes(),iv);const enc=Buffer.concat([cipher.update(plain),cipher.final()]),tag=cipher.getAuthTag();const header=Buffer.from(JSON.stringify({format:'CDBAK',version:1,compression:'gzip',encryption:'AES-256-GCM',iv:iv.toString('base64'),tag:tag.toString('base64')})+'\n');return Buffer.concat([Buffer.from('CDBAK1\n'),header,enc])}
+function makeS3(){const cfg={region:BACKUP_S3_REGION,forcePathStyle:BACKUP_S3_FORCE_PATH_STYLE};if(BACKUP_S3_ENDPOINT)cfg.endpoint=BACKUP_S3_ENDPOINT;if(BACKUP_S3_ACCESS_KEY_ID&&BACKUP_S3_SECRET_ACCESS_KEY)cfg.credentials={accessKeyId:BACKUP_S3_ACCESS_KEY_ID,secretAccessKey:BACKUP_S3_SECRET_ACCESS_KEY};return new S3Client(cfg)}
+async function pruneLocalBackups(retentionDays){try{const files=await fs.readdir(POSTGRES_BACKUP_DIR,{withFileTypes:true});const cutoff=Date.now()-retentionDays*86400000;for(const f of files){if(!f.isFile()||!f.name.endsWith('.cdbak'))continue;const full=path.join(POSTGRES_BACKUP_DIR,f.name),st=await fs.stat(full);if(st.mtimeMs<cutoff)await fs.unlink(full)}}catch(e){console.warn('backup local retention:',e?.message||e)}}
+async function uploadOffsiteBackup(fileBuffer,fileName,retentionDays){if(!BACKUP_S3_BUCKET)throw new Error('尚未設定 BACKUP_S3_BUCKET');const s3=makeS3(),key=`${BACKUP_S3_PREFIX}/${fileName}`;await s3.send(new PutObjectCommand({Bucket:BACKUP_S3_BUCKET,Key:key,Body:fileBuffer,ContentType:'application/octet-stream',Metadata:{encrypted:'aes-256-gcm'}}));try{const listed=await s3.send(new ListObjectsV2Command({Bucket:BACKUP_S3_BUCKET,Prefix:`${BACKUP_S3_PREFIX}/`}));const cutoff=Date.now()-retentionDays*86400000,old=(listed.Contents||[]).filter(x=>x.Key&&x.LastModified&&x.LastModified.getTime()<cutoff).map(x=>({Key:x.Key}));if(old.length)await s3.send(new DeleteObjectsCommand({Bucket:BACKUP_S3_BUCKET,Delete:{Objects:old,Quiet:true}}))}catch(e){console.warn('backup s3 retention:',e?.message||e)}return key}
+async function createCentralBackup(triggerType='manual',actor='system'){
+  if(centralBackupRunning)throw new Error('中央備份正在執行中');centralBackupRunning=true;
+  const backupId=crypto.randomUUID(),started=now();let eventCreated=false,lockClient=null,hasDbLock=false;
+  try{
+    lockClient=await pool.connect();const lock=(await lockClient.query('SELECT pg_try_advisory_lock(73919001) AS locked')).rows[0];hasDbLock=!!lock?.locked;if(!hasDbLock)throw Object.assign(new Error('另一個 Server Instance 正在執行中央備份'),{skipDiagnostic:true});
+    await pool.query(`INSERT INTO central_backup_events(backup_id,trigger_type,status,started_at,created_by) VALUES($1,$2,'running',$3,$4)`,[backupId,triggerType,started,String(actor||'').slice(0,80)]);eventCreated=true;
+    const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
+    try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
+    const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.32',apiVersion:'2.4.44',schemaVersion:schema.currentVersion,tables:data};
+    const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
+    await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
+    let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
+    if(policy.offsiteEnabled){offsiteProvider='s3';try{offsiteKey=await uploadOffsiteBackup(encrypted,fileName,policy.retentionDays);offsiteStatus='uploaded'}catch(e){offsiteStatus='failed';await recordDiagnostic('','BACKUP_OFFSITE_002','central_backup',e?.message||'異地備份上傳失敗',{severity:'error',actor,context:{backupId}})}}
+    await pruneLocalBackups(policy.retentionDays);
+    const finalStatus=policy.offsiteEnabled&&offsiteStatus==='failed'?'partial':'success';
+    await pool.query(`UPDATE central_backup_events SET status=$1,completed_at=$2,size_bytes=$3,sha256=$4,local_path=$5,offsite_provider=$6,offsite_key=$7,offsite_status=$8,table_count=$9,row_count=$10 WHERE backup_id=$11`,[finalStatus,now(),encrypted.length,hash,localPath,offsiteProvider,offsiteKey,offsiteStatus,CENTRAL_BACKUP_TABLES.length,rowCount,backupId]);
+    return {ok:true,backupId,status:finalStatus,sizeBytes:encrypted.length,sha256:hash,offsiteStatus,offsiteKey,tableCount:CENTRAL_BACKUP_TABLES.length,rowCount};
+  }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
+}
+async function centralBackupSummary(){const policy=await getCentralBackupPolicy(),events=(await pool.query('SELECT * FROM central_backup_events ORDER BY id DESC LIMIT 100')).rows,last=events[0]||null,lastSuccess=events.find(x=>x.status==='success'||x.status==='partial')||null;return {policy,events,last,lastSuccess,running:centralBackupRunning,storage:backupStorageStatus(),generatedAt:now()}}
+async function maybeRunScheduledCentralBackup(){try{const policy=await getCentralBackupPolicy();if(!policy.enabled||centralBackupRunning)return;const d=new Date(),parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(d),get=t=>parts.find(x=>x.type===t)?.value||'';if(Number(get('hour'))!==policy.dailyHourTaipei)return;const day=`${get('year')}-${get('month')}-${get('day')}`,dayStart=new Date(`${day}T00:00:00+08:00`).toISOString();const {rows}=await pool.query("SELECT id FROM central_backup_events WHERE trigger_type='scheduled' AND started_at >= $1 AND status IN ('running','success','partial') LIMIT 1",[dayStart]);if(rows.length)return;await createCentralBackup('scheduled','scheduler')}catch(e){console.warn('scheduled central backup:',e?.message||e)}}
+
+app.get('/api/super/backups',superAuth,async(req,res,next)=>{try{res.json(await centralBackupSummary())}catch(e){next(e)}});
+app.patch('/api/super/backups/policy',superAuth,async(req,res,next)=>{try{const b=req.body||{},hour=Math.max(0,Math.min(23,Number(b.dailyHourTaipei??3))),days=Math.max(1,Math.min(365,Number(b.retentionDays||14)));await pool.query(`UPDATE central_backup_policy SET enabled=$1,daily_hour_taipei=$2,retention_days=$3,offsite_enabled=$4,updated_at=$5,updated_by=$6 WHERE id=1`,[!!b.enabled,hour,days,!!b.offsiteEnabled,now(),SUPER_ADMIN_USER]);res.json({ok:true,...await centralBackupSummary()})}catch(e){next(e)}});
+app.post('/api/super/backups/run',superAuth,async(req,res,next)=>{try{const result=await createCentralBackup('manual',SUPER_ADMIN_USER);res.json(result)}catch(e){next(e)}});
+
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
   try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
 });
@@ -1641,6 +1733,8 @@ app.use((err,req,res,next)=>{
 
 async function start(){
   await initDb();
+  setInterval(()=>{maybeRunScheduledCentralBackup()},15*60*1000).unref();
+  setTimeout(()=>{maybeRunScheduledCentralBackup()},15*1000).unref();
   app.listen(PORT,()=>console.log(`Car Dealer Central API listening on http://localhost:${PORT}`));
 }
 start().catch(err=>{console.error('Server startup failed:',err);process.exit(1);});
