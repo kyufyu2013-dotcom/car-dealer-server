@@ -55,7 +55,15 @@ linear-gradient(180deg,rgba(255,255,255,.03),transparent 18%,transparent 78%,rgb
 // Keep all Sales-side notices inside the app so the browser hostname is never shown as the alert title.
 (function(){const nativeAlert=window.alert.bind(window);window.alert=function(message){const bg=document.getElementById('systemPromptBg'),msg=document.getElementById('systemPromptMessage'),ok=document.getElementById('systemPromptOk');if(!bg||!msg||!ok){nativeAlert(message);return}msg.textContent=String(message??'');bg.classList.add('show');ok.onclick=()=>bg.classList.remove('show');setTimeout(()=>ok.focus(),0)}})();
 
-const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},saleQueueTimer=null,saleQueueBusy=false,photoQueueTimer=null,photoQueueBusy=false,liveEventSource=null,liveRestartTimer=null,liveInventoryTimer=null;
+const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},lastInventoryFingerprint='',saleQueueTimer=null,saleQueueBusy=false,photoQueueTimer=null,photoQueueBusy=false,liveEventSource=null,liveRestartTimer=null,liveInventoryTimer=null;
+const PHOTO_CACHE_DB='carDealerSalesPhotoCache_v88',PHOTO_CACHE_STORE='photos';let photoDbPromise=null;
+function photoCacheDb(){if(!('indexedDB' in window))return Promise.resolve(null);if(photoDbPromise)return photoDbPromise;photoDbPromise=new Promise((resolve,reject)=>{const q=indexedDB.open(PHOTO_CACHE_DB,1);q.onupgradeneeded=()=>{if(!q.result.objectStoreNames.contains(PHOTO_CACHE_STORE))q.result.createObjectStore(PHOTO_CACHE_STORE,{keyPath:'key'})};q.onsuccess=()=>resolve(q.result);q.onerror=()=>resolve(null)});return photoDbPromise}
+function photoCacheKey(carId){return `${company?.id||'none'}:${me?.id||'none'}:${carId}`}
+function photoCacheSig(car){return `${Number(car?.inspectionPhotoCount||0)}:${Number(car?.intakePhotoCount||0)}`}
+async function loadPersistentPhotos(car){try{const db=await photoCacheDb();if(!db)return [];return await new Promise(resolve=>{const tx=db.transaction(PHOTO_CACHE_STORE,'readonly'),r=tx.objectStore(PHOTO_CACHE_STORE).get(photoCacheKey(car.id));r.onsuccess=()=>{const v=r.result;if(v&&v.sig===photoCacheSig(car)&&Array.isArray(v.photos)){salesPhotoCache[String(car.id)]=v.photos;resolve(v.photos)}else resolve([])};r.onerror=()=>resolve([])})}catch{return []}}
+async function savePersistentPhotos(carId,photos){try{const car=(data.cars||[]).find(c=>String(c.id)===String(carId));if(!car)return;const db=await photoCacheDb();if(!db)return;const tx=db.transaction(PHOTO_CACHE_STORE,'readwrite');tx.objectStore(PHOTO_CACHE_STORE).put({key:photoCacheKey(carId),sig:photoCacheSig(car),photos:Array.isArray(photos)?photos:[],savedAt:Date.now()})}catch{}}
+async function deletePersistentPhotos(carId){try{const db=await photoCacheDb();if(!db)return;db.transaction(PHOTO_CACHE_STORE,'readwrite').objectStore(PHOTO_CACHE_STORE).delete(photoCacheKey(carId))}catch{}}
+async function clearPersistentPhotos(){try{const db=await photoCacheDb();if(!db)return;db.transaction(PHOTO_CACHE_STORE,'readwrite').objectStore(PHOTO_CACHE_STORE).clear()}catch{}}
 const $=id=>document.getElementById(id);const money=n=>'NT$ '+Number(n||0).toLocaleString('zh-TW');const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const rate=v=>{let n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')};
 async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})};let r=await fetch(API+path,opt);let j={};try{j=await r.json()}catch{};if((r.status===401||r.status===403)&&token){logout(j.error||'登入或授權已失效');throw new Error(j.error||'授權失效')}if(!r.ok)throw new Error(j.error||'操作失敗');return j}
 function togglePassword(){const p=$('password');if(!p)return;p.type=p.type==='password'?'text':'password'}
@@ -115,7 +123,7 @@ async function processPhotoQueue(force=false){
  const now=Date.now();let idx=q.findIndex(x=>x.state!=='failed'&&(force||!x.nextTryAt||x.nextTryAt<=now));
  if(idx<0){let live=q.filter(x=>x.state!=='failed');if(live.length){let next=Math.min(...live.map(x=>x.nextTryAt||now+60000));schedulePhotoQueue(Math.max(1000,next-now))}return}
  photoQueueBusy=true;let item=q[idx];item.state='syncing';savePhotoQueue(q);if(currentPage==='sync')renderSync();
- try{let photos=await fetchPhotoBundleOnce(item.carId);salesPhotoCache[String(item.carId)]=photos;q=loadPhotoQueue().filter(x=>x.operationId!==item.operationId);savePhotoQueue(q);addPhotoHistory(item,'acked',photos.length?`照片已讀取 ${photos.length} 張`:'車輛目前沒有可讀取照片');let box=$(`photoStrip_${item.carId}`);if(box)box.innerHTML=photos.length?photos.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join(''):'<div class="photoLoading photoOffline">無照片</div>';if(currentPage==='sync')renderSync()}
+ try{let photos=await fetchPhotoBundleOnce(item.carId);salesPhotoCache[String(item.carId)]=photos;savePersistentPhotos(item.carId,photos);q=loadPhotoQueue().filter(x=>x.operationId!==item.operationId);savePhotoQueue(q);addPhotoHistory(item,'acked',photos.length?`照片已讀取 ${photos.length} 張`:'車輛目前沒有可讀取照片');let box=$(`photoStrip_${item.carId}`);if(box)box.innerHTML=photos.length?photos.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join(''):'<div class="photoLoading photoOffline">無照片</div>';if(currentPage==='sync')renderSync()}
  catch(e){q=loadPhotoQueue();let i=q.findIndex(x=>x.operationId===item.operationId);if(i>=0){q[i].attempts=Number(q[i].attempts||0)+1;q[i].lastError=e.message||'照片讀取失敗';q[i].state='pending';q[i].nextTryAt=Date.now()+retryDelay(q[i].attempts)}savePhotoQueue(q);if(currentPage==='sync')renderSync()}
  finally{photoQueueBusy=false;if(loadPhotoQueue().some(x=>x.state!=='failed'))schedulePhotoQueue(1200)}
 }
@@ -153,7 +161,7 @@ async function refreshNodeStatus(showOfflineAlert=false){
    nodeIsOnline=online;lastNodeOnline=online;
    setDealerNodeBadge(online?'on':'off',online?(LAN_MODE?'● 本機資料伺服器正常':'● 公司資料主機連線'):(LAN_MODE?'● 本機資料伺服器離線':'● 公司資料主機離線'));
    if(!online&&changed&&showOfflineAlert)alert('⚠ 車行主機離線中，照片無法讀取。');
-   if(online&&changed){salesPhotoCache={};salesPhotoLoading={};setTimeout(refreshNodeInventory,0);setTimeout(()=>processPhotoQueue(true),250)}
+   if(online&&changed){setTimeout(refreshNodeInventory,0);setTimeout(()=>processPhotoQueue(true),250)}
    return online;
  }catch(e){
    nodeIsOnline=false;
@@ -161,13 +169,31 @@ async function refreshNodeStatus(showOfflineAlert=false){
    return false;
  }
 }
+function inventoryFingerprint(cars){
+ return JSON.stringify((cars||[]).map(c=>[String(c.id||''),String(c.plate||''),String(c.model||''),String(c.year||''),Number(c.mileage||0),String(c.inDate||''),Number(c.floorPrice||0),String(c.salesNote||''),String(c.commissionMode||''),Number(c.fixedCommissionAmount||0),String(c.inspectionStatus||''),Number(c.inspectionPhotoCount||0),Number(c.intakePhotoCount||0)]));
+}
+function reconcilePhotoCache(prevCars,nextCars){
+ const prev=new Map((prevCars||[]).map(c=>[String(c.id),c]));
+ const nextIds=new Set((nextCars||[]).map(c=>String(c.id)));
+ for(const k of Object.keys(salesPhotoCache)){if(!nextIds.has(String(k))){delete salesPhotoCache[k];deletePersistentPhotos(k)}}
+ for(const c of (nextCars||[])){
+   const old=prev.get(String(c.id));if(!old){delete salesPhotoCache[String(c.id)];delete salesPhotoLoading[String(c.id)];continue}
+   const oldCount=Number(old.inspectionPhotoCount||0)+Number(old.intakePhotoCount||0);
+   const newCount=Number(c.inspectionPhotoCount||0)+Number(c.intakePhotoCount||0);
+   if(oldCount!==newCount){delete salesPhotoCache[String(c.id)];delete salesPhotoLoading[String(c.id)];deletePersistentPhotos(c.id)}
+ }
+}
 async function refreshNodeInventory(){
  if(!token||!nodeIsOnline||nodeInventoryBusy)return;
  try{
    const cars=await fetchNodeInventory();
    if(cars===null)return;
+   const fp=inventoryFingerprint(cars);
+   if(LAN_MODE&&fp===lastInventoryFingerprint)return;
+   const prevCars=data?.cars||[];
+   reconcilePhotoCache(prevCars,cars);
    data={...(data||{}),cars};
-   salesPhotoCache={};salesPhotoLoading={};
+   lastInventoryFingerprint=fp;
    render();
  }catch(e){
    setDealerNodeBadge('off','● 車行主機讀取失敗');
@@ -203,7 +229,7 @@ async function changeMyPassword(){
  const b=$('changePwBtn');if(b){b.disabled=true;b.textContent='修改中…'}
  try{await api('/account/change-password',{method:'POST',body:JSON.stringify({currentPassword,newPassword})});alert('密碼修改成功，請使用新密碼重新登入');closeModal();logout()}catch(e){alert(e.message||'修改密碼失敗');if(b){b.disabled=false;b.textContent='確認修改密碼'}}
 }
-function logout(msg=''){clearInterval(timer);clearInterval(nodeTimer);clearTimeout(saleQueueTimer);clearTimeout(photoQueueTimer);timer=null;nodeTimer=null;saleQueueTimer=null;photoQueueTimer=null;saleQueueBusy=false;photoQueueBusy=false;token='';me=null;company=null;nodeIsOnline=false;lastNodeOnline=null;nodeInventoryBusy=false;salesPhotoCache={};salesPhotoLoading={};data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
+function logout(msg=''){clearInterval(timer);clearInterval(nodeTimer);clearTimeout(saleQueueTimer);clearTimeout(photoQueueTimer);timer=null;nodeTimer=null;saleQueueTimer=null;photoQueueTimer=null;saleQueueBusy=false;photoQueueBusy=false;token='';me=null;company=null;nodeIsOnline=false;lastNodeOnline=null;nodeInventoryBusy=false;clearPersistentPhotos();salesPhotoCache={};salesPhotoLoading={};lastInventoryFingerprint='';data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
 async function restore(){let s;try{s=JSON.parse(localStorage.getItem(SESSION)||sessionStorage.getItem(SESSION_TEMP))}catch{};if(!s?.token)return false;if($('rememberLogin'))$('rememberLogin').checked=!!localStorage.getItem(SESSION);token=s.token;currentPage=s.page||'cars';try{let j=await api('/session/restore');if(j.user?.role!=='sales')throw new Error('角色不符');if(j.token)token=j.token;me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);saveSession();enter();await refreshNodeStateAndInventory(false);return true}catch{token='';localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);return false}}
 async function sync(){if(!token)return;if(!LAN_MODE)processSaleQueue(false);try{let j=await api('/company/snapshot');if(j.token){token=j.token;saveSession()}company=j.company||company;if(j.user)me=j.user;if(LAN_MODE){data=j.snapshot||data;render();return}if(Number(j.version||0)!==version){version=Number(j.version||0);const keepCars=data?.cars||[];data=j.snapshot||data;data.cars=keepCars;render();if(nodeIsOnline)setTimeout(refreshNodeInventory,0)}}catch(e){}}
 function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');$('tabSync')?.classList.toggle('active',p==='sync');render();if(p==='cars'&&nodeIsOnline)setTimeout(refreshNodeInventory,0)}
@@ -220,7 +246,7 @@ async function fetchSalesPhotoBundle(carId){
  const k=String(carId);
  if(salesPhotoCache[k]?.length)return salesPhotoCache[k];
  if(salesPhotoLoading[k])return salesPhotoLoading[k];
- salesPhotoLoading[k]=(async()=>{const photos=await fetchPhotoBundleOnce(carId);salesPhotoCache[k]=photos;return photos})();
+ salesPhotoLoading[k]=(async()=>{const photos=await fetchPhotoBundleOnce(carId);salesPhotoCache[k]=photos;savePersistentPhotos(carId,photos);return photos})();
  try{return await salesPhotoLoading[k]}finally{delete salesPhotoLoading[k]}
 }
 async function hydrateAutoPhotos(){
@@ -231,7 +257,8 @@ async function hydrateAutoPhotos(){
    const box=$(`photoStrip_${c.id}`);if(!box)continue;
    ensurePhotoQueued(c);
    if(!nodeIsOnline){box.innerHTML='<div class="photoLoading photoOffline">主機離線・等待自動重試</div>';continue}
-   const cached=salesPhotoCache[String(c.id)]||[];
+   let cached=salesPhotoCache[String(c.id)]||[];
+   if(!cached.length)cached=await loadPersistentPhotos(c);
    if(cached.length){box.innerHTML=cached.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join('');continue}
    box.innerHTML='<div class="photoLoading">照片排程讀取中…</div>';
  }
@@ -273,5 +300,5 @@ function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===Strin
 async function submitApply(carId){if(LAN_MODE)return alert('目前為店內備用入口，可查看庫存與照片；成交申請請回到一般業務入口後送出。');let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');let c=(data.cars||[]).find(x=>String(x.id)===String(carId));if(!c)return alert('找不到車輛資料');try{enqueueSale(c,{carId,sellPrice:sell,saleDate:date});closeModal();showPage('sync');processSaleQueue(true);alert('成交申請已加入同步佇列。系統會自動送出，請勿重複提交。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
 $('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>{if(token){sync();processSaleQueue(true);processPhotoQueue(true)}else health()});window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
-(async()=>{await health();if(!(await restore())){};if(!LAN_MODE&&'serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.3.15',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
+(async()=>{await health();if(!(await restore())){};if(!LAN_MODE&&'serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.3.24',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>

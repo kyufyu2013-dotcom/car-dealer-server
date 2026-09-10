@@ -202,7 +202,7 @@ async function recordSyncEvent(companyId,eventType,message='',opts={}){
   }catch(e){console.warn('sync event log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=1;
+const SERVER_SCHEMA_TARGET=2;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -300,6 +300,21 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
       CREATE INDEX IF NOT EXISTS idx_users_company_role ON users(company_id,role);
     `
+  },
+  {
+    version:2,
+    name:'phase4b-migration-safety-audit',
+    sql:`
+      CREATE TABLE IF NOT EXISTS migration_safety_events(
+        id BIGSERIAL PRIMARY KEY,
+        migration_version INTEGER NOT NULL,
+        migration_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_migration_safety_time ON migration_safety_events(created_at DESC);
+    `
   }
 ];
 
@@ -314,6 +329,14 @@ async function ensureMigrationTable(client=pool){
       error_text TEXT
     )
   `);
+}
+
+async function ensureMigrationSafetyTable(client=pool){
+  await client.query(`CREATE TABLE IF NOT EXISTS migration_safety_events(id BIGSERIAL PRIMARY KEY,migration_version INTEGER NOT NULL,migration_name TEXT NOT NULL,status TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)`);
+}
+
+async function migrationSafetyEvent(client,version,name,status,detail=''){
+  try{await ensureMigrationSafetyTable(client);await client.query('INSERT INTO migration_safety_events(migration_version,migration_name,status,detail,created_at) VALUES($1,$2,$3,$4,$5)',[version,name,status,String(detail||'').slice(0,2000),now()]);}catch(e){console.warn('migration safety audit failed:',e?.message||e)}
 }
 
 async function getServerSchemaStatus(client=pool){
@@ -337,15 +360,18 @@ async function runServerMigrations(){
       await lockClient.query(`INSERT INTO schema_migrations(version,name,status,started_at,completed_at,error_text)
         VALUES($1,$2,'running',$3,NULL,NULL)
         ON CONFLICT(version) DO UPDATE SET name=excluded.name,status='running',started_at=excluded.started_at,completed_at=NULL,error_text=NULL`,[m.version,m.name,started]);
+      await migrationSafetyEvent(lockClient,m.version,m.name,'started','PostgreSQL transaction protection active');
       try{
         await lockClient.query('BEGIN');
         await lockClient.query(m.sql);
         await lockClient.query('COMMIT');
         await lockClient.query("UPDATE schema_migrations SET status='completed',completed_at=$1,error_text=NULL WHERE version=$2",[now(),m.version]);
+        await migrationSafetyEvent(lockClient,m.version,m.name,'completed','Transaction committed successfully');
         console.log(`PostgreSQL migration v${m.version} completed: ${m.name}`);
       }catch(e){
         try{await lockClient.query('ROLLBACK')}catch{}
         try{await lockClient.query("UPDATE schema_migrations SET status='failed',completed_at=$1,error_text=$2 WHERE version=$3",[now(),String(e?.message||e).slice(0,2000),m.version])}catch{}
+        await migrationSafetyEvent(lockClient,m.version,m.name,'rolled_back',String(e?.message||e));
         throw new Error(`PostgreSQL migration v${m.version} failed (${m.name}): ${e?.message||e}`);
       }
     }
@@ -427,7 +453,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.33',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4a-migrations'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.36',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4b-migration-safety'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1210,7 +1236,7 @@ app.get('/api/super/companies/:id/sync-events',superAuth,async(req,res,next)=>{
 });
 
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
-  try{res.json(await getServerSchemaStatus());}catch(e){next(e)}
+  try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
 });
 
 app.get('/api/super/health',superAuth,async(req,res,next)=>{
@@ -1231,8 +1257,9 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
       const caps=n?.capabilities||{};
       const localSchemaVersion=Number(caps.localSchemaVersion||0),localSchemaTarget=Number(caps.localSchemaTarget||0);
       const localSchemaStatus=String(caps.localSchemaStatus||'unknown');
+      const migrationSafetyStatus=String(caps.migrationSafetyStatus||'none');
       if(n&&localSchemaTarget>0&&(localSchemaStatus!=='ready'||localSchemaVersion<localSchemaTarget)){score=Math.max(0,score-15);issues.push(`SQLite Schema ${localSchemaStatus} v${localSchemaVersion}/${localSchemaTarget}`)}
-      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus};
+      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0)};
     });
     res.json({health:rows,generatedAt:now(),schema});
   }catch(e){next(e)}
