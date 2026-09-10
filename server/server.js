@@ -65,6 +65,27 @@ let loadTestWindowSecond=0,loadTestWindowCount=0;
 // It reuses the isolated load_test_* tables and intentionally requires LOAD_TEST_ENABLED + a configured token.
 let managedLoadTest={running:false,stopRequested:false,runId:'',targetNodes:0,durationSeconds:0,heartbeatIntervalMs:15000,startedAt:null,completedAt:null,totalRequests:0,successCount:0,errorCount:0,currentRps:0,p95Ms:0,p99Ms:0,lastError:''};
 
+// Phase 9B: controlled resilience drill guard. Maintenance mode is application-level only:
+// it temporarily rejects normal mutating API traffic with HTTP 503 while Super Admin remains available.
+let maintenanceRuntime={enabled:false,reason:'',startedAt:null,expiresAt:null,startedBy:'',updatedAt:null};
+function maintenanceActive(){
+  if(!maintenanceRuntime.enabled)return false;
+  if(maintenanceRuntime.expiresAt&&Date.now()>=Date.parse(maintenanceRuntime.expiresAt)){
+    maintenanceRuntime.enabled=false;
+    pool.query("UPDATE resilience_control_state SET maintenance_enabled=FALSE,updated_at=$1 WHERE id=1",[now()]).catch(()=>{});
+    return false;
+  }
+  return true;
+}
+async function loadMaintenanceRuntime(){
+  try{
+    const r=(await pool.query("SELECT * FROM resilience_control_state WHERE id=1")).rows[0];
+    if(r)maintenanceRuntime={enabled:!!r.maintenance_enabled,reason:r.reason||'',startedAt:r.started_at||null,expiresAt:r.expires_at||null,startedBy:r.started_by||'',updatedAt:r.updated_at||null};
+    maintenanceActive();
+  }catch{}
+  return maintenanceRuntime;
+}
+
 
 // Phase 8C: lightweight central performance telemetry. Technical metrics are Super Admin only.
 const METRICS_SAMPLE_MS=Math.max(5000,Math.min(60000,Number(process.env.METRICS_SAMPLE_MS||15000)));
@@ -373,7 +394,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=13;
+const SERVER_SCHEMA_TARGET=14;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -743,7 +764,7 @@ const SERVER_MIGRATIONS=[
       );
       CREATE INDEX IF NOT EXISTS idx_performance_alert_events_status_time ON performance_alert_events(status,last_seen_at DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_performance_alert_one_open ON performance_alert_events(alert_key) WHERE status='open';
-      UPDATE desktop_update_policy SET latest_version='0.10.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v12' WHERE id=1 AND latest_version IN ('0.10.1','0.10.2','0.10.3','0.10.4');
+      UPDATE desktop_update_policy SET latest_version='0.10.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v12' WHERE id=1 AND latest_version IN ('0.10.1','0.10.2','0.10.3','0.10.4');
     `
   },
   {
@@ -764,7 +785,7 @@ const SERVER_MIGRATIONS=[
       );
       CREATE INDEX IF NOT EXISTS idx_resilience_drill_events_time ON resilience_drill_events(started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_resilience_drill_events_type ON resilience_drill_events(drill_type,started_at DESC);
-      UPDATE desktop_update_policy SET latest_version='0.10.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v13' WHERE id=1 AND latest_version='0.10.6';
+      UPDATE desktop_update_policy SET latest_version='0.10.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v13' WHERE id=1 AND latest_version='0.10.7';
     `
   }
 ];
@@ -959,17 +980,26 @@ app.use('/api',(req,res,next)=>{
   next();
 });
 
+// Phase 9B Maintenance Mode（維護演練模式）: intentionally creates an application-level brownout
+// for normal write traffic so Node reconnect/retry behavior can be observed without touching PostgreSQL itself.
+app.use('/api',(req,res,next)=>{
+  if(!maintenanceActive())return next();
+  if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready'||['GET','HEAD','OPTIONS'].includes(req.method))return next();
+  res.setHeader('Retry-After','15');
+  return res.status(503).json({error:'中央服務正在執行受控維護演練，請稍後自動重試',errorCode:'RESILIENCE_MAINTENANCE',maintenance:{reason:maintenanceRuntime.reason,expiresAt:maintenanceRuntime.expiresAt}});
+});
+
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.54',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.55',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.54',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9a-resilience-drill-center-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.55',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1505,7 +1535,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.6').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.7').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1587,7 +1617,7 @@ async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIn
             await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
               VALUES($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
-              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.6',seq,512,now()]);
+              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.7',seq,512,now()]);
             rt.successCount++;
           }catch(e){rt.errorCount++;rt.lastError=String(e?.message||e).slice(0,500)}
           finally{const ms=Number(process.hrtime.bigint()-t0)/1e6;latencies.push(ms);if(latencies.length>200000)latencies.splice(0,latencies.length-100000);rt.totalRequests++;}
@@ -2019,7 +2049,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.42',apiVersion:'2.4.54',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.43',apiVersion:'2.4.55',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -2142,10 +2172,85 @@ async function runResilienceDrill(actor=SUPER_ADMIN_USER){
 async function resilienceSummary(){
   const current=await resilienceChecks();
   const events=(await pool.query('SELECT * FROM resilience_drill_events ORDER BY id DESC LIMIT 50')).rows;
-  return {current,events,destructiveDrillsEnabled:false,note:'Phase 9A 只做不破壞正式服務的準備檢查；真正停 DB、斷網、Promote Standby 需在維護時段以受控流程執行。',generatedAt:now()};
+  const control=await controlledDrillCapabilities(); return {current,events,control,destructiveDrillsEnabled:true,note:'Phase 9B 已加入受控維護中斷、DB 重新連線、Backup/Restore、警報鏈路與 HA Peer 探測。真正的 PostgreSQL Promote 仍由基礎設施層負責，不由應用程式直接執行。',generatedAt:now()};
 }
 app.get('/api/super/resilience',superAuth,async(req,res,next)=>{try{res.json(await resilienceSummary())}catch(e){next(e)}});
 app.post('/api/super/resilience/run',superAuth,async(req,res,next)=>{try{res.json(await runResilienceDrill(SUPER_ADMIN_USER))}catch(e){next(e)}});
+
+
+// Phase 9B: controlled, auditable drills. No shell commands and no automatic PostgreSQL promotion are executed here.
+async function recordControlledDrill(type,title,actor,runner){
+  const drillId=crypto.randomUUID(),started=now();
+  await pool.query("INSERT INTO resilience_drill_events(drill_id,drill_type,status,title,summary,detail,started_at,actor) VALUES($1,$2,'running',$3,'',$4::jsonb,$5,$6)",[drillId,type,title,'{}',started,actor]);
+  try{
+    const detail=await runner();
+    const status=detail?.status==='warning'?'warning':'passed';
+    const summary=String(detail?.summary||'演練完成').slice(0,1000);
+    await pool.query('UPDATE resilience_drill_events SET status=$1,summary=$2,detail=$3::jsonb,completed_at=$4 WHERE drill_id=$5',[status,summary,JSON.stringify(detail||{}),now(),drillId]);
+    return {ok:true,drillId,status,summary,detail};
+  }catch(e){
+    const msg=String(e?.message||e).slice(0,1000);
+    await pool.query("UPDATE resilience_drill_events SET status='failed',summary=$1,detail=$2::jsonb,completed_at=$3 WHERE drill_id=$4",[msg,JSON.stringify({error:msg}),now(),drillId]).catch(()=>{});
+    await recordDiagnostic('','RESILIENCE_CONTROLLED_001','resilience_drill',msg,{severity:'error',actor,context:{drillId,type}});
+    throw e;
+  }
+}
+async function controlledDrillCapabilities(){
+  const m=await loadMaintenanceRuntime();
+  const peer=await probeHaPeer().catch(e=>({configured:!!CENTRAL_HA_PEER_URL,ok:false,error:String(e?.message||e)}));
+  return {maintenance:m,types:[
+    {key:'db_reconnect',title:'DB Reconnect（資料庫重新連線）',safe:true,description:'建立並釋放專用測試連線，再重新連線驗證；不會關閉正式 PostgreSQL。'},
+    {key:'backup_restore',title:'Backup / Restore（備份復原）',safe:true,description:'重新執行最近一份中央備份的暫存 Restore Drill，不修改正式資料。'},
+    {key:'alert_pipeline',title:'Alert Pipeline（警報鏈路）',safe:true,description:'建立一筆測試警報並立即 Recovery，驗證 Phase 8D 警報資料鏈。'},
+    {key:'ha_peer',title:'HA Peer Probe（備援主機探測）',safe:true,description:'即時檢查 Peer /api/ready；應用程式不會自行 Promote Standby。'},
+    {key:'maintenance_brownout',title:'Maintenance Brownout（維護中斷）',safe:false,description:'需先開啟維護模式；正常寫入/Heartbeat 暫時回 503，用來觀察 Node 自動重試與重連。'}
+  ],ha:{enabled:CENTRAL_HA_ENABLED,peerConfigured:peer.configured,peerOk:peer.ok,peer},generatedAt:now()};
+}
+app.get('/api/super/resilience/control',superAuth,async(req,res,next)=>{try{res.json(await controlledDrillCapabilities())}catch(e){next(e)}});
+app.post('/api/super/resilience/maintenance/start',superAuth,async(req,res,next)=>{
+  try{
+    const b=req.body||{},minutes=Number(b.minutes||5),confirmText=String(b.confirmText||'');
+    if(confirmText!=='MAINTENANCE')return res.status(400).json({error:'二次確認失敗，請輸入 MAINTENANCE。'});
+    if(![1,5,10,15].includes(minutes))return res.status(400).json({error:'維護演練時間只允許 1 / 5 / 10 / 15 分鐘。'});
+    const startedAt=now(),expiresAt=new Date(Date.now()+minutes*60000).toISOString(),reason=String(b.reason||'Phase 9B 受控故障演練').slice(0,300),actor=req.auth?.username||SUPER_ADMIN_USER;
+    maintenanceRuntime={enabled:true,reason,startedAt,expiresAt,startedBy:actor,updatedAt:startedAt};
+    await pool.query('UPDATE resilience_control_state SET maintenance_enabled=TRUE,reason=$1,started_at=$2,expires_at=$3,started_by=$4,updated_at=$2 WHERE id=1',[reason,startedAt,expiresAt,actor]);
+    await recordControlledDrill('maintenance_start','Maintenance Mode（維護演練模式）',actor,async()=>({summary:`維護演練模式已開啟 ${minutes} 分鐘。`,minutes,expiresAt,reason,status:'warning'}));
+    res.json({ok:true,maintenance:maintenanceRuntime});
+  }catch(e){next(e)}
+});
+app.post('/api/super/resilience/maintenance/stop',superAuth,async(req,res,next)=>{
+  try{
+    const actor=req.auth?.username||SUPER_ADMIN_USER,stoppedAt=now();
+    maintenanceRuntime={enabled:false,reason:'',startedAt:null,expiresAt:null,startedBy:'',updatedAt:stoppedAt};
+    await pool.query("UPDATE resilience_control_state SET maintenance_enabled=FALSE,reason='',started_at=NULL,expires_at=NULL,started_by='',updated_at=$1 WHERE id=1",[stoppedAt]);
+    await recordControlledDrill('maintenance_stop','Maintenance Recovery（維護恢復）',actor,async()=>({summary:'維護演練模式已手動解除，正常寫入流量恢復。'}));
+    res.json({ok:true,maintenance:maintenanceRuntime});
+  }catch(e){next(e)}
+});
+app.post('/api/super/resilience/controlled',superAuth,async(req,res,next)=>{
+  try{
+    const type=String(req.body?.type||''),actor=req.auth?.username||SUPER_ADMIN_USER;
+    const allowed=new Set(['db_reconnect','backup_restore','alert_pipeline','ha_peer','maintenance_brownout']);
+    if(!allowed.has(type))return res.status(400).json({error:'不支援的演練類型'});
+    if(type==='maintenance_brownout'){
+      if(!maintenanceActive())return res.status(409).json({error:'請先開啟 Maintenance Mode（維護演練模式）再進行中斷觀察。'});
+      return res.json(await recordControlledDrill(type,'Maintenance Brownout（維護中斷）',actor,async()=>({status:'warning',summary:'維護中斷目前生效中；一般寫入、Heartbeat、同步會收到 HTTP 503，請觀察 Dealer Node 自動重試/重連。',expiresAt:maintenanceRuntime.expiresAt})));
+    }
+    if(type==='db_reconnect')return res.json(await recordControlledDrill(type,'DB Reconnect（資料庫重新連線）',actor,async()=>{
+      const t0=Date.now();const c=await pool.connect();try{await c.query('SELECT 1 AS ok')}finally{c.release()};const q=await pool.query('SELECT NOW() AS now');return {summary:`專用連線釋放後已重新取得 PostgreSQL 連線，總耗時 ${Date.now()-t0} ms。`,roundTripMs:Date.now()-t0,databaseTime:q.rows[0]?.now};
+    }));
+    if(type==='backup_restore')return res.json(await recordControlledDrill(type,'Backup / Restore（備份復原）',actor,async()=>{
+      const b=(await pool.query("SELECT backup_id FROM central_backup_events WHERE status IN ('success','partial') ORDER BY id DESC LIMIT 1")).rows[0];if(!b)throw new Error('尚無可用中央備份。');const r=await drillCentralBackup(b.backup_id,actor);return {summary:`Restore Drill 通過，可重建 ${Number(r.rowCount||0).toLocaleString()} 筆資料。`,backupId:b.backup_id,rowCount:r.rowCount,tableCount:r.tableCount};
+    }));
+    if(type==='alert_pipeline')return res.json(await recordControlledDrill(type,'Alert Pipeline（警報鏈路）',actor,async()=>{
+      const key=`phase9b_test_${crypto.randomUUID()}`,ts=now();await pool.query(`INSERT INTO performance_alert_events(alert_key,severity,status,title,message,impact,advice,value,threshold,unit,opened_at,last_seen_at,context) VALUES($1,'warning','open',$2,$3,$4,$5,1,1,'test',$6,$6,$7::jsonb)`,[key,'Phase 9B 測試警報','這是一筆受控測試警報。','不影響正式服務。','系統將立即自動標記 Recovery。',ts,JSON.stringify({phase:'9B',actor})]);await pool.query("UPDATE performance_alert_events SET status='recovered',recovered_at=$1,last_seen_at=$1 WHERE alert_key=$2 AND status='open'",[now(),key]);return {summary:'Phase 8D 測試警報已成功建立並 Recovery，警報資料鏈正常。',alertKey:key};
+    }));
+    if(type==='ha_peer')return res.json(await recordControlledDrill(type,'HA Peer Probe（備援主機探測）',actor,async()=>{
+      const st=await refreshHaRuntime({allowMigration:false,recordTransition:false}),peer=await probeHaPeer();if(!CENTRAL_HA_ENABLED)return {status:'warning',summary:'CENTRAL_HA_ENABLED 尚未開啟；目前只能完成本機角色檢查。',runtime:st,peer};if(!peer.configured)return {status:'warning',summary:'HA 已啟用，但尚未設定 CENTRAL_HA_PEER_URL。',runtime:st,peer};if(!peer.ok)throw new Error('HA Peer 健康檢查失敗。');return {summary:'HA Peer /api/ready 回應正常；自動 Promote 仍由 PostgreSQL / 基礎設施負責。',runtime:st,peer};
+    }));
+  }catch(e){next(e)}
+});
 
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
   try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
@@ -2400,6 +2505,7 @@ async function start(){
     await initDb();
     await refreshHaRuntime({allowMigration:false,recordTransition:false});
   }
+  await loadMaintenanceRuntime();
   setInterval(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*60*1000).unref();
   setInterval(async()=>{
     try{
