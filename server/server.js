@@ -559,7 +559,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.41',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6a-signed-update-policy'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.42',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6a-signed-update-policy'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1056,7 +1056,7 @@ app.patch('/api/super/update-policy',superAuth,async(req,res,next)=>{
     const releaseNotes=String(b.releaseNotes===undefined?old.releaseNotes:b.releaseNotes||'').slice(0,12000);
     const packageSha256=String(b.packageSha256===undefined?old.packageSha256:b.packageSha256||'').trim().toLowerCase();
     if(packageSha256 && !/^[a-f0-9]{64}$/.test(packageSha256))return res.status(400).json({error:'SHA-256 必須是 64 位十六進位字串'});
-    const packageSignature=String(b.packageSignature===undefined?old.packageSignature:b.packageSignature||'').trim().slice(0,4000);
+    const packageSignature=packageSha256?crypto.sign(null,Buffer.from(packageSha256),UPDATE_SIGNING_PRIVATE_KEY).toString('base64url'):'';
     await pool.query(`UPDATE desktop_update_policy SET enabled=$1,channel=$2,latest_version=$3,minimum_version=$4,download_url=$5,release_notes=$6,package_sha256=$7,package_signature=$8,updated_at=$9,updated_by=$10 WHERE id=1`,
       [b.enabled===undefined?old.enabled:!!b.enabled,channel,latest,minimum,downloadUrl,releaseNotes,packageSha256,packageSignature,now(),SUPER_ADMIN_USER]);
     res.json({ok:true,policy:await getDesktopUpdatePolicy()});
