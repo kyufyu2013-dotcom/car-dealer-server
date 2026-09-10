@@ -132,7 +132,7 @@ function salesSafeSnapshot(snapshot,user){
   const requests=(Array.isArray(d.saleRequests)?d.saleRequests:[])
     .filter(r=>r&&String(r.salesId)===String(user.id))
     .map(r=>({
-      id:r.id,carId:r.carId,plate:r.plate||'',model:r.model||'',floorPrice:Number(r.floorPrice||0),
+      id:r.id,operationId:r.operationId||'',carId:r.carId,plate:r.plate||'',model:r.model||'',floorPrice:Number(r.floorPrice||0),
       sellPrice:Number(r.sellPrice||0),saleDate:r.saleDate||'',requestedAt:r.requestedAt||'',
       salesId:r.salesId,salesName:r.salesName||user.name,commissionRate:Number(r.commissionRate??user.commission_rate??0),
       expectedCommission:Number(r.expectedCommission||0),commissionMode:r.commissionMode==='fixed'?'fixed':'percentage',fixedCommissionAmount:Math.max(0,Number(r.fixedCommissionAmount||0)),status:r.status||'待確認',
@@ -324,7 +324,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.24',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.25',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -591,26 +591,32 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     const d=existing.snapshot;
     d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
     d.cars=Array.isArray(d.cars)?d.cars:[];
-    const c=d.cars.find(x=>x.id===body.carId);
-    if(!c||c.status!=='在庫'){await client.query('ROLLBACK');return res.status(400).json({error:'車輛不存在或已售'});}
-    if(d.saleRequests.some(r=>r.carId===c.id&&r.status==='待確認')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有待確認成交申請'});}
+    const operationId=String(body.operationId||'').trim();
+    if(operationId&&!/^[A-Za-z0-9._:-]{8,120}$/.test(operationId)){await client.query('ROLLBACK');return res.status(400).json({error:'同步識別碼格式錯誤'});}
     const {rows}=await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId]);
     const u=rows[0];
     if(!u){await client.query('ROLLBACK');return res.status(401).json({error:'帳號不存在'});}
+    if(operationId){
+      const dup=d.saleRequests.find(r=>String(r.operationId||'')===operationId&&String(r.salesId)===String(u.id));
+      if(dup){await client.query('COMMIT');return res.json({ok:true,duplicate:true,ackOperationId:operationId,version:existing.version,snapshot:salesSafeSnapshot(d,u),requestId:dup.id});}
+    }
+    const c=d.cars.find(x=>x.id===body.carId);
+    if(!c||c.status!=='在庫'){await client.query('ROLLBACK');return res.status(400).json({error:'車輛不存在或已售'});}
+    if(d.saleRequests.some(r=>r.carId===c.id&&r.status==='待確認')){await client.query('ROLLBACK');return res.status(409).json({error:'此車已有待確認成交申請'});}
     const sell=Number(body.sellPrice||0);
     if(sell<=0){await client.query('ROLLBACK');return res.status(400).json({error:'售價錯誤'});}
     const rate=Number(u.commission_rate||0),floor=Number(c.floorPrice||0);
     const commissionMode=c.commissionMode==='fixed'?'fixed':'percentage',fixedCommissionAmount=Math.max(0,Number(c.fixedCommissionAmount||0));
     const expectedCommission=commissionMode==='fixed'?fixedCommissionAmount:Math.max(0,sell-floor)*rate/100;
     d.saleRequests.push({
-      id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,carId:c.id,plate:c.plate,model:c.model,
+      id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,operationId:operationId||`legacy_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,carId:c.id,plate:c.plate,model:c.model,
       floorPrice:floor,sellPrice:sell,saleDate:body.saleDate||today(),requestedAt:today(),salesId:u.id,salesName:u.name,
       commissionRate:rate,commissionMode,fixedCommissionAmount,expectedCommission,status:'待確認'
     });
     const ver=existing.version+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
-    res.json({ok:true,version:ver,snapshot:salesSafeSnapshot(d,u)});
+    res.json({ok:true,ackOperationId:operationId||null,version:ver,snapshot:salesSafeSnapshot(d,u)});
   }catch(e){
     try{ await client.query('ROLLBACK'); }catch{}
     next(e);
