@@ -55,7 +55,7 @@ linear-gradient(180deg,rgba(255,255,255,.03),transparent 18%,transparent 78%,rgb
 // Keep all Sales-side notices inside the app so the browser hostname is never shown as the alert title.
 (function(){const nativeAlert=window.alert.bind(window);window.alert=function(message){const bg=document.getElementById('systemPromptBg'),msg=document.getElementById('systemPromptMessage'),ok=document.getElementById('systemPromptOk');if(!bg||!msg||!ok){nativeAlert(message);return}msg.textContent=String(message??'');bg.classList.add('show');ok.onclick=()=>bg.classList.remove('show');setTimeout(()=>ok.focus(),0)}})();
 
-const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},saleQueueTimer=null,saleQueueBusy=false;
+const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},saleQueueTimer=null,saleQueueBusy=false,photoQueueTimer=null,photoQueueBusy=false;
 const $=id=>document.getElementById(id);const money=n=>'NT$ '+Number(n||0).toLocaleString('zh-TW');const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const rate=v=>{let n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')};
 async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})};let r=await fetch(API+path,opt);let j={};try{j=await r.json()}catch{};if((r.status===401||r.status===403)&&token){logout(j.error||'登入或授權已失效');throw new Error(j.error||'授權失效')}if(!r.ok)throw new Error(j.error||'操作失敗');return j}
 function togglePassword(){const p=$('password');if(!p)return;p.type=p.type==='password'?'text':'password'}
@@ -93,6 +93,35 @@ function enqueueSale(car,payload){let q=loadSaleQueue();if(q.some(x=>String(x.ca
 function retryQueueItem(id){let q=loadSaleQueue(),i=q.findIndex(x=>x.operationId===id);if(i<0)return;q[i].state='pending';q[i].nextTryAt=0;q[i].lastError='';saveSaleQueue(q);processSaleQueue(true);renderSync()}
 function deleteQueueItem(id){let q=loadSaleQueue().filter(x=>x.operationId!==id);saveSaleQueue(q);renderSync()}
 
+function photoQueueKey(){return `carDealerSalesPhotoQueue_v81_${company?.id||'none'}_${me?.id||'none'}`}
+function photoHistoryKey(){return `carDealerSalesPhotoHistory_v81_${company?.id||'none'}_${me?.id||'none'}`}
+function loadPhotoQueue(){try{let q=JSON.parse(localStorage.getItem(photoQueueKey())||'[]');return Array.isArray(q)?q:[]}catch{return []}}
+function savePhotoQueue(q){localStorage.setItem(photoQueueKey(),JSON.stringify((q||[]).slice(-120)))}
+function loadPhotoHistory(){try{let q=JSON.parse(localStorage.getItem(photoHistoryKey())||'[]');return Array.isArray(q)?q:[]}catch{return []}}
+function addPhotoHistory(item,state,message=''){let h=loadPhotoHistory();h.unshift({...item,state,message,finishedAt:new Date().toISOString()});localStorage.setItem(photoHistoryKey(),JSON.stringify(h.slice(0,20)))}
+function photoOperationId(){try{return 'photo_'+crypto.randomUUID()}catch{return 'photo_'+Date.now()+'_'+Math.random().toString(36).slice(2,12)}}
+function schedulePhotoQueue(ms=1200){clearTimeout(photoQueueTimer);photoQueueTimer=setTimeout(()=>processPhotoQueue(false),ms)}
+function ensurePhotoQueued(car){if(!car||salesPhotoCache[String(car.id)]?.length)return;let q=loadPhotoQueue();if(q.some(x=>String(x.carId)===String(car.id)&&x.state!=='failed'))return;let total=Number(car.intakePhotoCount||0)+Number(car.inspectionPhotoCount||0);if(!total)return;q.push({operationId:photoOperationId(),type:'photoFetch',carId:car.id,plate:car.plate||'',model:car.model||'',createdAt:new Date().toISOString(),attempts:0,nextTryAt:0,state:'pending',lastError:''});savePhotoQueue(q);schedulePhotoQueue(80)}
+async function fetchPhotoBundleOnce(carId){
+ if(LAN_MODE){const rr=await api('/lan/photos/'+encodeURIComponent(carId));return (rr.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8)}
+ const q=await api('/sales/node-photos/request',{method:'POST',body:JSON.stringify({carId})});
+ const deadline=Date.now()+65000;
+ while(Date.now()<deadline){await new Promise(r=>setTimeout(r,550));const rr=await api('/sales/node-photo-bundles/'+encodeURIComponent(q.requestId));if(rr.status==='completed')return (rr.result?.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8);if(rr.status==='failed'||rr.status==='expired'){let e=new Error(rr.error||'照片讀取失敗');throw e}}
+ throw new Error('照片讀取逾時')
+}
+async function processPhotoQueue(force=false){
+ if(!token||photoQueueBusy||!navigator.onLine||!nodeIsOnline)return;
+ let q=loadPhotoQueue();if(!q.length)return;
+ const now=Date.now();let idx=q.findIndex(x=>x.state!=='failed'&&(force||!x.nextTryAt||x.nextTryAt<=now));
+ if(idx<0){let live=q.filter(x=>x.state!=='failed');if(live.length){let next=Math.min(...live.map(x=>x.nextTryAt||now+60000));schedulePhotoQueue(Math.max(1000,next-now))}return}
+ photoQueueBusy=true;let item=q[idx];item.state='syncing';savePhotoQueue(q);if(currentPage==='sync')renderSync();
+ try{let photos=await fetchPhotoBundleOnce(item.carId);salesPhotoCache[String(item.carId)]=photos;q=loadPhotoQueue().filter(x=>x.operationId!==item.operationId);savePhotoQueue(q);addPhotoHistory(item,'acked',photos.length?`照片已讀取 ${photos.length} 張`:'車輛目前沒有可讀取照片');let box=$(`photoStrip_${item.carId}`);if(box)box.innerHTML=photos.length?photos.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join(''):'<div class="photoLoading photoOffline">無照片</div>';if(currentPage==='sync')renderSync()}
+ catch(e){q=loadPhotoQueue();let i=q.findIndex(x=>x.operationId===item.operationId);if(i>=0){q[i].attempts=Number(q[i].attempts||0)+1;q[i].lastError=e.message||'照片讀取失敗';q[i].state='pending';q[i].nextTryAt=Date.now()+retryDelay(q[i].attempts)}savePhotoQueue(q);if(currentPage==='sync')renderSync()}
+ finally{photoQueueBusy=false;if(loadPhotoQueue().some(x=>x.state!=='failed'))schedulePhotoQueue(1200)}
+}
+function retryPhotoQueueItem(id){let q=loadPhotoQueue(),i=q.findIndex(x=>x.operationId===id);if(i<0)return;q[i].state='pending';q[i].nextTryAt=0;q[i].lastError='';savePhotoQueue(q);processPhotoQueue(true);renderSync()}
+function deletePhotoQueueItem(id){let q=loadPhotoQueue().filter(x=>x.operationId!==id);savePhotoQueue(q);renderSync()}
+
 
 async function fetchNodeInventory(){
  if(nodeInventoryBusy)return null;
@@ -124,7 +153,7 @@ async function refreshNodeStatus(showOfflineAlert=false){
    nodeIsOnline=online;lastNodeOnline=online;
    setDealerNodeBadge(online?'on':'off',online?(LAN_MODE?'● 本機資料伺服器正常':'● 公司資料主機連線'):(LAN_MODE?'● 本機資料伺服器離線':'● 公司資料主機離線'));
    if(!online&&changed&&showOfflineAlert)alert('⚠ 車行主機離線中，照片無法讀取。');
-   if(online&&changed){salesPhotoCache={};salesPhotoLoading={};setTimeout(refreshNodeInventory,0)}
+   if(online&&changed){salesPhotoCache={};salesPhotoLoading={};setTimeout(refreshNodeInventory,0);setTimeout(()=>processPhotoQueue(true),250)}
    return online;
  }catch(e){
    nodeIsOnline=false;
@@ -149,7 +178,7 @@ async function refreshNodeStateAndInventory(showLoginAlert=false){
  const online=await refreshNodeStatus(showLoginAlert);
  if(online)await refreshNodeInventory();
 }
-function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;setDealerNodeBadge('checking',LAN_MODE?'● 本機資料伺服器檢查中':'● 公司資料主機檢查中');showPage(currentPage||'cars');clearInterval(timer);clearInterval(nodeTimer);timer=setInterval(sync,5000);nodeTimer=setInterval(()=>LAN_MODE?refreshNodeInventory():refreshNodeStatus(false),2000);if(!LAN_MODE){scheduleSaleQueue(300);setInterval(()=>processSaleQueue(false),5000)}}
+function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;setDealerNodeBadge('checking',LAN_MODE?'● 本機資料伺服器檢查中':'● 公司資料主機檢查中');showPage(currentPage||'cars');clearInterval(timer);clearInterval(nodeTimer);timer=setInterval(sync,5000);nodeTimer=setInterval(()=>LAN_MODE?refreshNodeInventory():refreshNodeStatus(false),2000);if(!LAN_MODE){scheduleSaleQueue(300);setInterval(()=>processSaleQueue(false),5000)}schedulePhotoQueue(350);setInterval(()=>processPhotoQueue(false),5000)}
 function openAccountSettings(){
  $('modal').innerHTML=`<h2>⚙ 帳號設定</h2><div class="notice">${esc(me?.name||'')}｜${esc(me?.username||'')}<br>你可以在這裡修改自己的登入密碼。</div><div class="field"><label>目前密碼</label><input id="currentPw" type="password" autocomplete="current-password" placeholder="輸入目前密碼"></div><div class="field"><label>新密碼</label><input id="newPw" type="password" autocomplete="new-password" placeholder="至少 6 碼"></div><div class="field"><label>再次輸入新密碼</label><input id="newPw2" type="password" autocomplete="new-password" placeholder="再次輸入新密碼"></div><div class="row"><button id="changePwBtn" class="btn primary" style="flex:1" onclick="changeMyPassword()">確認修改密碼</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
  $('modalBg').classList.add('show');setTimeout(()=>$('currentPw')?.focus(),50)
@@ -161,7 +190,7 @@ async function changeMyPassword(){
  const b=$('changePwBtn');if(b){b.disabled=true;b.textContent='修改中…'}
  try{await api('/account/change-password',{method:'POST',body:JSON.stringify({currentPassword,newPassword})});alert('密碼修改成功，請使用新密碼重新登入');closeModal();logout()}catch(e){alert(e.message||'修改密碼失敗');if(b){b.disabled=false;b.textContent='確認修改密碼'}}
 }
-function logout(msg=''){clearInterval(timer);clearInterval(nodeTimer);clearTimeout(saleQueueTimer);timer=null;nodeTimer=null;saleQueueTimer=null;saleQueueBusy=false;token='';me=null;company=null;nodeIsOnline=false;lastNodeOnline=null;nodeInventoryBusy=false;salesPhotoCache={};salesPhotoLoading={};data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
+function logout(msg=''){clearInterval(timer);clearInterval(nodeTimer);clearTimeout(saleQueueTimer);clearTimeout(photoQueueTimer);timer=null;nodeTimer=null;saleQueueTimer=null;photoQueueTimer=null;saleQueueBusy=false;photoQueueBusy=false;token='';me=null;company=null;nodeIsOnline=false;lastNodeOnline=null;nodeInventoryBusy=false;salesPhotoCache={};salesPhotoLoading={};data={cars:[],saleRequests:[]};localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);$('app').classList.add('hidden');$('loginPage').classList.remove('hidden');$('password').value='';if(msg)alert(msg);health()}
 async function restore(){let s;try{s=JSON.parse(localStorage.getItem(SESSION)||sessionStorage.getItem(SESSION_TEMP))}catch{};if(!s?.token)return false;if($('rememberLogin'))$('rememberLogin').checked=!!localStorage.getItem(SESSION);token=s.token;currentPage=s.page||'cars';try{let j=await api('/session/restore');if(j.user?.role!=='sales')throw new Error('角色不符');if(j.token)token=j.token;me=j.user;company=j.company;data=j.snapshot||data;version=Number(j.version||0);saveSession();enter();await refreshNodeStateAndInventory(false);return true}catch{token='';localStorage.removeItem(SESSION);sessionStorage.removeItem(SESSION_TEMP);return false}}
 async function sync(){if(!token)return;if(!LAN_MODE)processSaleQueue(false);try{let j=await api('/company/snapshot');if(j.token){token=j.token;saveSession()}company=j.company||company;if(j.user)me=j.user;if(LAN_MODE){data=j.snapshot||data;render();return}if(Number(j.version||0)!==version){version=Number(j.version||0);const keepCars=data?.cars||[];data=j.snapshot||data;data.cars=keepCars;render();if(nodeIsOnline)setTimeout(refreshNodeInventory,0)}}catch(e){}}
 function showPage(p){currentPage=p;saveSession();$('tabCars').classList.toggle('active',p==='cars');$('tabReq').classList.toggle('active',p==='requests');$('tabSync')?.classList.toggle('active',p==='sync');render();if(p==='cars'&&nodeIsOnline)setTimeout(refreshNodeInventory,0)}
@@ -178,22 +207,7 @@ async function fetchSalesPhotoBundle(carId){
  const k=String(carId);
  if(salesPhotoCache[k]?.length)return salesPhotoCache[k];
  if(salesPhotoLoading[k])return salesPhotoLoading[k];
- salesPhotoLoading[k]=(async()=>{
-   if(LAN_MODE){const rr=await api('/lan/photos/'+encodeURIComponent(carId));const photos=(rr.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8);salesPhotoCache[k]=photos;return photos}
-   const q=await api('/sales/node-photos/request',{method:'POST',body:JSON.stringify({carId})});
-   const deadline=Date.now()+65000;
-   while(Date.now()<deadline){
-     await new Promise(r=>setTimeout(r,550));
-     const rr=await api('/sales/node-photo-bundles/'+encodeURIComponent(q.requestId));
-     if(rr.status==='completed'){
-       const photos=(rr.result?.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8);
-       salesPhotoCache[k]=photos;
-       return photos;
-     }
-     if(rr.status==='failed'||rr.status==='expired')throw new Error(rr.error||'照片讀取失敗');
-   }
-   throw new Error('照片讀取逾時');
- })();
+ salesPhotoLoading[k]=(async()=>{const photos=await fetchPhotoBundleOnce(carId);salesPhotoCache[k]=photos;return photos})();
  try{return await salesPhotoLoading[k]}finally{delete salesPhotoLoading[k]}
 }
 async function hydrateAutoPhotos(){
@@ -202,11 +216,11 @@ async function hydrateAutoPhotos(){
    const total=Number(c.intakePhotoCount||0)+Number(c.inspectionPhotoCount||0);
    if(!total)continue;
    const box=$(`photoStrip_${c.id}`);if(!box)continue;
-   if(!nodeIsOnline){box.innerHTML='<div class="photoLoading photoOffline">主機離線</div>';continue}
-   try{
-     const photos=await fetchSalesPhotoBundle(c.id);
-     box.innerHTML=photos.length?photos.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join(''):'<div class="photoLoading photoOffline">無照片</div>';
-   }catch(e){box.innerHTML='<div class="photoLoading photoOffline">無法讀取</div>'}
+   ensurePhotoQueued(c);
+   if(!nodeIsOnline){box.innerHTML='<div class="photoLoading photoOffline">主機離線・等待自動重試</div>';continue}
+   const cached=salesPhotoCache[String(c.id)]||[];
+   if(cached.length){box.innerHTML=cached.map(src=>`<img src="${src}" onclick="openImage(this.src)">`).join('');continue}
+   box.innerHTML='<div class="photoLoading">照片排程讀取中…</div>';
  }
 }
 function monthlyBonusInfo(){let mk=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Taipei'}).slice(0,7),rs=(data.saleRequests||[]).filter(r=>r.status==='已成交'&&String(r.saleDate||'').slice(0,7)===mk),bonus=rs.reduce((sum,r)=>sum+Number((r.finalCommission??r.expectedCommission)||0),0);return {mk,rs,bonus}}
@@ -231,11 +245,12 @@ function renderCars(){
  setTimeout(hydrateAutoPhotos,0);
 }
 function renderSync(){
- let q=loadSaleQueue(),h=loadSyncHistory(),active=q.filter(x=>x.state!=='failed'),failed=q.filter(x=>x.state==='failed');
+ let q=loadSaleQueue(),pq=loadPhotoQueue(),h=loadSyncHistory(),ph=loadPhotoHistory(),active=q.filter(x=>x.state!=='failed'),failed=q.filter(x=>x.state==='failed'),pactive=pq.filter(x=>x.state!=='failed'),pfailed=pq.filter(x=>x.state==='failed');
  let stateLabel=x=>x.state==='syncing'?'🔵 同步中':x.state==='failed'?'🔴 需要處理':'🟡 待同步';
- $('page').innerHTML=`<div class="card"><h2 style="margin-top:0">🔄 同步中心</h2><div class="kpi"><div><div class="muted">等待同步</div><div class="big">${active.length}</div></div><div><div class="muted">需要處理</div><div class="big">${failed.length}</div></div></div>${LAN_MODE?'<div class="notice">目前使用店內備用入口。成交申請暫不送出；回到一般業務入口後會繼續同步。</div>':active.length?'<div class="notice">系統會自動重試，不需要重複提交成交申請。</div>':'<div class="notice">✅ 目前沒有等待同步的成交申請。</div>'}</div>`+
- q.map(x=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(x.plate||'-')}</div><div>${esc(x.model||'')}</div></div><span class="status ${x.state==='failed'?'rejected':'pending'}">${stateLabel(x)}</span></div><div>成交價：<b>${money(x.payload?.sellPrice)}</b></div><div class="muted">建立時間 ${esc(new Date(x.createdAt).toLocaleString('zh-TW',{hour12:false}))}｜重試 ${Number(x.attempts||0)} 次</div>${x.lastError?`<div class="notice error">${esc(x.lastError)}</div>`:''}${x.state==='failed'?`<div class="row"><button class="btn primary" onclick="retryQueueItem('${esc(x.operationId)}')">重新同步</button><button class="btn dangerBtn" onclick="deleteQueueItem('${esc(x.operationId)}')">移除</button></div>`:''}</div>`).join('')+
- (h.length?`<div class="card"><h3 style="margin-top:0">最近同步紀錄</h3>${h.slice(0,10).map(x=>`<div style="padding:9px 0;border-bottom:1px solid #e2e8f0"><b>${x.state==='acked'?'✅ 已送達':'❌ 未完成'}｜${esc(x.plate||'-')} ${esc(x.model||'')}</b><div class="muted">${esc(x.message||'')}｜${esc(new Date(x.finishedAt).toLocaleString('zh-TW',{hour12:false}))}</div></div>`).join('')}</div>`:'');
+ $('page').innerHTML=`<div class="card"><h2 style="margin-top:0">🔄 同步中心</h2><div class="kpi"><div><div class="muted">成交等待同步</div><div class="big">${active.length}</div></div><div><div class="muted">照片等待讀取</div><div class="big">${pactive.length}</div></div><div><div class="muted">需要處理</div><div class="big">${failed.length+pfailed.length}</div></div></div>${LAN_MODE?'<div class="notice">目前使用店內備用入口。成交申請暫不送出；照片仍會由本機資料伺服器背景讀取。</div>':active.length||pactive.length?'<div class="notice">成交與照片工作都會自動重試，不需要重複操作。</div>':'<div class="notice">✅ 目前沒有等待同步或照片讀取工作。</div>'}</div>`+
+ q.map(x=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(x.plate||'-')}</div><div>${esc(x.model||'')}</div></div><span class="status ${x.state==='failed'?'rejected':'pending'}">${stateLabel(x)}</span></div><div><b>成交申請</b>｜成交價 ${money(x.payload?.sellPrice)}</div><div class="muted">建立時間 ${esc(new Date(x.createdAt).toLocaleString('zh-TW',{hour12:false}))}｜重試 ${Number(x.attempts||0)} 次</div>${x.lastError?`<div class="notice error">${esc(x.lastError)}</div>`:''}${x.state==='failed'?`<div class="row"><button class="btn primary" onclick="retryQueueItem('${esc(x.operationId)}')">重新同步</button><button class="btn dangerBtn" onclick="deleteQueueItem('${esc(x.operationId)}')">移除</button></div>`:''}</div>`).join('')+
+ pq.map(x=>`<div class="car"><div class="carhead"><div><div class="plate">${esc(x.plate||'-')}</div><div>${esc(x.model||'')}</div></div><span class="status ${x.state==='failed'?'rejected':'pending'}">${stateLabel(x)}</span></div><div><b>照片背景讀取</b></div><div class="muted">建立時間 ${esc(new Date(x.createdAt).toLocaleString('zh-TW',{hour12:false}))}｜重試 ${Number(x.attempts||0)} 次</div>${x.lastError?`<div class="notice error">${esc(x.lastError)}</div>`:''}${x.state==='failed'?`<div class="row"><button class="btn primary" onclick="retryPhotoQueueItem('${esc(x.operationId)}')">重新讀取</button><button class="btn dangerBtn" onclick="deletePhotoQueueItem('${esc(x.operationId)}')">移除</button></div>`:''}</div>`).join('')+
+ ((h.length||ph.length)?`<div class="card"><h3 style="margin-top:0">最近同步紀錄</h3>${[...h.map(x=>({...x,_kind:'成交'})),...ph.map(x=>({...x,_kind:'照片'}))].sort((a,b)=>String(b.finishedAt||'').localeCompare(String(a.finishedAt||''))).slice(0,12).map(x=>`<div style="padding:9px 0;border-bottom:1px solid #e2e8f0"><b>${x.state==='acked'?'✅ 已完成':'❌ 未完成'}｜${esc(x._kind)}｜${esc(x.plate||'-')} ${esc(x.model||'')}</b><div class="muted">${esc(x.message||'')}｜${esc(new Date(x.finishedAt).toLocaleString('zh-TW',{hour12:false}))}</div></div>`).join('')}</div>`:'');
 }
 
 function statusClass(s){return s==='待確認'?'pending':(s==='已確認'||s==='已成交'||s==='通過')?'approved':'rejected'}
@@ -244,6 +259,6 @@ function openApply(id){let c=(data.cars||[]).find(x=>String(x.id)===String(id));
 function updateCommission(id){let c=(data.cars||[]).find(x=>String(x.id)===String(id)),sell=Number($('sellPrice')?.value||0),diff=Math.max(0,sell-Number(c?.floorPrice||0)),bonus=c?.commissionMode==='fixed'?Math.max(0,Number(c.fixedCommissionAmount||0)):diff*Number(me?.commissionRate||0)/100;if($('commissionPreview'))$('commissionPreview').innerHTML=c?.commissionMode==='fixed'?`固定業務獎金：<b>${money(bonus)}</b><br><span class="muted">不依成交價與個人獎金比例計算</span>`:`超過底價：<b>${money(diff)}</b><br>預估業務獎金：<b>${money(bonus)}</b>`}
 async function submitApply(carId){if(LAN_MODE)return alert('目前為店內備用入口，可查看庫存與照片；成交申請請回到一般業務入口後送出。');let sell=Number($('sellPrice').value||0),date=$('saleDate').value;if(sell<=0||!date)return alert('請確認售價與成交日期');let c=(data.cars||[]).find(x=>String(x.id)===String(carId));if(!c)return alert('找不到車輛資料');try{enqueueSale(c,{carId,sellPrice:sell,saleDate:date});closeModal();showPage('sync');processSaleQueue(true);alert('成交申請已加入同步佇列。系統會自動送出，請勿重複提交。')}catch(e){alert(e.message)}}
 function closeModal(){$('modalBg').classList.remove('show')}function openImage(src){$('bigImage').src=src;$('imageBg').classList.add('show')}function closeImage(){$('imageBg').classList.remove('show');$('bigImage').src=''}
-$('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>{if(token){sync();processSaleQueue(true)}else health()});window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
+$('password').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});window.addEventListener('online',()=>{if(token){sync();processSaleQueue(true);processPhotoQueue(true)}else health()});window.addEventListener('offline',()=>{$('netState').className='notice error';$('netState').textContent='🔴 目前沒有網路'});
 (async()=>{await health();if(!(await restore())){};if(!LAN_MODE&&'serviceWorker' in navigator)navigator.serviceWorker.register('sw.js?v=9.3.15',{updateViaCache:'none'}).then(r=>r.update()).catch(()=>{})})();
 </script></body></html>
