@@ -69,6 +69,17 @@ let managedLoadTest={running:false,stopRequested:false,runId:'',targetNodes:0,du
 // Phase 8C: lightweight central performance telemetry. Technical metrics are Super Admin only.
 const METRICS_SAMPLE_MS=Math.max(5000,Math.min(60000,Number(process.env.METRICS_SAMPLE_MS||15000)));
 const METRICS_RETENTION_HOURS=Math.max(1,Math.min(24*30,Number(process.env.METRICS_RETENTION_HOURS||72)));
+// Phase 8D: sustained anomaly + capacity alert engine. An alert opens only after consecutive bad samples.
+const ALERT_TRIGGER_SAMPLES=Math.max(2,Math.min(20,Number(process.env.ALERT_TRIGGER_SAMPLES||4)));
+const ALERT_RECOVERY_SAMPLES=Math.max(2,Math.min(20,Number(process.env.ALERT_RECOVERY_SAMPLES||3)));
+const ALERT_CPU_PERCENT=Math.max(1,Math.min(100,Number(process.env.ALERT_CPU_PERCENT||80)));
+const ALERT_RAM_PERCENT=Math.max(1,Math.min(100,Number(process.env.ALERT_RAM_PERCENT||85)));
+const ALERT_API_P95_MS=Math.max(50,Number(process.env.ALERT_API_P95_MS||500));
+const ALERT_API_5XX_RATE=Math.max(0,Math.min(1,Number(process.env.ALERT_API_5XX_RATE||0.01)));
+const ALERT_EVENT_LOOP_P95_MS=Math.max(10,Number(process.env.ALERT_EVENT_LOOP_P95_MS||100));
+const ALERT_PG_WAITING=Math.max(1,Number(process.env.ALERT_PG_WAITING||1));
+const ALERT_CAPACITY_PERCENT=Math.max(1,Math.min(100,Number(process.env.ALERT_CAPACITY_PERCENT||80)));
+const alertRuntime=new Map();
 const eventLoopMonitor=monitorEventLoopDelay({resolution:20}); eventLoopMonitor.enable();
 let perfLastCpu=process.cpuUsage(),perfLastWall=process.hrtime.bigint();
 let apiPerfWindow=[];
@@ -83,6 +94,53 @@ async function collectSystemMetrics(){
   return {sampledAt:now(),instanceId:CENTRAL_HA_INSTANCE_ID,site:CENTRAL_HA_SITE,cpuPercent:cpu,rssBytes:mem.rss,heapUsedBytes:mem.heapUsed,heapTotalBytes:mem.heapTotal,systemFreeBytes:os.freemem(),systemTotalBytes:os.totalmem(),eventLoopP95Ms:elP95,eventLoopMaxMs:elMax,apiRps:api.rps,apiP50Ms:api.p50Ms,apiP95Ms:api.p95Ms,apiP99Ms:api.p99Ms,apiErrorRate:api.errorRate,pgTotal:Number(pool.totalCount||0),pgIdle:Number(pool.idleCount||0),pgWaiting:Number(pool.waitingCount||0),pgQueryMs,pgOk,uptimeSeconds:Math.round(process.uptime()),loadAvg1:Number(os.loadavg()[0]||0),cpuCores:os.cpus().length};
 }
 function assessPerformance(m){const issues=[];let score=100;if(m.cpuPercent>=85){score-=25;issues.push('Node.js CPU 使用率過高')}else if(m.cpuPercent>=70){score-=10;issues.push('CPU 使用率偏高')}const memRatio=m.systemTotalBytes?1-m.systemFreeBytes/m.systemTotalBytes:0;if(memRatio>=.9){score-=20;issues.push('系統記憶體使用率超過 90%')}if(m.eventLoopP95Ms>=100){score-=25;issues.push('Event Loop 延遲嚴重')}else if(m.eventLoopP95Ms>=40){score-=10;issues.push('Event Loop 延遲偏高')}if(m.pgWaiting>0){score-=Math.min(25,m.pgWaiting*5);issues.push(`PostgreSQL 等待連線 ${m.pgWaiting}`)}if(m.pgQueryMs>=200){score-=20;issues.push('PostgreSQL 基礎查詢延遲過高')}else if(m.pgQueryMs>=80){score-=8;issues.push('PostgreSQL 查詢延遲偏高')}if(m.apiErrorRate>=.02){score-=25;issues.push('API 5xx 錯誤率偏高')}if(m.apiP95Ms>=1000){score-=20;issues.push('API P95 延遲過高')}else if(m.apiP95Ms>=500){score-=8;issues.push('API P95 延遲偏高')}score=Math.max(0,score);let bottleneck='none';if(m.pgWaiting>0||m.pgQueryMs>=200)bottleneck='postgres';else if(m.eventLoopP95Ms>=100)bottleneck='event_loop';else if(m.cpuPercent>=85)bottleneck='cpu';else if(memRatio>=.9)bottleneck='memory';else if(m.apiP95Ms>=1000)bottleneck='api_latency';else if(m.apiErrorRate>=.02)bottleneck='api_errors';return {score,grade:score>=90?'A':score>=80?'B':score>=65?'C':score>=50?'D':'F',bottleneck,issues,memoryPercent:memRatio*100};}
+
+function alertDefinitions(m,capacity){
+  const ramPct=m.systemTotalBytes?(1-m.systemFreeBytes/m.systemTotalBytes)*100:0;
+  const capPct=Number(capacity?.usagePercent||0);
+  return [
+    {key:'cpu_high',bad:m.cpuPercent>=ALERT_CPU_PERCENT,severity:'warning',title:'CPU 負載偏高',message:`CPU Usage（處理器使用率） ${m.cpuPercent.toFixed(1)}%，已達警戒值 ${ALERT_CPU_PERCENT}%`,impact:'中央 Server 可用運算餘裕下降，API 回應可能逐漸變慢。',advice:'檢查是否正在壓力測試、大量同步或有高 CPU 工作；若持續發生，準備增加 CPU 資源。',value:m.cpuPercent,threshold:ALERT_CPU_PERCENT,unit:'%'},
+    {key:'ram_high',bad:ramPct>=ALERT_RAM_PERCENT,severity:'warning',title:'RAM 使用率偏高',message:`RAM Usage（系統記憶體使用率） ${ramPct.toFixed(1)}%，已達警戒值 ${ALERT_RAM_PERCENT}%`,impact:'主機可用記憶體不足時可能增加交換或造成程序不穩定。',advice:'檢查其他程序與 Node.js 記憶體使用；若持續升高，增加 RAM 或排查記憶體異常。',value:ramPct,threshold:ALERT_RAM_PERCENT,unit:'%'},
+    {key:'api_p95_high',bad:m.apiP95Ms>=ALERT_API_P95_MS,severity:m.apiP95Ms>=1000?'critical':'warning',title:'API 回應延遲偏高',message:`API P95（95% 請求回應時間） ${m.apiP95Ms.toFixed(1)} ms，警戒值 ${ALERT_API_P95_MS} ms`,impact:'多數使用者操作可能開始感覺變慢。',advice:'對照 CPU、Event Loop 與 PostgreSQL 指標，找出延遲來源。',value:m.apiP95Ms,threshold:ALERT_API_P95_MS,unit:'ms'},
+    {key:'api_5xx_high',bad:m.apiErrorRate>=ALERT_API_5XX_RATE,severity:'critical',title:'API 伺服器錯誤率偏高',message:`API 5xx Rate（伺服器錯誤率） ${(m.apiErrorRate*100).toFixed(3)}%，警戒值 ${(ALERT_API_5XX_RATE*100).toFixed(2)}%`,impact:'部分登入、同步或管理操作可能直接失敗。',advice:'立即查看 Phase 5A 錯誤診斷中心與 Server log，確認共同錯誤來源。',value:m.apiErrorRate*100,threshold:ALERT_API_5XX_RATE*100,unit:'%'},
+    {key:'event_loop_high',bad:m.eventLoopP95Ms>=ALERT_EVENT_LOOP_P95_MS,severity:'critical',title:'Event Loop 延遲過高',message:`Event Loop P95（事件迴圈延遲） ${m.eventLoopP95Ms.toFixed(1)} ms，警戒值 ${ALERT_EVENT_LOOP_P95_MS} ms`,impact:'Node.js 主執行緒忙碌，API 可能整體卡頓。',advice:'檢查同步 CPU 工作、過大的 JSON 處理或高併發工作。',value:m.eventLoopP95Ms,threshold:ALERT_EVENT_LOOP_P95_MS,unit:'ms'},
+    {key:'pg_waiting',bad:m.pgWaiting>=ALERT_PG_WAITING,severity:'critical',title:'PostgreSQL 連線池壅塞',message:`Waiting Connections（等待中的資料庫連線） ${m.pgWaiting}，警戒值 ${ALERT_PG_WAITING}`,impact:'API 正在等待可用資料庫連線，延遲可能快速上升。',advice:'檢查 Connection Pool（資料庫連線池）、慢查詢與 PostgreSQL 負載。',value:m.pgWaiting,threshold:ALERT_PG_WAITING,unit:'connections'},
+    {key:'capacity_high',bad:capPct>=ALERT_CAPACITY_PERCENT,severity:capPct>=90?'critical':'capacity',title:'接近安全容量上限',message:`Capacity Usage（安全容量使用率） ${capPct.toFixed(1)}%，警戒值 ${ALERT_CAPACITY_PERCENT}%`,impact:`目前約 ${Number(capacity?.onlineNodes||0).toLocaleString()} 個 Dealer Node；最近壓測安全容量約 ${Number(capacity?.safeNodes||0).toLocaleString()}。`,advice:'準備擴充中央服務資源，並在擴充後重新執行 Phase 8A 壓力測試確認新安全容量。',value:capPct,threshold:ALERT_CAPACITY_PERCENT,unit:'%'}
+  ];
+}
+async function getCapacityAlertSnapshot(){
+  let onlineNodes=0,safeNodes=0,sourceRunId='';
+  try{onlineNodes=Number((await pool.query('SELECT COUNT(*)::int AS n FROM dealer_nodes WHERE last_seen_at >= $1',[new Date(Date.now()-60000).toISOString()])).rows[0]?.n||0)}catch{}
+  try{const r=(await pool.query("SELECT run_id,analysis,estimated_nodes FROM load_test_runs WHERE status IN ('completed','completed_with_errors') ORDER BY capacity_score DESC,started_at DESC LIMIT 1")).rows[0];if(r){safeNodes=Number(r.analysis?.recommendedNodes||r.estimated_nodes||0);sourceRunId=String(r.run_id||'')}}catch{}
+  return {onlineNodes,safeNodes,usagePercent:safeNodes>0?onlineNodes/safeNodes*100:0,sourceRunId};
+}
+async function evaluatePerformanceAlerts(m){
+  const capacity=await getCapacityAlertSnapshot(),defs=alertDefinitions(m,capacity),ts=now();
+  for(const d of defs){
+    const st=alertRuntime.get(d.key)||{bad:0,good:0,active:false};
+    if(d.bad){st.bad++;st.good=0}else{st.good++;st.bad=0}
+    if(!st.active&&d.bad&&st.bad>=ALERT_TRIGGER_SAMPLES){
+      st.active=true;
+      await pool.query(`INSERT INTO performance_alert_events(alert_key,severity,status,title,message,impact,advice,value,threshold,unit,opened_at,last_seen_at,occurrence_count,context) VALUES($1,$2,'open',$3,$4,$5,$6,$7,$8,$9,$10,$10,1,$11::jsonb) ON CONFLICT (alert_key) WHERE status='open' DO UPDATE SET severity=excluded.severity,title=excluded.title,message=excluded.message,impact=excluded.impact,advice=excluded.advice,value=excluded.value,threshold=excluded.threshold,unit=excluded.unit,last_seen_at=excluded.last_seen_at,occurrence_count=performance_alert_events.occurrence_count+1,context=excluded.context`,[d.key,d.severity,d.title,d.message,d.impact,d.advice,d.value,d.threshold,d.unit,ts,JSON.stringify({instanceId:m.instanceId,site:m.site,capacity})]);
+      await recordDiagnostic('',`PERF_${d.key.toUpperCase()}`,'performance_alert',d.message,{severity:d.severity==='critical'?'critical':'warn',context:{impact:d.impact,advice:d.advice,value:d.value,threshold:d.threshold,unit:d.unit,capacity}});
+    }else if(st.active&&d.bad){
+      await pool.query(`UPDATE performance_alert_events SET severity=$1,message=$2,impact=$3,advice=$4,value=$5,threshold=$6,unit=$7,last_seen_at=$8,occurrence_count=occurrence_count+1,context=$9::jsonb WHERE alert_key=$10 AND status='open'`,[d.severity,d.message,d.impact,d.advice,d.value,d.threshold,d.unit,ts,JSON.stringify({instanceId:m.instanceId,site:m.site,capacity}),d.key]);
+    }else if(st.active&&!d.bad&&st.good>=ALERT_RECOVERY_SAMPLES){
+      st.active=false;
+      await pool.query(`UPDATE performance_alert_events SET status='recovered',recovered_at=$1,last_seen_at=$1 WHERE alert_key=$2 AND status='open'`,[ts,d.key]);
+      try{await pool.query(`UPDATE diagnostic_events SET resolved=TRUE,resolved_at=$1 WHERE company_id='' AND module='performance_alert' AND error_code=$2 AND resolved=FALSE`,[ts,`PERF_${d.key.toUpperCase()}`])}catch{}
+    }
+    alertRuntime.set(d.key,st);
+  }
+  return capacity;
+}
+async function getPerformanceAlertCenter(){
+  const capacity=await getCapacityAlertSnapshot();
+  let events=[];try{events=(await pool.query(`SELECT * FROM performance_alert_events ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END, last_seen_at DESC LIMIT 100`)).rows}catch{}
+  const open=events.filter(x=>x.status==='open');
+  let level='normal';if(open.some(x=>x.severity==='critical'))level='critical';else if(open.some(x=>x.severity==='capacity'))level='capacity';else if(open.length)level='warning';
+  return {level,openCount:open.length,events,capacity,thresholds:{triggerSamples:ALERT_TRIGGER_SAMPLES,recoverySamples:ALERT_RECOVERY_SAMPLES,cpuPercent:ALERT_CPU_PERCENT,ramPercent:ALERT_RAM_PERCENT,apiP95Ms:ALERT_API_P95_MS,api5xxPercent:ALERT_API_5XX_RATE*100,eventLoopP95Ms:ALERT_EVENT_LOOP_P95_MS,pgWaiting:ALERT_PG_WAITING,capacityPercent:ALERT_CAPACITY_PERCENT}};
+}
 
 
 function b64url(v){return Buffer.from(v).toString('base64url')}
@@ -315,7 +373,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=11;
+const SERVER_SCHEMA_TARGET=12;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -660,6 +718,33 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_system_metric_samples_time ON system_metric_samples(sampled_at DESC);
       UPDATE desktop_update_policy SET latest_version='0.10.1',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v11' WHERE id=1 AND latest_version='0.10.0';
     `
+  },
+  {
+    version:12,
+    name:'phase8d-performance-alert-center',
+    sql:`
+      CREATE TABLE IF NOT EXISTS performance_alert_events(
+        id BIGSERIAL PRIMARY KEY,
+        alert_key TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'warning',
+        status TEXT NOT NULL DEFAULT 'open',
+        title TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        impact TEXT NOT NULL DEFAULT '',
+        advice TEXT NOT NULL DEFAULT '',
+        value DOUBLE PRECISION NOT NULL DEFAULT 0,
+        threshold DOUBLE PRECISION NOT NULL DEFAULT 0,
+        unit TEXT NOT NULL DEFAULT '',
+        opened_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        recovered_at TEXT,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        context JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+      CREATE INDEX IF NOT EXISTS idx_performance_alert_events_status_time ON performance_alert_events(status,last_seen_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_performance_alert_one_open ON performance_alert_events(alert_key) WHERE status='open';
+      UPDATE desktop_update_policy SET latest_version='0.10.5',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v12' WHERE id=1 AND latest_version IN ('0.10.1','0.10.2','0.10.3','0.10.4');
+    `
   }
 ];
 
@@ -856,14 +941,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.52',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.53',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.52',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8c-performance-pagination-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.53',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8d-alert-center-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1399,7 +1484,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.4').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.5').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1481,7 +1566,7 @@ async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIn
             await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
               VALUES($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
-              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.4',seq,512,now()]);
+              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.5',seq,512,now()]);
             rt.successCount++;
           }catch(e){rt.errorCount++;rt.lastError=String(e?.message||e).slice(0,500)}
           finally{const ms=Number(process.hrtime.bigint()-t0)/1e6;latencies.push(ms);if(latencies.length>200000)latencies.splice(0,latencies.length-100000);rt.totalRequests++;}
@@ -1913,7 +1998,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.40',apiVersion:'2.4.52',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.41',apiVersion:'2.4.53',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -1999,7 +2084,8 @@ app.get('/api/super/performance',superAuth,async(req,res,next)=>{
     const current=await collectSystemMetrics(),assessment=assessPerformance(current);
     const since=new Date(Date.now()-6*3600*1000).toISOString();
     let history=[];try{history=(await pool.query('SELECT * FROM system_metric_samples WHERE sampled_at>=$1 ORDER BY sampled_at DESC LIMIT 1440',[since])).rows.reverse()}catch{}
-    res.json({current,assessment,history,config:{sampleMs:METRICS_SAMPLE_MS,retentionHours:METRICS_RETENTION_HOURS},generatedAt:now()});
+    const alertCenter=await getPerformanceAlertCenter();
+    res.json({current,assessment,alertCenter,history,config:{sampleMs:METRICS_SAMPLE_MS,retentionHours:METRICS_RETENTION_HOURS},generatedAt:now()});
   }catch(e){next(e)}
 });
 
@@ -2230,6 +2316,7 @@ async function start(){
       if(CENTRAL_HA_ENABLED&&haRuntime.dbRole!=='primary')return;
       const m=await collectSystemMetrics();
       await pool.query(`INSERT INTO system_metric_samples(instance_id,site,sampled_at,cpu_percent,rss_bytes,heap_used_bytes,heap_total_bytes,system_free_bytes,system_total_bytes,event_loop_p95_ms,event_loop_max_ms,api_rps,api_p95_ms,api_error_rate,pg_total,pg_idle,pg_waiting,pg_query_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,[m.instanceId,m.site,m.sampledAt,m.cpuPercent,m.rssBytes,m.heapUsedBytes,m.heapTotalBytes,m.systemFreeBytes,m.systemTotalBytes,m.eventLoopP95Ms,m.eventLoopMaxMs,m.apiRps,m.apiP95Ms,m.apiErrorRate,m.pgTotal,m.pgIdle,m.pgWaiting,m.pgQueryMs]);
+      await evaluatePerformanceAlerts(m);
       const cutoff=new Date(Date.now()-METRICS_RETENTION_HOURS*3600*1000).toISOString();
       await pool.query('DELETE FROM system_metric_samples WHERE sampled_at<$1',[cutoff]);
     }catch(e){console.warn('performance sample failed:',e?.message||e)}
