@@ -55,7 +55,7 @@ linear-gradient(180deg,rgba(255,255,255,.03),transparent 18%,transparent 78%,rgb
 // Keep all Sales-side notices inside the app so the browser hostname is never shown as the alert title.
 (function(){const nativeAlert=window.alert.bind(window);window.alert=function(message){const bg=document.getElementById('systemPromptBg'),msg=document.getElementById('systemPromptMessage'),ok=document.getElementById('systemPromptOk');if(!bg||!msg||!ok){nativeAlert(message);return}msg.textContent=String(message??'');bg.classList.add('show');ok.onclick=()=>bg.classList.remove('show');setTimeout(()=>ok.focus(),0)}})();
 
-const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},saleQueueTimer=null,saleQueueBusy=false,photoQueueTimer=null,photoQueueBusy=false;
+const LAN_MODE=location.protocol==='http:'&&location.port==='18765';const API='/api';const SESSION='carDealerSalesWebSession_v9_2_6';const SESSION_TEMP=SESSION+'_temp';let token='',me=null,company=null,data={cars:[],saleRequests:[]},version=0,currentPage='cars',timer=null,nodeTimer=null,nodeIsOnline=false,lastNodeOnline=null,nodeInventoryBusy=false,salesPhotoCache={},salesPhotoLoading={},saleQueueTimer=null,saleQueueBusy=false,photoQueueTimer=null,photoQueueBusy=false,liveEventSource=null,liveRestartTimer=null,liveInventoryTimer=null;
 const $=id=>document.getElementById(id);const money=n=>'NT$ '+Number(n||0).toLocaleString('zh-TW');const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const rate=v=>{let n=Number(v||0);return Number.isInteger(n)?String(n):n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')};
 async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})};let r=await fetch(API+path,opt);let j={};try{j=await r.json()}catch{};if((r.status===401||r.status===403)&&token){logout(j.error||'登入或授權已失效');throw new Error(j.error||'授權失效')}if(!r.ok)throw new Error(j.error||'操作失敗');return j}
 function togglePassword(){const p=$('password');if(!p)return;p.type=p.type==='password'?'text':'password'}
@@ -178,7 +178,20 @@ async function refreshNodeStateAndInventory(showLoginAlert=false){
  const online=await refreshNodeStatus(showLoginAlert);
  if(online)await refreshNodeInventory();
 }
-function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;setDealerNodeBadge('checking',LAN_MODE?'● 本機資料伺服器檢查中':'● 公司資料主機檢查中');showPage(currentPage||'cars');clearInterval(timer);clearInterval(nodeTimer);timer=setInterval(sync,5000);nodeTimer=setInterval(()=>LAN_MODE?refreshNodeInventory():refreshNodeStatus(false),2000);if(!LAN_MODE){scheduleSaleQueue(300);setInterval(()=>processSaleQueue(false),5000)}schedulePhotoQueue(350);setInterval(()=>processPhotoQueue(false),5000)}
+function stopLiveInventoryPush(){clearTimeout(liveRestartTimer);clearTimeout(liveInventoryTimer);if(liveEventSource){try{liveEventSource.close()}catch{}liveEventSource=null}}
+function scheduleLiveInventoryRefresh(){clearTimeout(liveInventoryTimer);liveInventoryTimer=setTimeout(async()=>{if(!token||LAN_MODE)return;try{await refreshNodeStatus(false);if(nodeIsOnline)await refreshNodeInventory();await sync()}catch{}},120)}
+async function startLiveInventoryPush(){
+ if(LAN_MODE||!token||typeof EventSource==='undefined')return;
+ stopLiveInventoryPush();
+ try{
+   const j=await api('/sales/live-ticket',{method:'POST',body:'{}'});
+   if(!j?.ticket)return;
+   const es=new EventSource(API+'/sales/live?ticket='+encodeURIComponent(j.ticket));liveEventSource=es;
+   es.addEventListener('inventory',()=>scheduleLiveInventoryRefresh());
+   es.onerror=()=>{if(liveEventSource!==es)return;try{es.close()}catch{}liveEventSource=null;clearTimeout(liveRestartTimer);liveRestartTimer=setTimeout(startLiveInventoryPush,2200)};
+ }catch{clearTimeout(liveRestartTimer);liveRestartTimer=setTimeout(startLiveInventoryPush,4000)}
+}
+function enter(){$('loginPage').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.name+'｜業務獎金 '+rate(me.commissionRate)+'%';$('shop').textContent=company.name+'｜'+company.id;setDealerNodeBadge('checking',LAN_MODE?'● 本機資料伺服器檢查中':'● 公司資料主機檢查中');showPage(currentPage||'cars');clearInterval(timer);clearInterval(nodeTimer);timer=setInterval(sync,5000);nodeTimer=setInterval(()=>LAN_MODE?refreshNodeInventory():refreshNodeStatus(false),2000);if(!LAN_MODE){scheduleSaleQueue(300);setInterval(()=>processSaleQueue(false),5000)}schedulePhotoQueue(350);setInterval(()=>processPhotoQueue(false),5000);startLiveInventoryPush()}
 function openAccountSettings(){
  $('modal').innerHTML=`<h2>⚙ 帳號設定</h2><div class="notice">${esc(me?.name||'')}｜${esc(me?.username||'')}<br>你可以在這裡修改自己的登入密碼。</div><div class="field"><label>目前密碼</label><input id="currentPw" type="password" autocomplete="current-password" placeholder="輸入目前密碼"></div><div class="field"><label>新密碼</label><input id="newPw" type="password" autocomplete="new-password" placeholder="至少 6 碼"></div><div class="field"><label>再次輸入新密碼</label><input id="newPw2" type="password" autocomplete="new-password" placeholder="再次輸入新密碼"></div><div class="row"><button id="changePwBtn" class="btn primary" style="flex:1" onclick="changeMyPassword()">確認修改密碼</button><button class="btn ghost" onclick="closeModal()">取消</button></div>`;
  $('modalBg').classList.add('show');setTimeout(()=>$('currentPw')?.focus(),50)

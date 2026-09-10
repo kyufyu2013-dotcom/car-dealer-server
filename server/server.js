@@ -178,6 +178,24 @@ function signSuper(){
   return jwt.sign({sub:'platform-admin',role:'platformAdmin'},JWT_SECRET,{expiresIn:'12h'});
 }
 
+// Phase 3C: lightweight realtime push hub for Sales inventory changes.
+// Streams carry only change notifications; actual inventory still comes through Sales-safe Node APIs.
+const salesLiveClients=new Map();
+function addSalesLiveClient(companyId,res){
+  const key=String(companyId);
+  if(!salesLiveClients.has(key))salesLiveClients.set(key,new Set());
+  salesLiveClients.get(key).add(res);
+}
+function removeSalesLiveClient(companyId,res){
+  const key=String(companyId),set=salesLiveClients.get(key);
+  if(!set)return;set.delete(res);if(!set.size)salesLiveClients.delete(key);
+}
+function notifySalesInventoryChanged(companyId,version,reason='inventoryChanged'){
+  const set=salesLiveClients.get(String(companyId));if(!set||!set.size)return;
+  const payload=JSON.stringify({companyId:String(companyId),version:Number(version||0),reason,at:now()});
+  for(const res of [...set]){try{res.write(`event: inventory\ndata: ${payload}\n\n`)}catch{removeSalesLiveClient(companyId,res)}}
+}
+
 async function initDb(){
   await pool.query(`
     CREATE TABLE IF NOT EXISTS companies(
@@ -327,7 +345,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.29',architecture:'local-first-phase3b'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.30',architecture:'local-first-phase3c-push'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -431,6 +449,39 @@ app.get('/api/node/status',auth,requireActiveCompany,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+// Short-lived ticket avoids putting the normal bearer token in an EventSource URL.
+app.post('/api/sales/live-ticket',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用即時更新'});
+    const ticket=jwt.sign({sub:req.auth.sub,companyId:req.auth.companyId,role:'sales',tokenVersion:Number(req.auth.tokenVersion||0),purpose:'sales-live'},JWT_SECRET,{expiresIn:'2m'});
+    res.json({ok:true,ticket,expiresInSeconds:120});
+  }catch(e){next(e)}
+});
+
+app.get('/api/sales/live',async(req,res)=>{
+  const ticket=String(req.query.ticket||'');
+  try{
+    const a=jwt.verify(ticket,JWT_SECRET);
+    if(a?.purpose!=='sales-live'||a?.role!=='sales')return res.status(401).end();
+    const ur=await pool.query('SELECT enabled,token_version FROM users WHERE id=$1 AND company_id=$2',[a.sub,a.companyId]);
+    const u=ur.rows[0];
+    if(!u||!u.enabled||Number(u.token_version||0)!==Number(a.tokenVersion||0))return res.status(401).end();
+    const c=await getCompany(a.companyId);
+    if(!c||companyStatus(c)!=='啟用中')return res.status(403).end();
+    res.setHeader('Content-Type','text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control','no-cache, no-transform');
+    res.setHeader('Connection','keep-alive');
+    res.setHeader('X-Accel-Buffering','no');
+    res.flushHeaders?.();
+    addSalesLiveClient(a.companyId,res);
+    res.write(`event: ready\ndata: ${JSON.stringify({ok:true,at:now()})}\n\n`);
+    const keep=setInterval(()=>{try{res.write(`: keepalive ${Date.now()}\n\n`)}catch{}},25000);
+    req.on('close',()=>{clearInterval(keep);removeSalesLiveClient(a.companyId,res)});
+  }catch(e){
+    if(!res.headersSent)res.status(401).end();else res.end();
+  }
+});
+
 app.get('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     const u=await getUserById(req.auth.companyId,req.auth.sub);
@@ -524,6 +575,7 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       ON CONFLICT(company_id) DO UPDATE SET version=EXCLUDED.version,json=EXCLUDED.json,updated_at=EXCLUDED.updated_at
     `,[req.auth.companyId,ver,JSON.stringify(cloudOperationalSnapshot(clean)),now()]);
     await client.query('COMMIT');
+    notifySalesInventoryChanged(req.auth.companyId,ver,'snapshot');
     res.json({ok:true,version:ver});
   }catch(e){
     try{ await client.query('ROLLBACK'); }catch{}
@@ -619,6 +671,7 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     const ver=existing.version+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
+    notifySalesInventoryChanged(req.auth.companyId,ver,'saleRequest');
     res.json({ok:true,ackOperationId:operationId||null,version:ver,snapshot:salesSafeSnapshot(d,u)});
   }catch(e){
     try{ await client.query('ROLLBACK'); }catch{}
@@ -651,7 +704,7 @@ app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,re
     d.saleRequests.push(r);
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d,request:r});
+    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleConfirmed');res.json({ok:true,version:ver,snapshot:d,request:r});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
@@ -686,7 +739,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
     }
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
+    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
@@ -733,6 +786,7 @@ app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=
     if(integrity){await client.query('ROLLBACK');return res.status(409).json({error:integrity});}
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
+    notifySalesInventoryChanged(req.auth.companyId,ver,'saleCanceled');
     res.json({ok:true,version:ver,snapshot:d,canceledRequestId:r.id});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
@@ -754,7 +808,7 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
     d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'駁回成交申請',carId:r.carId,plate:r.plate||'',requestId:r.id,reason:r.rejectReason,operatedAt:r.rejectedAt,operatedBy:req.auth.username||req.auth.sub});
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');res.json({ok:true,version:ver,snapshot:d});
+    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
