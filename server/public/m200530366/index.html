@@ -108,9 +108,9 @@ function companyDataRow(id){return cloudRows.find(x=>x.company?.id===id)||null}
 function allCars(){const arr=[];for(const x of cloudRows){const cars=Array.isArray(x.snapshot?.cars)?x.snapshot.cars:[];for(const car of cars)arr.push({...car,_companyId:x.company.id,_companyName:x.company.name})}return arr}
 function allUsers(){const arr=[];for(const x of cloudRows){const users=Array.isArray(x.users)&&x.users.length?x.users:(Array.isArray(x.snapshot?.users)?x.snapshot.users:[]);for(const u of users)arr.push({...u,_companyId:x.company.id,_companyName:x.company.name})}return arr}
 function soldCars(){return allCars().filter(c=>c.status==="已售"||Number(c.sellPrice)>0)}
-function nodeIsOnline(x){const t=Date.parse(x?.node?.last_seen_at||"");return Number.isFinite(t)&&(Date.now()-t)<45000}
+function nodeIsOnline(x){if(x?.node?.capabilities?.online===false)return false;const t=Date.parse(x?.node?.last_seen_at||"");return Number.isFinite(t)&&(Date.now()-t)<45000}
 function nodeStatusHtml(x){if(!x?.node)return `<span class="badge warn">尚未建立節點</span>`;return nodeIsOnline(x)?`<span class="badge ok node-live">● Node 在線</span>`:`<span class="badge bad">● Node 離線</span>`}
-function fmtDateTime(v){if(!v)return "-";try{return new Date(v).toLocaleString("zh-TW",{hour12:false})}catch{return String(v)}}
+function fmtDateTime(v){if(!v)return "-";try{const d=new Date(v);if(!Number.isFinite(d.getTime())||d.getTime()<946684800000)return "-";return d.toLocaleString("zh-TW",{hour12:false})}catch{return "-"}}
 async function requestNodeData(companyId,resource,payload={}){
  const start=await api(`/super/nodes/${encodeURIComponent(companyId)}/request`,{method:"POST",body:JSON.stringify({resource,payload})});
  const id=start.requestId,deadline=Date.now()+18000;

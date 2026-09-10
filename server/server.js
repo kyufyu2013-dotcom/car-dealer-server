@@ -314,7 +314,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.18',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.19',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -785,7 +785,7 @@ app.post('/api/node/offline',auth,requireActiveCompany,async(req,res,next)=>{
     if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可變更節點狀態'});
     const nodeId=String(req.body?.nodeId||'').trim();
     if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
-    const offlineAt=new Date(0).toISOString();
+    const offlineAt=now();
     const r=await pool.query(`UPDATE dealer_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{\"online\":false}'::jsonb WHERE company_id=$2 AND node_id=$3 RETURNING company_id,node_id`,[offlineAt,req.auth.companyId,nodeId]);
     await pool.query(`UPDATE dealer_node_requests SET status='failed',error_text='Dealer Node 已登出或離線',completed_at=$1 WHERE company_id=$2 AND node_id=$3 AND status IN ('queued','claimed')`,[now(),req.auth.companyId,nodeId]);
     res.json({ok:true,offline:true,nodeId,updated:r.rowCount>0});
@@ -800,6 +800,7 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
 const NODE_RESOURCES=new Set(['companyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle','salesInventory','backupStatus','createBackup']);
 function nodeOnline(row,maxAgeMs=45000){
+  if(row?.capabilities?.online===false)return false;
   const t=Date.parse(row?.last_seen_at||'');
   return Number.isFinite(t)&&(Date.now()-t)<=maxAgeMs;
 }
