@@ -196,6 +196,12 @@ function notifySalesInventoryChanged(companyId,version,reason='inventoryChanged'
   for(const res of [...set]){try{res.write(`event: inventory\ndata: ${payload}\n\n`)}catch{removeSalesLiveClient(companyId,res)}}
 }
 
+async function recordSyncEvent(companyId,eventType,message='',opts={}){
+  try{
+    await pool.query(`INSERT INTO sync_events(company_id,event_type,status,message,actor,operation_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`,[String(companyId),String(eventType),String(opts.status||'ok'),String(message||''),String(opts.actor||''),opts.operationId?String(opts.operationId):null,now()]);
+  }catch(e){console.warn('sync event log failed:',e?.message||e)}
+}
+
 async function initDb(){
   await pool.query(`
     CREATE TABLE IF NOT EXISTS companies(
@@ -256,6 +262,17 @@ async function initDb(){
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sync_events(
+      id BIGSERIAL PRIMARY KEY,
+      company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ok',
+      message TEXT NOT NULL DEFAULT '',
+      actor TEXT NOT NULL DEFAULT '',
+      operation_id TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS dealer_node_requests(
       id TEXT PRIMARY KEY,
       company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -271,6 +288,8 @@ async function initDb(){
       error_text TEXT
     );
 
+    CREATE INDEX IF NOT EXISTS idx_sync_events_company_time ON sync_events(company_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_sync_events_status ON sync_events(status,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON dealer_nodes(last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_node_requests_lookup ON dealer_node_requests(company_id,node_id,status,requested_at);
     CREATE INDEX IF NOT EXISTS idx_node_requests_expire ON dealer_node_requests(expires_at);
@@ -345,7 +364,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.30',architecture:'local-first-phase3c-push'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.31',architecture:'local-first-phase3c-push'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -671,6 +690,7 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     const ver=existing.version+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
+    recordSyncEvent(req.auth.companyId,'sale_request',`成交申請已送達：${c.plate||c.model||c.id}`,{actor:u.username||u.name,operationId:operationId||null});
     notifySalesInventoryChanged(req.auth.companyId,ver,'saleRequest');
     res.json({ok:true,ackOperationId:operationId||null,version:ver,snapshot:salesSafeSnapshot(d,u)});
   }catch(e){
@@ -704,7 +724,7 @@ app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,re
     d.saleRequests.push(r);
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleConfirmed');res.json({ok:true,version:ver,snapshot:d,request:r});
+    await client.query('COMMIT');recordSyncEvent(req.auth.companyId,'sale_request','後台建立成交申請',{actor:req.auth.username||req.auth.sub});notifySalesInventoryChanged(req.auth.companyId,ver,'saleConfirmed');res.json({ok:true,version:ver,snapshot:d,request:r});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
@@ -739,7 +759,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
     }
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
+    await client.query('COMMIT');recordSyncEvent(req.auth.companyId,'sale_confirm',`確認成交：${c.plate||c.model||c.id}`,{actor:req.auth.username||req.auth.sub,operationId:r.operationId||null});notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
@@ -786,6 +806,7 @@ app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=
     if(integrity){await client.query('ROLLBACK');return res.status(409).json({error:integrity});}
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
+    recordSyncEvent(req.auth.companyId,'sale_cancel',`取消成交：${c.plate||c.model||c.id}`,{actor:req.auth.username||req.auth.sub,operationId:r.operationId||null});
     notifySalesInventoryChanged(req.auth.companyId,ver,'saleCanceled');
     res.json({ok:true,version:ver,snapshot:d,canceledRequestId:r.id});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
@@ -808,7 +829,7 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
     d.operationLogs.push({id:`log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,action:'駁回成交申請',carId:r.carId,plate:r.plate||'',requestId:r.id,reason:r.rejectReason,operatedAt:r.rejectedAt,operatedBy:req.auth.username||req.auth.sub});
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
-    await client.query('COMMIT');notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
+    await client.query('COMMIT');recordSyncEvent(req.auth.companyId,'sale_reject',`駁回成交申請：${r.plate||r.carId}`,{actor:req.auth.username||req.auth.sub,operationId:r.operationId||null});notifySalesInventoryChanged(req.auth.companyId,ver,'saleStatusChanged');res.json({ok:true,version:ver,snapshot:d});
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
@@ -870,6 +891,7 @@ app.post('/api/node/offline',auth,requireActiveCompany,async(req,res,next)=>{
     const offlineAt=now();
     const r=await pool.query(`UPDATE dealer_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{\"online\":false}'::jsonb WHERE company_id=$2 AND node_id=$3 RETURNING company_id,node_id`,[offlineAt,req.auth.companyId,nodeId]);
     await pool.query(`UPDATE dealer_node_requests SET status='failed',error_text='Dealer Node 已登出或離線',completed_at=$1 WHERE company_id=$2 AND node_id=$3 AND status IN ('queued','claimed')`,[now(),req.auth.companyId,nodeId]);
+    recordSyncEvent(req.auth.companyId,'node_offline','車行主機已離線',{actor:req.auth.username||req.auth.sub,status:'warn'});
     res.json({ok:true,offline:true,nodeId,updated:r.rowCount>0});
   }catch(e){next(e)}
 });
@@ -1115,6 +1137,34 @@ app.post('/api/node/commands/:id/result',auth,requireActiveCompany,async(req,res
 
 app.get('/api/super/companies/:id/offline-test',superAuth,async(req,res,next)=>{try{const r=(await pool.query('SELECT * FROM offline_license_tests WHERE company_id=$1',[req.params.id])).rows[0];res.json({enabled:!!r?.enabled,durationSeconds:Number(r?.duration_seconds||60),simulateOutage:!!r?.simulate_outage,updatedAt:r?.updated_at||null});}catch(e){next(e)}});
 app.put('/api/super/companies/:id/offline-test',superAuth,async(req,res,next)=>{try{const b=req.body||{};const sec=Math.max(5,Math.min(259200,Number(b.durationSeconds||60)));await pool.query(`INSERT INTO offline_license_tests(company_id,enabled,duration_seconds,simulate_outage,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id) DO UPDATE SET enabled=excluded.enabled,duration_seconds=excluded.duration_seconds,simulate_outage=excluded.simulate_outage,updated_at=excluded.updated_at`,[req.params.id,!!b.enabled,sec,!!b.simulateOutage,now()]);res.json({ok:true,enabled:!!b.enabled,durationSeconds:sec,simulateOutage:!!b.simulateOutage});}catch(e){next(e)}});
+
+app.get('/api/super/companies/:id/sync-events',superAuth,async(req,res,next)=>{
+  try{
+    const limit=Math.max(1,Math.min(200,Number(req.query.limit||100)));
+    const {rows}=await pool.query('SELECT id,event_type,status,message,actor,operation_id,created_at FROM sync_events WHERE company_id=$1 ORDER BY id DESC LIMIT $2',[req.params.id,limit]);
+    res.json({events:rows});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/health',superAuth,async(req,res,next)=>{
+  try{
+    const companies=(await pool.query('SELECT * FROM companies ORDER BY created_at DESC')).rows;
+    const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
+    const snaps=(await pool.query('SELECT company_id,updated_at FROM snapshots')).rows;
+    const failed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM sync_events WHERE status<>'ok' AND created_at>$1 GROUP BY company_id",[new Date(Date.now()-24*3600*1000).toISOString()])).rows;
+    const nb=new Map(nodes.map(x=>[x.company_id,x])),sb=new Map(snaps.map(x=>[x.company_id,x])),fb=new Map(failed.map(x=>[x.company_id,Number(x.n||0)]));
+    const rows=companies.map(c=>{
+      const n=nb.get(c.id),st=sb.get(c.id);let score=0;const issues=[];
+      if(nodeOnline(n)){score+=40}else issues.push('Dealer Node 離線');
+      if(c.enabled){score+=20}else issues.push('車行已停用');
+      const authAge=Date.now()-Date.parse(c.last_auth_at||'');if(Number.isFinite(authAge)&&authAge<7*86400000)score+=20;else issues.push('最近 7 天無授權登入');
+      const snapAge=Date.now()-Date.parse(st?.updated_at||'');if(Number.isFinite(snapAge)&&snapAge<2*86400000)score+=20;else if(Number.isFinite(snapAge)&&snapAge<7*86400000){score+=10;issues.push('資料同步超過 2 天')}else issues.push('資料同步超過 7 天');
+      const failures=fb.get(c.id)||0;if(failures){score=Math.max(0,score-Math.min(20,failures*5));issues.push(`24 小時異常 ${failures} 筆`)}
+      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures};
+    });
+    res.json({health:rows,generatedAt:now()});
+  }catch(e){next(e)}
+});
 
 app.get('/api/super/data',superAuth,async(req,res,next)=>{
   try{

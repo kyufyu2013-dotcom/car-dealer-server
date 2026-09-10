@@ -62,6 +62,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
         <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
         <button id="navSales" onclick="showPage('sales')">💰 全部成交</button>
         <button id="navUsers" onclick="showPage('users')">👥 全部帳號</button>
+        <button id="navHealth" onclick="showPage('health')">🩺 系統健康</button>
       </div>
     </aside>
     <main class="content">
@@ -80,7 +81,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
 const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
 const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
 const AUTO_REFRESH_MS=3000;
-let superToken="",currentPage="overview",cloudRows=[],refreshing=false,lastCloudAt=0;
+let superToken="",currentPage="overview",cloudRows=[],healthRows=[],refreshing=false,lastCloudAt=0;
 const nodeCompanyCache=new Map(),nodeVehicleCache=new Map();
 
 function today(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
@@ -160,18 +161,18 @@ loginPass.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 
 function showPage(p){
   currentPage=p;saveSession();
-  ["overview","vehicles","sales","users"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
-  const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號"};pageTitle.textContent=titles[p]||"Super Admin";
+  ["overview","vehicles","sales","users","health"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
+  const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號",health:"系統健康"};pageTitle.textContent=titles[p]||"Super Admin";
   renderCurrent();
 }
-function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers()}
+function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers();else if(currentPage==="health")renderHealth()}
 function userIsEditing(){const a=document.activeElement;return !!(a&&(a.tagName==="INPUT"||a.tagName==="SELECT"||a.tagName==="TEXTAREA"||a.isContentEditable))}
 function modalIsOpen(){return modalBg.classList.contains("show")}
 async function refreshCloud(manual=false){
   if(!superToken||refreshing)return;
   refreshing=true;
   try{
-    const r=await api("/super/data");cloudRows=Array.isArray(r.companies)?r.companies:[];lastCloudAt=Date.now();setCloudState("雲端已同步","ok");saveSession();
+    const [r,h]=await Promise.all([api("/super/data"),api("/super/health")]);cloudRows=Array.isArray(r.companies)?r.companies:[];healthRows=Array.isArray(h.health)?h.health:[];lastCloudAt=Date.now();setCloudState("雲端已同步","ok");saveSession();
     if(manual||(!modalIsOpen()&&!userIsEditing()))renderCurrent();
   }catch(e){setCloudState("連線異常","bad");if(manual)alert(e.message);throw e}
   finally{refreshing=false}
@@ -181,6 +182,23 @@ async function refreshCloud(manual=false){
 function remainText(c){if(c.trialRemainingSeconds===null||c.trialRemainingSeconds===undefined)return "不限期";let x=Math.max(0,Number(c.trialRemainingSeconds));const d=Math.floor(x/86400);x%=86400;const h=Math.floor(x/3600);x%=3600;const m=Math.floor(x/60);return `${d}天 ${h}時 ${m}分`;}
 async function openOfflineTest(id){const x=companyDataRow(id);if(!x)return;let t={enabled:false,durationSeconds:60,simulateOutage:false};try{t=await api("/super/companies/"+encodeURIComponent(id)+"/offline-test")}catch(e){}const sec=Number(t.durationSeconds||60),hh=String(Math.floor(sec/3600)).padStart(2,"0"),mm=String(Math.floor(sec%3600/60)).padStart(2,"0"),ss=String(sec%60).padStart(2,"0");modal.innerHTML=`<h2>🧪 容錯授權測試｜${esc(x.company.name)}</h2><div class="notice">正式授權容錯固定 72 小時。這裡只影響指定車行的測試憑證，可用時／分／秒快速測試，不會修改其他車行。</div><div class="grid"><label>時<input id="oth" type="number" min="0" value="${hh}"></label><label>分<input id="otm" type="number" min="0" max="59" value="${mm}"></label><label>秒<input id="ots" type="number" min="0" max="59" value="${ss}"></label></div><label style="display:flex;gap:8px;align-items:center;margin-top:16px"><input id="oten" type="checkbox" style="width:auto" ${t.enabled?"checked":""}> 啟用此車行測試模式</label><label style="display:flex;gap:8px;align-items:center;margin-top:12px"><input id="otout" type="checkbox" style="width:auto" ${t.simulateOutage?"checked":""}> 模擬授權服務無回應</label><div class="notice">測試方式：先啟用測試模式但不要勾「模擬無回應」，讓車行成功登入一次取得測試憑證；再勾模擬無回應，即可測試備用登入與到期。</div><div class="actions"><button class="btn2" onclick="closeModal()">取消</button><button class="btn" onclick="saveOfflineTest('${esc(id)}')">儲存測試設定</button></div>`;modalBg.classList.add("show");}
 async function saveOfflineTest(id){const sec=Math.max(5,Number(oth.value||0)*3600+Number(otm.value||0)*60+Number(ots.value||0));try{await api("/super/companies/"+encodeURIComponent(id)+"/offline-test",{method:"PUT",body:JSON.stringify({enabled:oten.checked,durationSeconds:sec,simulateOutage:otout.checked})});closeModal();alert("容錯測試設定已更新。") }catch(e){alert(e.message)}}
+
+function healthFor(id){return healthRows.find(x=>String(x.companyId)===String(id))||null}
+function healthBadge(h){if(!h)return `<span class="badge warn">尚無資料</span>`;const cls=h.score>=85?'ok':h.score>=60?'warn':'bad';return `<span class="badge ${cls}">${Number(h.score||0)} / 100</span>`}
+async function openSyncEvents(id){
+ const x=companyDataRow(id);if(!x)return;
+ try{
+  const r=await api(`/super/companies/${encodeURIComponent(id)}/sync-events?limit=100`),ev=Array.isArray(r.events)?r.events:[];
+  modal.innerHTML=`<div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><h2 style="margin:0">${esc(x.company.name)}｜同步紀錄</h2><div class="muted">最近 100 筆系統同步事件</div></div><button class="btn2" onclick="closeModal()">關閉</button></div><div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>時間</th><th>類型</th><th>狀態</th><th>事件</th><th>操作者</th><th>Operation ID</th></tr></thead><tbody>${ev.map(e=>`<tr><td>${fmtDateTime(e.created_at)}</td><td>${esc(e.event_type||'')}</td><td><span class="badge ${e.status==='ok'?'ok':e.status==='warn'?'warn':'bad'}">${esc(e.status||'')}</span></td><td>${esc(e.message||'')}</td><td>${esc(e.actor||'-')}</td><td><code>${esc(e.operation_id||'-')}</code></td></tr>`).join('')||`<tr><td colspan="6">目前沒有同步紀錄</td></tr>`}</tbody></table></div>`;
+  modalBg.classList.add('show');
+ }catch(e){alert(e.message||'讀取同步紀錄失敗')}
+}
+function renderHealth(){
+ const rows=[...healthRows].sort((a,b)=>Number(a.score||0)-Number(b.score||0));
+ const avg=rows.length?Math.round(rows.reduce((s,x)=>s+Number(x.score||0),0)/rows.length):0;
+ const bad=rows.filter(x=>Number(x.score||0)<60).length,warn=rows.filter(x=>Number(x.score||0)>=60&&Number(x.score||0)<85).length;
+ main.innerHTML=`<div class="cards"><div class="card"><div class="muted">平均健康度</div><div class="num">${avg} / 100</div></div><div class="card"><div class="muted">需要處理</div><div class="num">${bad}</div></div><div class="card"><div class="muted">注意</div><div class="num">${warn}</div></div></div><div class="panel"><div class="panel-head"><div><h2 style="margin:0">🩺 車行系統健康度</h2><div class="muted">依 Node 連線、授權登入、資料同步與近 24 小時異常自動評分</div></div><button class="btn2" onclick="refreshCloud(true)">重新檢查</button></div><div class="table-wrap"><table><thead><tr><th>車行</th><th>健康度</th><th>Node</th><th>版本</th><th>最後連線</th><th>最後授權</th><th>最後資料同步</th><th>24h異常</th><th>問題</th><th>操作</th></tr></thead><tbody>${rows.map(h=>`<tr><td><b>${esc(h.companyName)}</b><div class="muted"><code>${esc(h.companyId)}</code></div></td><td>${healthBadge(h)}</td><td>${h.nodeOnline?'<span class="badge ok">在線</span>':'<span class="badge bad">離線</span>'}</td><td>${esc(h.appVersion||'-')}</td><td>${fmtDateTime(h.lastSeenAt)}</td><td>${fmtDateTime(h.lastAuthAt)}</td><td>${fmtDateTime(h.snapshotUpdatedAt)}</td><td>${Number(h.failures24h||0)}</td><td>${(h.issues||[]).map(v=>esc(v)).join('<br>')||'<span class="badge ok">正常</span>'}</td><td><button class="btn2" onclick="openSyncEvents('${esc(h.companyId)}')">同步紀錄</button></td></tr>`).join('')||`<tr><td colspan="10">尚無健康資料</td></tr>`}</tbody></table></div></div>`;
+}
 
 function renderOverview(){
   const cars=allCars(),sold=soldCars(),stock=cars.filter(c=>c.status!=="已售");
@@ -197,11 +215,11 @@ function renderOverview(){
   <div class="notice">🛰️ Dealer Node Phase 3｜Local-first：完整成本、來源、照片、利潤與詳細歷史以車行本機 SQLite 為主。中央 PostgreSQL 只保留帳號／授權與手機業務所需的營運影子資料；最高權限完整資料必須由在線 Node 按需讀取。</div>
   <div class="panel">
     <div class="panel-head"><div><h2 style="margin:0">🏢 車行授權與資料</h2><div class="muted">自助註冊與 Super Admin 手動建立的車行都會顯示在這裡</div></div><button class="btn" onclick="openCompany()">＋新增車行</button></div>
-    <div class="table-wrap"><table><thead><tr><th>車行</th><th>車行代碼</th><th>建立方式</th><th>主帳號</th><th>授權</th><th>啟用日</th><th>到期日</th><th>Dealer Node</th><th>庫存</th><th>已售</th><th>庫存成本</th><th>操作</th></tr></thead><tbody>
+    <div class="table-wrap"><table><thead><tr><th>車行</th><th>車行代碼</th><th>建立方式</th><th>主帳號</th><th>授權</th><th>啟用日</th><th>到期日</th><th>Dealer Node</th><th>健康度</th><th>庫存</th><th>已售</th><th>庫存成本</th><th>操作</th></tr></thead><tbody>
     ${cloudRows.map(x=>{const c=x.company,d=x.snapshot||{},cars=Array.isArray(d.cars)?d.cars:[],stock=cars.filter(v=>v.status!=="已售"),sold=cars.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),sc=stock.reduce((s,v)=>s+Number(v.totalCost||v.purchasePrice||0),0);return `<tr>
       <td><b>${esc(c.name)}</b>${c.trial?` <span class="badge info">試用</span>`:""}</td><td><code>${esc(c.id)}</code></td><td>${c.createdBy==="self"?"自助註冊":"管理員建立"}</td><td>${esc(c.mainUsername||((x.users||[]).find(u=>u.role==="admin")?.username)||"-")}</td><td><span class="badge ${badgeFor(c.status)}">${esc(c.status)}</span></td>
-      <td>${esc(c.startDate||"立即")}</td><td>${esc(c.expiresAt||"不限期")}<div class="muted">剩餘：${remainText(c)}</div><div class="muted">最後授權：${fmtDateTime(c.lastOnlineAt)}</div></td><td>${nodeStatusHtml(x)}<div class="muted">${x.node?`最後連線 ${fmtDateTime(x.node.last_seen_at)}｜v${esc(x.node.app_version||"-")}`:""}</div></td><td>${stock.length}</td><td>${sold.length}</td><td>${money(sc)}</td>
-      <td><button class="btn" onclick="openCompanyData('${esc(c.id)}')">即時讀取資料</button> <button class="btn2" onclick="openBackupManager('${esc(c.id)}')">💾 備份</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權設定</button> <button class="btn2" onclick="openOfflineTest('${esc(c.id)}')">🧪 容錯測試</button> <button class="btn2" onclick="toggleCompany('${esc(c.id)}')">${c.enabled?"停用":"啟用"}</button></td></tr>`}).join("")||`<tr><td colspan="12">目前 PostgreSQL 尚無車行</td></tr>`}
+      <td>${esc(c.startDate||"立即")}</td><td>${esc(c.expiresAt||"不限期")}<div class="muted">剩餘：${remainText(c)}</div><div class="muted">最後授權：${fmtDateTime(c.lastOnlineAt)}</div></td><td>${nodeStatusHtml(x)}<div class="muted">${x.node?`最後連線 ${fmtDateTime(x.node.last_seen_at)}｜v${esc(x.node.app_version||"-")}`:""}</div></td><td>${healthBadge(healthFor(c.id))}</td><td>${stock.length}</td><td>${sold.length}</td><td>${money(sc)}</td>
+      <td><button class="btn" onclick="openCompanyData('${esc(c.id)}')">即時讀取資料</button> <button class="btn2" onclick="openBackupManager('${esc(c.id)}')">💾 備份</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權設定</button> <button class="btn2" onclick="openSyncEvents('${esc(c.id)}')">📋 同步紀錄</button> <button class="btn2" onclick="openOfflineTest('${esc(c.id)}')">🧪 容錯測試</button> <button class="btn2" onclick="toggleCompany('${esc(c.id)}')">${c.enabled?"停用":"啟用"}</button></td></tr>`}).join("")||`<tr><td colspan="13">目前 PostgreSQL 尚無車行</td></tr>`}
     </tbody></table></div>
   </div>`;
 }
