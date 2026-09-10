@@ -512,7 +512,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.39',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase5a-diagnostics'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.40',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase5b-agent-self-recovery'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1352,7 +1352,7 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
       const localSchemaStatus=String(caps.localSchemaStatus||'unknown');
       const migrationSafetyStatus=String(caps.migrationSafetyStatus||'none');
       if(n&&localSchemaTarget>0&&(localSchemaStatus!=='ready'||localSchemaVersion<localSchemaTarget)){score=Math.max(0,score-15);issues.push(`SQLite Schema ${localSchemaStatus} v${localSchemaVersion}/${localSchemaTarget}`)}
-      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0)};
+      return {companyId:c.id,companyName:c.name,score,issues,nodeOnline:nodeOnline(n),lastSeenAt:n?.last_seen_at||null,appVersion:n?.app_version||'',lastAuthAt:c.last_auth_at||null,snapshotUpdatedAt:st?.updated_at||null,failures24h:failures,postgresSchemaVersion:schema.currentVersion,postgresSchemaTarget:schema.targetVersion,postgresSchemaStatus:schema.status,localSchemaVersion,localSchemaTarget,localSchemaStatus,migrationSafetyStatus,migrationSafetyFromVersion:Number(caps.migrationSafetyFromVersion||0),migrationSafetyTargetVersion:Number(caps.migrationSafetyTargetVersion||0),agentAutoRecovery:!!caps.agentAutoRecovery,agentWatchdog:!!caps.agentWatchdog,agentRecoveryCount:Number(caps.agentRecoveryCount||0),agentLastRecoveryAt:caps.agentLastRecoveryAt||null,agentHeartbeatFailures:Number(caps.agentHeartbeatFailures||0),agentCommandFailures:Number(caps.agentCommandFailures||0)};
     });
     res.json({health:rows,generatedAt:now(),schema});
   }catch(e){next(e)}
