@@ -373,7 +373,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=12;
+const SERVER_SCHEMA_TARGET=13;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -743,7 +743,28 @@ const SERVER_MIGRATIONS=[
       );
       CREATE INDEX IF NOT EXISTS idx_performance_alert_events_status_time ON performance_alert_events(status,last_seen_at DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_performance_alert_one_open ON performance_alert_events(alert_key) WHERE status='open';
-      UPDATE desktop_update_policy SET latest_version='0.10.5',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v12' WHERE id=1 AND latest_version IN ('0.10.1','0.10.2','0.10.3','0.10.4');
+      UPDATE desktop_update_policy SET latest_version='0.10.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v12' WHERE id=1 AND latest_version IN ('0.10.1','0.10.2','0.10.3','0.10.4');
+    `
+  },
+  {
+    version:13,
+    name:'phase9a-resilience-drill-center',
+    sql:`
+      CREATE TABLE IF NOT EXISTS resilience_drill_events(
+        id BIGSERIAL PRIMARY KEY,
+        drill_id TEXT NOT NULL UNIQUE,
+        drill_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        title TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        actor TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_resilience_drill_events_time ON resilience_drill_events(started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_resilience_drill_events_type ON resilience_drill_events(drill_type,started_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.10.6',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v13' WHERE id=1 AND latest_version='0.10.6';
     `
   }
 ];
@@ -941,14 +962,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.53',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.54',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.53',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8d-alert-center-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.54',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9a-resilience-drill-center-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1484,7 +1505,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.5').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.6').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1566,7 +1587,7 @@ async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIn
             await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
               VALUES($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
-              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.5',seq,512,now()]);
+              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.6',seq,512,now()]);
             rt.successCount++;
           }catch(e){rt.errorCount++;rt.lastError=String(e?.message||e).slice(0,500)}
           finally{const ms=Number(process.hrtime.bigint()-t0)/1e6;latencies.push(ms);if(latencies.length>200000)latencies.splice(0,latencies.length-100000);rt.totalRequests++;}
@@ -1998,7 +2019,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.41',apiVersion:'2.4.53',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.42',apiVersion:'2.4.54',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -2056,6 +2077,75 @@ app.post('/api/super/backups/run',superAuth,async(req,res,next)=>{try{const resu
 app.post('/api/super/backups/:backupId/verify',superAuth,async(req,res,next)=>{try{res.json(await verifyCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
 app.post('/api/super/backups/:backupId/drill',superAuth,async(req,res,next)=>{try{res.json(await drillCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
 app.post('/api/super/backups/:backupId/restore',superAuth,async(req,res,next)=>{try{const phrase=String(req.body?.confirmPhrase||'');if(phrase!==`RESTORE ${req.params.backupId}`)return res.status(400).json({error:'復原確認文字不正確'});res.json(await restoreCentralBackup(req.params.backupId,SUPER_ADMIN_USER))}catch(e){next(e)}});
+
+
+// Phase 9A: non-destructive commercial readiness / failure drill center.
+// This intentionally verifies recovery evidence without stopping PostgreSQL, cutting network, or promoting a standby.
+async function resilienceChecks(){
+  const checks=[];
+  const push=(key,title,status,summary,detail={})=>checks.push({key,title,status,summary,detail});
+  try{
+    const t0=process.hrtime.bigint();
+    const q=await pool.query('SELECT NOW() AS now, pg_is_in_recovery() AS in_recovery');
+    const ms=Number(process.hrtime.bigint()-t0)/1e6;
+    push('postgres_roundtrip','PostgreSQL Round Trip（資料庫往返）',ms<1000?'pass':'warn',`查詢成功，往返 ${ms.toFixed(1)} ms。`,{latencyMs:ms,inRecovery:!!q.rows[0]?.in_recovery});
+  }catch(e){push('postgres_roundtrip','PostgreSQL Round Trip（資料庫往返）','fail','資料庫查詢失敗。',{error:String(e?.message||e)})}
+
+  try{
+    const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
+    const peer=await probeHaPeer();
+    if(!CENTRAL_HA_ENABLED) push('ha_failover','HA Failover（主備切換準備）','warn','目前未啟用 CENTRAL_HA_ENABLED，尚未具備正式 Primary / Standby 切換條件。',{runtime:st,peer});
+    else if(!peer.configured) push('ha_failover','HA Failover（主備切換準備）','warn','HA 已啟用，但尚未設定 Standby / Peer 健康檢查位置。',{runtime:st,peer});
+    else if(!peer.ok) push('ha_failover','HA Failover（主備切換準備）','fail','Peer 健康檢查失敗，主機故障時可能無法確認備援端狀態。',{runtime:st,peer});
+    else push('ha_failover','HA Failover（主備切換準備）','pass','HA 已啟用，而且 Peer /api/ready 可正常回應。',{runtime:st,peer});
+  }catch(e){push('ha_failover','HA Failover（主備切換準備）','fail','HA 檢查失敗。',{error:String(e?.message||e)})}
+
+  try{
+    const b=(await pool.query("SELECT backup_id,started_at,verification_status,drill_status,status FROM central_backup_events WHERE status IN ('success','partial') ORDER BY id DESC LIMIT 1")).rows[0];
+    if(!b) push('backup_restore','Backup / Restore Drill（備份復原演練）','fail','尚無成功的中央備份。');
+    else if(b.verification_status!=='verified') push('backup_restore','Backup / Restore Drill（備份復原演練）','warn','最近備份尚未通過可復原驗證。',{backup:b});
+    else if(b.drill_status!=='passed') push('backup_restore','Backup / Restore Drill（備份復原演練）','warn','最近備份已驗證，但尚未完成 Restore Drill（復原演練）。',{backup:b});
+    else push('backup_restore','Backup / Restore Drill（備份復原演練）','pass','最近中央備份已驗證，且復原演練通過。',{backup:b});
+  }catch(e){push('backup_restore','Backup / Restore Drill（備份復原演練）','fail','無法讀取備份演練紀錄。',{error:String(e?.message||e)})}
+
+  try{
+    const r=(await pool.query("SELECT run_id,target_nodes,capacity_score,estimated_nodes,p95_ms,error_count,total_requests,started_at,status FROM load_test_runs WHERE target_nodes>=10000 AND status IN ('completed','completed_with_errors') ORDER BY started_at DESC LIMIT 1")).rows[0];
+    if(!r) push('reconnect_storm','10,000 Node Reconnect Evidence（萬節點重連證據）','warn','尚未找到 10,000 Node 等級壓力測試紀錄；正式商用前仍需做重連風暴演練。');
+    else if(Number(r.capacity_score||0)<80) push('reconnect_storm','10,000 Node Reconnect Evidence（萬節點重連證據）','warn',`已有 10,000 Node 測試，但容量評分只有 ${Number(r.capacity_score||0)}。`,{run:r});
+    else push('reconnect_storm','10,000 Node Reconnect Evidence（萬節點重連證據）','pass',`已找到 ${Number(r.target_nodes||0).toLocaleString()} Node 測試證據，容量評分 ${Number(r.capacity_score||0)}。`,{run:r});
+  }catch(e){push('reconnect_storm','10,000 Node Reconnect Evidence（萬節點重連證據）','fail','無法讀取壓力測試證據。',{error:String(e?.message||e)})}
+
+  try{
+    const open=(await pool.query("SELECT COUNT(*)::int AS n FROM performance_alert_events WHERE status='open'")).rows[0]?.n||0;
+    push('alert_pipeline','Alert Pipeline（異常警報鏈路）',Number(open)>0?'warn':'pass',Number(open)>0?`目前仍有 ${open} 個效能警報尚未恢復。`:'目前沒有未恢復的效能警報。',{openAlerts:Number(open)});
+  }catch(e){push('alert_pipeline','Alert Pipeline（異常警報鏈路）','fail','無法讀取 Phase 8D 警報狀態。',{error:String(e?.message||e)})}
+
+  const fail=checks.filter(x=>x.status==='fail').length,warn=checks.filter(x=>x.status==='warn').length,pass=checks.filter(x=>x.status==='pass').length;
+  const overall=fail?'fail':warn?'warn':'pass';
+  return {overall,pass,warn,fail,checks,generatedAt:now()};
+}
+async function runResilienceDrill(actor=SUPER_ADMIN_USER){
+  const drillId=crypto.randomUUID(),started=now();
+  await pool.query("INSERT INTO resilience_drill_events(drill_id,drill_type,status,title,summary,detail,started_at,actor) VALUES($1,'preflight','running',$2,'',$3::jsonb,$4,$5)",[drillId,'Phase 9A 商用前故障準備檢查','{}',started,actor]);
+  try{
+    const result=await resilienceChecks();
+    const status=result.overall==='fail'?'failed':result.overall==='warn'?'warning':'passed';
+    const summary=`通過 ${result.pass}｜注意 ${result.warn}｜失敗 ${result.fail}`;
+    await pool.query('UPDATE resilience_drill_events SET status=$1,summary=$2,detail=$3::jsonb,completed_at=$4 WHERE drill_id=$5',[status,summary,JSON.stringify(result),now(),drillId]);
+    if(result.fail) await recordDiagnostic('','RESILIENCE_PREFLIGHT_001','resilience_drill','商用前故障準備檢查存在失敗項目',{severity:'error',actor,context:{drillId,summary}});
+    return {ok:result.fail===0,drillId,status,summary,...result};
+  }catch(e){
+    await pool.query("UPDATE resilience_drill_events SET status='failed',summary=$1,detail=$2::jsonb,completed_at=$3 WHERE drill_id=$4",[String(e?.message||e).slice(0,1000),JSON.stringify({error:String(e?.message||e)}),now(),drillId]).catch(()=>{});
+    throw e;
+  }
+}
+async function resilienceSummary(){
+  const current=await resilienceChecks();
+  const events=(await pool.query('SELECT * FROM resilience_drill_events ORDER BY id DESC LIMIT 50')).rows;
+  return {current,events,destructiveDrillsEnabled:false,note:'Phase 9A 只做不破壞正式服務的準備檢查；真正停 DB、斷網、Promote Standby 需在維護時段以受控流程執行。',generatedAt:now()};
+}
+app.get('/api/super/resilience',superAuth,async(req,res,next)=>{try{res.json(await resilienceSummary())}catch(e){next(e)}});
+app.post('/api/super/resilience/run',superAuth,async(req,res,next)=>{try{res.json(await runResilienceDrill(SUPER_ADMIN_USER))}catch(e){next(e)}});
 
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
   try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
