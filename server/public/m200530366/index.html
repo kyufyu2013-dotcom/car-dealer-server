@@ -196,7 +196,7 @@ function renderOverview(){
     ${cloudRows.map(x=>{const c=x.company,d=x.snapshot||{},cars=Array.isArray(d.cars)?d.cars:[],stock=cars.filter(v=>v.status!=="已售"),sold=cars.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),sc=stock.reduce((s,v)=>s+Number(v.totalCost||v.purchasePrice||0),0);return `<tr>
       <td><b>${esc(c.name)}</b>${c.trial?` <span class="badge info">試用</span>`:""}</td><td><code>${esc(c.id)}</code></td><td>${c.createdBy==="self"?"自助註冊":"管理員建立"}</td><td>${esc(c.mainUsername||((x.users||[]).find(u=>u.role==="admin")?.username)||"-")}</td><td><span class="badge ${badgeFor(c.status)}">${esc(c.status)}</span></td>
       <td>${esc(c.startDate||"立即")}</td><td>${esc(c.expiresAt||"不限期")}</td><td>${nodeStatusHtml(x)}<div class="muted">${x.node?`最後連線 ${fmtDateTime(x.node.last_seen_at)}｜v${esc(x.node.app_version||"-")}`:""}</div></td><td>${stock.length}</td><td>${sold.length}</td><td>${money(sc)}</td>
-      <td><button class="btn" onclick="openCompanyData('${esc(c.id)}')">即時讀取資料</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權設定</button> <button class="btn2" onclick="toggleCompany('${esc(c.id)}')">${c.enabled?"停用":"啟用"}</button></td></tr>`}).join("")||`<tr><td colspan="12">目前 PostgreSQL 尚無車行</td></tr>`}
+      <td><button class="btn" onclick="openCompanyData('${esc(c.id)}')">即時讀取資料</button> <button class="btn2" onclick="openBackupManager('${esc(c.id)}')">💾 備份</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權設定</button> <button class="btn2" onclick="toggleCompany('${esc(c.id)}')">${c.enabled?"停用":"啟用"}</button></td></tr>`}).join("")||`<tr><td colspan="12">目前 PostgreSQL 尚無車行</td></tr>`}
     </tbody></table></div>
   </div>`;
 }
@@ -224,6 +224,11 @@ async function resetUserPassword(companyId,userId,username){
  if(!confirm(`確定重設 ${username} 的密碼？重設後該帳號舊登入會失效。`))return;
  try{await api(`/super/companies/${encodeURIComponent(companyId)}/users/${encodeURIComponent(userId)}/reset-password`,{method:"POST",body:JSON.stringify({newPassword:p})});alert("密碼已重設");await refreshCloud(true)}catch(e){alert(e.message||"重設失敗")}
 }
+
+
+async function openBackupManager(companyId){const x=companyDataRow(companyId);if(!x)return;if(!nodeIsOnline(x))return alert("此車行 Dealer Node 目前離線，無法遠端備份。");loadingNode(x.company.name+"｜遠端備份管理","正在讀取車行主機備份位置與狀態...");try{const st=await requestNodeData(companyId,"backupStatus",{});renderBackupManager(x,st)}catch(e){alert("備份狀態讀取失敗："+e.message);closeModal()}}
+function renderBackupManager(x,st){const latest=st.latest||null;modal.innerHTML=`<div style="display:flex;justify-content:space-between;gap:10px"><div><h2 style="margin:0">💾 ${esc(x.company.name)}｜遠端備份</h2><div class="muted">由資料中心遠端要求該車行 Dealer Node 建立本機完整備份</div></div><button class="btn2" onclick="closeModal()">關閉</button></div><div class="detail-grid"><div class="detail-item"><b>車行代碼</b>${esc(x.company.id)}</div><div class="detail-item"><b>Node 狀態</b>${nodeStatusHtml(x)}</div><div class="detail-item"><b>備份數量</b>${Number(st.count||0)} 份</div><div class="detail-item"><b>最新備份</b>${latest?esc(latest.name):'尚無備份'}</div></div><div class="notice"><b>車行主機備份資料夾位置</b><br><code style="word-break:break-all">${esc(st.backupRoot||'-')}</code><br><br>目前版本先完成「遠端觸發車行本機備份＋位置/狀態查詢」。中央付費備份上傳會在下一個 Backup 階段接上，不會把照片塞回營運 PostgreSQL。</div><div class="actions"><button class="btn" onclick="remoteCreateBackup('${esc(x.company.id)}')">立即遠端備份</button><button class="btn2" onclick="openBackupManager('${esc(x.company.id)}')">重新整理</button></div>`;modalBg.classList.add("show")}
+async function remoteCreateBackup(companyId){if(!confirm("確定要求此車行立即建立完整本機備份？"))return;const x=companyDataRow(companyId);loadingNode(x.company.name+"｜正在建立備份","備份包含 SQLite 與本機照片，資料量大時請稍候。");try{const r=await requestNodeData(companyId,"createBackup",{});alert("遠端備份完成\n位置："+(r.path||'-'));await openBackupManager(companyId)}catch(e){alert("遠端備份失敗："+e.message);closeModal()}}
 
 async function openCompanyData(id){
   const x=companyDataRow(id);if(!x)return;const c=x.company;
