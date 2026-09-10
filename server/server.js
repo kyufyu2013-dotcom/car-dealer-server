@@ -787,6 +787,25 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_resilience_drill_events_type ON resilience_drill_events(drill_type,started_at DESC);
       UPDATE desktop_update_policy SET latest_version='0.10.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v13' WHERE id=1 AND latest_version='0.10.7';
     `
+  },
+  {
+    version:14,
+    name:'phase9b-controlled-resilience-maintenance-state',
+    sql:`
+      CREATE TABLE IF NOT EXISTS resilience_control_state(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        maintenance_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        reason TEXT NOT NULL DEFAULT '',
+        started_at TEXT,
+        expires_at TEXT,
+        started_by TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO resilience_control_state(id,maintenance_enabled,reason,started_at,expires_at,started_by,updated_at)
+      VALUES(1,FALSE,'',NULL,NULL,'',CURRENT_TIMESTAMP::text)
+      ON CONFLICT(id) DO NOTHING;
+      UPDATE desktop_update_policy SET latest_version='0.10.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v14' WHERE id=1 AND latest_version='0.10.7';
+    `
   }
 ];
 
