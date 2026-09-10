@@ -202,7 +202,40 @@ async function recordSyncEvent(companyId,eventType,message='',opts={}){
   }catch(e){console.warn('sync event log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=2;
+const DIAG_SEVERITIES=new Set(['info','warn','error','critical']);
+const DIAG_SECRET_KEYS=/pass(word)?|token|authorization|cookie|secret|jwt|offlineVerifier|passwordHash/i;
+function sanitizeDiagnosticContext(input,depth=0){
+  if(depth>3)return '[max-depth]';
+  if(input===null||input===undefined)return input;
+  if(typeof input==='string')return input.slice(0,500);
+  if(typeof input==='number'||typeof input==='boolean')return input;
+  if(Array.isArray(input))return input.slice(0,20).map(v=>sanitizeDiagnosticContext(v,depth+1));
+  if(typeof input==='object'){
+    const out={};let n=0;
+    for(const [k,v] of Object.entries(input)){
+      if(n++>=30)break;
+      out[k]=DIAG_SECRET_KEYS.test(k)?'[redacted]':sanitizeDiagnosticContext(v,depth+1);
+    }
+    return out;
+  }
+  return String(input).slice(0,500);
+}
+function diagnosticFingerprint(code,module,message){return crypto.createHash('sha256').update(`${code}|${module}|${String(message||'').slice(0,500)}`).digest('hex').slice(0,32)}
+async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
+  try{
+    const code=String(errorCode||'SYSTEM_UNKNOWN').toUpperCase().replace(/[^A-Z0-9_.-]/g,'_').slice(0,64)||'SYSTEM_UNKNOWN';
+    const mod=String(module||'system').replace(/[^A-Za-z0-9_.-]/g,'_').slice(0,64)||'system';
+    const severity=DIAG_SEVERITIES.has(String(opts.severity||'error'))?String(opts.severity||'error'):'error';
+    const msg=String(message||'').slice(0,1000),fp=diagnosticFingerprint(code,mod,msg),ts=now();
+    const ctx=sanitizeDiagnosticContext(opts.context||{});
+    await pool.query(`INSERT INTO diagnostic_events(company_id,error_code,module,severity,message,fingerprint,app_version,actor,first_seen_at,last_seen_at,occurrence_count,resolved,resolved_at,last_context)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,1,FALSE,NULL,$10::jsonb)
+      ON CONFLICT(company_id,error_code,module,fingerprint) DO UPDATE SET severity=excluded.severity,message=excluded.message,app_version=excluded.app_version,actor=excluded.actor,last_seen_at=excluded.last_seen_at,occurrence_count=diagnostic_events.occurrence_count+1,resolved=FALSE,resolved_at=NULL,last_context=excluded.last_context`,
+      [companyId?String(companyId):'',code,mod,severity,msg,fp,String(opts.appVersion||'').slice(0,40),String(opts.actor||'').slice(0,80),ts,JSON.stringify(ctx)]);
+  }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
+}
+
+const SERVER_SCHEMA_TARGET=3;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -314,6 +347,32 @@ const SERVER_MIGRATIONS=[
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_migration_safety_time ON migration_safety_events(created_at DESC);
+    `
+  },
+  {
+    version:3,
+    name:'phase5a-diagnostic-events',
+    sql:`
+      CREATE TABLE IF NOT EXISTS diagnostic_events(
+        id BIGSERIAL PRIMARY KEY,
+        company_id TEXT NOT NULL DEFAULT '',
+        error_code TEXT NOT NULL,
+        module TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'error',
+        message TEXT NOT NULL DEFAULT '',
+        fingerprint TEXT NOT NULL,
+        app_version TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL DEFAULT '',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        resolved BOOLEAN NOT NULL DEFAULT FALSE,
+        resolved_at TEXT,
+        last_context JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_diag_dedupe ON diagnostic_events(company_id,error_code,module,fingerprint);
+      CREATE INDEX IF NOT EXISTS idx_diag_company_time ON diagnostic_events(company_id,last_seen_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_diag_severity_time ON diagnostic_events(severity,last_seen_at DESC);
     `
   }
 ];
@@ -453,7 +512,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.38',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4b-migration-safety'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.39',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase5a-diagnostics'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1217,7 +1276,10 @@ app.post('/api/node/commands/:id/result',auth,requireActiveCompany,async(req,res
     if(ok){
       await pool.query("UPDATE dealer_node_requests SET status='completed',completed_at=$1,result_json=$2::jsonb,error_text=NULL WHERE id=$3",[now(),JSON.stringify(req.body?.result??null),r.id]);
     }else{
-      await pool.query("UPDATE dealer_node_requests SET status='failed',completed_at=$1,error_text=$2,result_json=NULL WHERE id=$3",[now(),String(req.body?.error||'Dealer Node 讀取失敗').slice(0,1000),r.id]);
+      const nodeError=String(req.body?.error||'Dealer Node 讀取失敗').slice(0,1000);
+      await pool.query("UPDATE dealer_node_requests SET status='failed',completed_at=$1,error_text=$2,result_json=NULL WHERE id=$3",[now(),nodeError,r.id]);
+      const isPhoto=String(r.resource||'').toLowerCase().includes('photo');
+      await recordDiagnostic(req.auth.companyId,isPhoto?'PHOTO_FETCH_002':'NODE_COMMAND_001',isPhoto?'photo_fetch':'dealer_node',nodeError,{severity:'error',actor:req.auth.username||'',context:{resource:r.resource,requestId:r.id}});
     }
     res.json({ok:true});
   }catch(e){next(e)}
@@ -1235,8 +1297,35 @@ app.get('/api/super/companies/:id/sync-events',superAuth,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可回報診斷事件'});
+    const b=req.body||{};
+    await recordDiagnostic(req.auth.companyId,b.errorCode||'NODE_UNKNOWN',b.module||'dealer_node',b.message||'',{severity:b.severity||'error',appVersion:b.appVersion||'',actor:req.auth.username||'',context:b.context||{}});
+    res.json({ok:true});
+  }catch(e){next(e)}
+});
+
 app.get('/api/super/migrations',superAuth,async(req,res,next)=>{
   try{const schema=await getServerSchemaStatus();await ensureMigrationSafetyTable();const safety=(await pool.query('SELECT id,migration_version,migration_name,status,detail,created_at FROM migration_safety_events ORDER BY id DESC LIMIT 100')).rows;res.json({...schema,safetyEvents:safety});}catch(e){next(e)}
+});
+
+app.get('/api/super/diagnostics',superAuth,async(req,res,next)=>{
+  try{
+    const companyId=String(req.query.companyId||'').trim();
+    const limit=Math.max(1,Math.min(500,Number(req.query.limit||200)));
+    const onlyOpen=String(req.query.open||'')==='1';
+    const where=[],args=[];
+    if(companyId){args.push(companyId);where.push(`d.company_id=$${args.length}`)}
+    if(onlyOpen)where.push('d.resolved=FALSE');
+    args.push(limit);
+    const q=`SELECT d.*,c.name AS company_name FROM diagnostic_events d LEFT JOIN companies c ON c.id=d.company_id ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY d.last_seen_at DESC LIMIT $${args.length}`;
+    const rows=(await pool.query(q,args)).rows;
+    res.json({events:rows,generatedAt:now()});
+  }catch(e){next(e)}
+});
+app.post('/api/super/diagnostics/:id/resolve',superAuth,async(req,res,next)=>{
+  try{await pool.query('UPDATE diagnostic_events SET resolved=TRUE,resolved_at=$1 WHERE id=$2',[now(),req.params.id]);res.json({ok:true});}catch(e){next(e)}
 });
 
 app.get('/api/super/health',superAuth,async(req,res,next)=>{
@@ -1245,15 +1334,19 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
     const companies=(await pool.query('SELECT * FROM companies ORDER BY created_at DESC')).rows;
     const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
     const snaps=(await pool.query('SELECT company_id,updated_at FROM snapshots')).rows;
-    const failed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM sync_events WHERE status<>'ok' AND event_type<>'node_offline' AND created_at>$1 GROUP BY company_id",[new Date(Date.now()-24*3600*1000).toISOString()])).rows;
-    const nb=new Map(nodes.map(x=>[x.company_id,x])),sb=new Map(snaps.map(x=>[x.company_id,x])),fb=new Map(failed.map(x=>[x.company_id,Number(x.n||0)]));
+    const since24=new Date(Date.now()-24*3600*1000).toISOString();
+    const failed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM sync_events WHERE status<>'ok' AND event_type<>'node_offline' AND created_at>$1 GROUP BY company_id",[since24])).rows;
+    const diagFailed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM diagnostic_events WHERE resolved=FALSE AND severity IN ('error','critical') AND last_seen_at>$1 GROUP BY company_id",[since24])).rows;
+    const nb=new Map(nodes.map(x=>[x.company_id,x])),sb=new Map(snaps.map(x=>[x.company_id,x])),fb=new Map(failed.map(x=>[x.company_id,Number(x.n||0)])),db=new Map(diagFailed.map(x=>[x.company_id,Number(x.n||0)]));
     const rows=companies.map(c=>{
       const n=nb.get(c.id),st=sb.get(c.id);let score=40;const issues=[];
       // Node 在線/離線屬於營業主機使用狀態，只保留狀態與事件紀錄，不納入健康度扣分。
       if(c.enabled){score+=20}else issues.push('車行已停用');
       const authAge=Date.now()-Date.parse(c.last_auth_at||'');if(Number.isFinite(authAge)&&authAge<7*86400000)score+=20;else issues.push('最近 7 天無授權登入');
       const snapAge=Date.now()-Date.parse(st?.updated_at||'');if(Number.isFinite(snapAge)&&snapAge<2*86400000)score+=20;else if(Number.isFinite(snapAge)&&snapAge<7*86400000){score+=10;issues.push('資料同步超過 2 天')}else issues.push('資料同步超過 7 天');
-      const failures=fb.get(c.id)||0;if(failures){score=Math.max(0,score-Math.min(20,failures*5));issues.push(`24 小時異常 ${failures} 筆`)}
+      const syncFailures=fb.get(c.id)||0,diagnosticFailures=db.get(c.id)||0,failures=syncFailures+diagnosticFailures;
+      if(syncFailures){score=Math.max(0,score-Math.min(15,syncFailures*5));issues.push(`24 小時同步異常 ${syncFailures} 筆`)}
+      if(diagnosticFailures){score=Math.max(0,score-Math.min(20,diagnosticFailures*5));issues.push(`24 小時系統錯誤 ${diagnosticFailures} 類`)}
       const caps=n?.capabilities||{};
       const localSchemaVersion=Number(caps.localSchemaVersion||0),localSchemaTarget=Number(caps.localSchemaTarget||0);
       const localSchemaStatus=String(caps.localSchemaStatus||'unknown');
@@ -1416,7 +1509,10 @@ app.delete('/api/super/companies/:id',superAuth,async(req,res,next)=>{
 
 app.use((err,req,res,next)=>{
   console.error(err);
-  res.status(500).json({error:'伺服器發生錯誤'});
+  const code=String(err?.code||'SERVER_UNHANDLED_001');
+  const companyId=req?.auth?.companyId||null;
+  recordDiagnostic(companyId,code,'central_api',err?.message||'伺服器發生錯誤',{severity:'error',actor:req?.auth?.username||'',context:{method:req?.method,path:req?.path,httpStatus:500}}).catch(()=>{});
+  res.status(500).json({error:'伺服器發生錯誤',errorCode:'SERVER_UNHANDLED_001'});
 });
 
 async function start(){
