@@ -8,6 +8,8 @@ import fs from 'fs/promises';
 import { gzipSync, gunzipSync } from 'zlib';
 import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { fileURLToPath } from 'url';
+import os from 'os';
+import { monitorEventLoopDelay } from 'perf_hooks';
 
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
@@ -59,6 +61,29 @@ const LOAD_TEST_ENABLED = String(process.env.LOAD_TEST_ENABLED||'').toLowerCase(
 const LOAD_TEST_TOKEN = String(process.env.LOAD_TEST_TOKEN||'');
 const LOAD_TEST_MAX_RPS = Math.max(10,Math.min(10000,Number(process.env.LOAD_TEST_MAX_RPS||2500)));
 let loadTestWindowSecond=0,loadTestWindowCount=0;
+// v10.2 / Phase 8C hotfix: Super Admin can launch a guarded, server-managed synthetic Dealer Node load test.
+// It reuses the isolated load_test_* tables and intentionally requires LOAD_TEST_ENABLED + a configured token.
+let managedLoadTest={running:false,stopRequested:false,runId:'',targetNodes:0,durationSeconds:0,heartbeatIntervalMs:15000,startedAt:null,completedAt:null,totalRequests:0,successCount:0,errorCount:0,currentRps:0,p95Ms:0,p99Ms:0,lastError:''};
+
+
+// Phase 8C: lightweight central performance telemetry. Technical metrics are Super Admin only.
+const METRICS_SAMPLE_MS=Math.max(5000,Math.min(60000,Number(process.env.METRICS_SAMPLE_MS||15000)));
+const METRICS_RETENTION_HOURS=Math.max(1,Math.min(24*30,Number(process.env.METRICS_RETENTION_HOURS||72)));
+const eventLoopMonitor=monitorEventLoopDelay({resolution:20}); eventLoopMonitor.enable();
+let perfLastCpu=process.cpuUsage(),perfLastWall=process.hrtime.bigint();
+let apiPerfWindow=[];
+function percentile(values,p){if(!values.length)return 0;const a=[...values].sort((x,y)=>x-y);return Number(a[Math.min(a.length-1,Math.max(0,Math.ceil(a.length*p)-1))]||0)}
+function recordApiPerf(ms,status){const t=Date.now();apiPerfWindow.push({t,ms:Number(ms||0),status:Number(status||0)});const cutoff=t-60000;if(apiPerfWindow.length>20000||apiPerfWindow[0]?.t<cutoff)apiPerfWindow=apiPerfWindow.filter(x=>x.t>=cutoff)}
+function apiPerfSnapshot(){const cutoff=Date.now()-60000;const a=apiPerfWindow.filter(x=>x.t>=cutoff);const lat=a.map(x=>x.ms),errors=a.filter(x=>x.status>=500).length;return {count:a.length,rps:a.length/60,p50Ms:percentile(lat,.50),p95Ms:percentile(lat,.95),p99Ms:percentile(lat,.99),errorRate:a.length?errors/a.length:0}}
+function processCpuPercent(){const cur=process.cpuUsage(),wall=process.hrtime.bigint();const cpuUs=(cur.user-perfLastCpu.user)+(cur.system-perfLastCpu.system);const wallUs=Number(wall-perfLastWall)/1000;perfLastCpu=cur;perfLastWall=wall;return wallUs>0?Math.min(100,(cpuUs/wallUs)*100):0}
+async function collectSystemMetrics(){
+  const mem=process.memoryUsage(),api=apiPerfSnapshot(),cpu=processCpuPercent();
+  const elP95=Number(eventLoopMonitor.percentile(95)/1e6||0),elMax=Number(eventLoopMonitor.max/1e6||0); eventLoopMonitor.reset();
+  let pgQueryMs=0,pgOk=true;const q0=process.hrtime.bigint();try{await pool.query('SELECT 1')}catch{pgOk=false}finally{pgQueryMs=Number(process.hrtime.bigint()-q0)/1e6}
+  return {sampledAt:now(),instanceId:CENTRAL_HA_INSTANCE_ID,site:CENTRAL_HA_SITE,cpuPercent:cpu,rssBytes:mem.rss,heapUsedBytes:mem.heapUsed,heapTotalBytes:mem.heapTotal,systemFreeBytes:os.freemem(),systemTotalBytes:os.totalmem(),eventLoopP95Ms:elP95,eventLoopMaxMs:elMax,apiRps:api.rps,apiP50Ms:api.p50Ms,apiP95Ms:api.p95Ms,apiP99Ms:api.p99Ms,apiErrorRate:api.errorRate,pgTotal:Number(pool.totalCount||0),pgIdle:Number(pool.idleCount||0),pgWaiting:Number(pool.waitingCount||0),pgQueryMs,pgOk,uptimeSeconds:Math.round(process.uptime()),loadAvg1:Number(os.loadavg()[0]||0),cpuCores:os.cpus().length};
+}
+function assessPerformance(m){const issues=[];let score=100;if(m.cpuPercent>=85){score-=25;issues.push('Node.js CPU 使用率過高')}else if(m.cpuPercent>=70){score-=10;issues.push('CPU 使用率偏高')}const memRatio=m.systemTotalBytes?1-m.systemFreeBytes/m.systemTotalBytes:0;if(memRatio>=.9){score-=20;issues.push('系統記憶體使用率超過 90%')}if(m.eventLoopP95Ms>=100){score-=25;issues.push('Event Loop 延遲嚴重')}else if(m.eventLoopP95Ms>=40){score-=10;issues.push('Event Loop 延遲偏高')}if(m.pgWaiting>0){score-=Math.min(25,m.pgWaiting*5);issues.push(`PostgreSQL 等待連線 ${m.pgWaiting}`)}if(m.pgQueryMs>=200){score-=20;issues.push('PostgreSQL 基礎查詢延遲過高')}else if(m.pgQueryMs>=80){score-=8;issues.push('PostgreSQL 查詢延遲偏高')}if(m.apiErrorRate>=.02){score-=25;issues.push('API 5xx 錯誤率偏高')}if(m.apiP95Ms>=1000){score-=20;issues.push('API P95 延遲過高')}else if(m.apiP95Ms>=500){score-=8;issues.push('API P95 延遲偏高')}score=Math.max(0,score);let bottleneck='none';if(m.pgWaiting>0||m.pgQueryMs>=200)bottleneck='postgres';else if(m.eventLoopP95Ms>=100)bottleneck='event_loop';else if(m.cpuPercent>=85)bottleneck='cpu';else if(memRatio>=.9)bottleneck='memory';else if(m.apiP95Ms>=1000)bottleneck='api_latency';else if(m.apiErrorRate>=.02)bottleneck='api_errors';return {score,grade:score>=90?'A':score>=80?'B':score>=65?'C':score>=50?'D':'F',bottleneck,issues,memoryPercent:memRatio*100};}
+
 
 function b64url(v){return Buffer.from(v).toString('base64url')}
 function offlineVerifier(password){const salt=crypto.randomBytes(16).toString('hex');const hash=crypto.scryptSync(String(password),salt,64,{N:16384,r:8,p:1}).toString('hex');return `${salt}:${hash}`;}
@@ -290,7 +315,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=10;
+const SERVER_SCHEMA_TARGET=11;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -606,6 +631,35 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_load_test_runs_capacity ON load_test_runs(capacity_score DESC,started_at DESC);
       UPDATE desktop_update_policy SET latest_version='0.10.0',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v10' WHERE id=1 AND latest_version='0.9.9';
     `
+  },
+  {
+    version:11,
+    name:'phase8c-system-performance-monitoring',
+    sql:`
+      CREATE TABLE IF NOT EXISTS system_metric_samples(
+        id BIGSERIAL PRIMARY KEY,
+        instance_id TEXT NOT NULL DEFAULT '',
+        site TEXT NOT NULL DEFAULT '',
+        sampled_at TEXT NOT NULL,
+        cpu_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+        rss_bytes BIGINT NOT NULL DEFAULT 0,
+        heap_used_bytes BIGINT NOT NULL DEFAULT 0,
+        heap_total_bytes BIGINT NOT NULL DEFAULT 0,
+        system_free_bytes BIGINT NOT NULL DEFAULT 0,
+        system_total_bytes BIGINT NOT NULL DEFAULT 0,
+        event_loop_p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        event_loop_max_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        api_rps DOUBLE PRECISION NOT NULL DEFAULT 0,
+        api_p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        api_error_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+        pg_total INTEGER NOT NULL DEFAULT 0,
+        pg_idle INTEGER NOT NULL DEFAULT 0,
+        pg_waiting INTEGER NOT NULL DEFAULT 0,
+        pg_query_ms DOUBLE PRECISION NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_system_metric_samples_time ON system_metric_samples(sampled_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.10.1',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v11' WHERE id=1 AND latest_version='0.10.0';
+    `
   }
 ];
 
@@ -784,6 +838,7 @@ function superAuth(req,res,next){
 const app=express();
 app.use(cors({origin:true,credentials:false}));
 app.use(express.json({limit:'30mb'}));
+app.use((req,res,next)=>{const started=process.hrtime.bigint();res.on('finish',()=>{const ms=Number(process.hrtime.bigint()-started)/1e6;recordApiPerf(ms,res.statusCode)});next()});
 app.use('/sales', express.static(path.join(__dirname,'public','sales'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
 app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
@@ -801,14 +856,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.48',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.50',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.48',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8b-capacity-analyzed-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.50',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8c-super-managed-loadtest-performance-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1344,7 +1399,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.0').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.2').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1404,6 +1459,82 @@ app.post('/api/load-test/run/finish',loadTestAuth,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+
+async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIntervalMs}){
+  const rt=managedLoadTest;
+  const latencies=[]; const startedMs=Date.now(); let seq=0;
+  // 250 ms pacing keeps the load smooth instead of creating a single burst every 15 seconds.
+  const tickMs=250; let carry=0;
+  try{
+    while(!rt.stopRequested && Date.now()-startedMs < durationSeconds*1000){
+      const tickStart=Date.now();
+      carry += targetNodes * tickMs / heartbeatIntervalMs;
+      let batch=Math.floor(carry); carry-=batch;
+      // Extra safety: never schedule more synthetic heartbeats per second than LOAD_TEST_MAX_RPS.
+      batch=Math.min(batch,Math.max(1,Math.floor(LOAD_TEST_MAX_RPS*tickMs/1000)));
+      const jobs=[];
+      for(let i=0;i<batch;i++){
+        const n=(seq++%targetNodes)+1;
+        jobs.push((async()=>{
+          const t0=process.hrtime.bigint();
+          try{
+            await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
+              VALUES($1,$2,$3,$4,$5,$6,$7)
+              ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
+              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.2',seq,512,now()]);
+            rt.successCount++;
+          }catch(e){rt.errorCount++;rt.lastError=String(e?.message||e).slice(0,500)}
+          finally{const ms=Number(process.hrtime.bigint()-t0)/1e6;latencies.push(ms);if(latencies.length>200000)latencies.splice(0,latencies.length-100000);rt.totalRequests++;}
+        })());
+      }
+      await Promise.all(jobs);
+      const elapsed=Math.max(.001,(Date.now()-startedMs)/1000);rt.currentRps=rt.totalRequests/elapsed;
+      rt.p95Ms=percentile(latencies,.95);rt.p99Ms=percentile(latencies,.99);
+      const wait=Math.max(0,tickMs-(Date.now()-tickStart)); if(wait)await new Promise(r=>setTimeout(r,wait));
+    }
+    const elapsed=Math.max(.001,(Date.now()-startedMs)/1000);
+    const status=rt.stopRequested?'completed-stopped':'completed';
+    const p50=percentile(latencies,.50),p95=percentile(latencies,.95),p99=percentile(latencies,.99),mx=latencies.reduce((m,v)=>v>m?v:m,0);
+    await pool.query(`UPDATE load_test_runs SET completed_at=$1,status=$2,total_requests=$3,success_count=$4,error_count=$5,rps=$6,p50_ms=$7,p95_ms=$8,p99_ms=$9,max_ms=$10,detail=COALESCE(detail,'{}'::jsonb)||$11::jsonb WHERE run_id=$12`,
+      [now(),status,rt.totalRequests,rt.successCount,rt.errorCount,rt.totalRequests/elapsed,p50,p95,p99,mx,JSON.stringify({source:'super-admin-managed',stopped:rt.stopRequested,lastError:rt.lastError||''}),runId]);
+    await persistLoadTestAnalysis(runId);
+  }catch(e){
+    rt.lastError=String(e?.message||e).slice(0,1000);
+    try{await pool.query(`UPDATE load_test_runs SET completed_at=$1,status='failed',total_requests=$2,success_count=$3,error_count=$4,detail=COALESCE(detail,'{}'::jsonb)||$5::jsonb WHERE run_id=$6`,[now(),rt.totalRequests,rt.successCount,rt.errorCount+1,JSON.stringify({source:'super-admin-managed',error:rt.lastError}),runId])}catch{}
+  }finally{
+    rt.running=false;rt.completedAt=now();rt.currentRps=0;
+  }
+}
+
+app.post('/api/super/load-tests/start',superAuth,async(req,res,next)=>{
+  try{
+    if(!LOAD_TEST_ENABLED)return res.status(409).json({error:'壓力測試目前未啟用。請先在 Server 設定 LOAD_TEST_ENABLED=true。'});
+    if(!LOAD_TEST_TOKEN||LOAD_TEST_TOKEN.length<16)return res.status(409).json({error:'LOAD_TEST_TOKEN 尚未設定或長度不足 16 字元。'});
+    if(managedLoadTest.running)return res.status(409).json({error:'目前已有壓力測試正在執行。'});
+    const b=req.body||{};
+    const allowedNodes=[100,1000,5000,10000],allowedDurations=[30,60,300];
+    const targetNodes=Number(b.targetNodes||100),durationSeconds=Number(b.durationSeconds||30),heartbeatIntervalMs=15000;
+    if(!allowedNodes.includes(targetNodes))return res.status(400).json({error:'測試節點只允許 100 / 1,000 / 5,000 / 10,000。'});
+    if(!allowedDurations.includes(durationSeconds))return res.status(400).json({error:'測試時間只允許 30 / 60 / 300 秒。'});
+    const expectedRps=targetNodes/(heartbeatIntervalMs/1000);
+    if(expectedRps>LOAD_TEST_MAX_RPS)return res.status(400).json({error:`此測試理論 ${expectedRps.toFixed(1)} RPS，超過 Server 安全上限 ${LOAD_TEST_MAX_RPS} RPS。`});
+    const runId=`ui_${crypto.randomUUID()}`;
+    await pool.query('DELETE FROM load_test_nodes WHERE last_seen_at < $1',[new Date(Date.now()-24*3600*1000).toISOString()]);
+    await pool.query(`INSERT INTO load_test_runs(run_id,started_at,status,target_nodes,duration_seconds,heartbeat_interval_ms,concurrency,detail) VALUES($1,$2,'running',$3,$4,$5,$6,$7::jsonb)`,[runId,now(),targetNodes,durationSeconds,heartbeatIntervalMs,Math.min(targetNodes,500),JSON.stringify({source:'super-admin-managed',actor:req.user?.username||SUPER_ADMIN_USER,warningConfirmed:true,serverInstance:CENTRAL_HA_INSTANCE_ID})]);
+    managedLoadTest={running:true,stopRequested:false,runId,targetNodes,durationSeconds,heartbeatIntervalMs,startedAt:now(),completedAt:null,totalRequests:0,successCount:0,errorCount:0,currentRps:0,p95Ms:0,p99Ms:0,lastError:''};
+    void runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIntervalMs});
+    res.json({ok:true,runId,targetNodes,durationSeconds,expectedRps,maxRps:LOAD_TEST_MAX_RPS});
+  }catch(e){next(e)}
+});
+
+app.post('/api/super/load-tests/stop',superAuth,async(req,res,next)=>{
+  try{
+    if(!managedLoadTest.running)return res.status(409).json({error:'目前沒有正在執行的壓力測試。'});
+    managedLoadTest.stopRequested=true;
+    res.json({ok:true,runId:managedLoadTest.runId,message:'已送出停止要求，系統會在目前批次完成後停止。'});
+  }catch(e){next(e)}
+});
+
 app.get('/api/super/load-tests',superAuth,async(req,res,next)=>{
   try{
     const {rows}=await pool.query('SELECT * FROM load_test_runs ORDER BY started_at DESC LIMIT 50');
@@ -1413,7 +1544,7 @@ app.get('/api/super/load-tests',superAuth,async(req,res,next)=>{
     const best=analyzed.slice().sort((a,b)=>Number(b.estimated_nodes||0)-Number(a.estimated_nodes||0))[0]||null;
     const latest=analyzed[0]||null;
     const capacity={latest:latest?latest.analysis:null,best:best?best.analysis:null,bestRunId:best?.run_id||'',testedMaxNodes:analyzed.reduce((m,r)=>Math.max(m,Number(r.target_nodes||0)),0),recommendation:!analyzed.length?'尚無測試資料':(best?.analysis?.score>=80?`目前證據支持約 ${Number(best.analysis.recommendedNodes||0).toLocaleString()} 個節點等級；正式容量仍應保留至少 20% 餘裕。`:'目前測試尚未達到穩定商用門檻，先處理瓶頸再提高節點數。')};
-    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:analyzed,capacity});
+    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:analyzed,capacity,managed:{...managedLoadTest,expectedRps:managedLoadTest.targetNodes?managedLoadTest.targetNodes/(managedLoadTest.heartbeatIntervalMs/1000):0}});
   }catch(e){next(e)}
 });
 
@@ -1784,7 +1915,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.36',apiVersion:'2.4.48',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.38',apiVersion:'2.4.50',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -1863,6 +1994,15 @@ app.get('/api/super/diagnostics',superAuth,async(req,res,next)=>{
 });
 app.post('/api/super/diagnostics/:id/resolve',superAuth,async(req,res,next)=>{
   try{await pool.query('UPDATE diagnostic_events SET resolved=TRUE,resolved_at=$1 WHERE id=$2',[now(),req.params.id]);res.json({ok:true});}catch(e){next(e)}
+});
+
+app.get('/api/super/performance',superAuth,async(req,res,next)=>{
+  try{
+    const current=await collectSystemMetrics(),assessment=assessPerformance(current);
+    const since=new Date(Date.now()-6*3600*1000).toISOString();
+    let history=[];try{history=(await pool.query('SELECT * FROM system_metric_samples WHERE sampled_at>=$1 ORDER BY sampled_at DESC LIMIT 1440',[since])).rows.reverse()}catch{}
+    res.json({current,assessment,history,config:{sampleMs:METRICS_SAMPLE_MS,retentionHours:METRICS_RETENTION_HOURS},generatedAt:now()});
+  }catch(e){next(e)}
 });
 
 app.get('/api/super/health',superAuth,async(req,res,next)=>{
@@ -2087,6 +2227,15 @@ async function start(){
     await refreshHaRuntime({allowMigration:false,recordTransition:false});
   }
   setInterval(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*60*1000).unref();
+  setInterval(async()=>{
+    try{
+      if(CENTRAL_HA_ENABLED&&haRuntime.dbRole!=='primary')return;
+      const m=await collectSystemMetrics();
+      await pool.query(`INSERT INTO system_metric_samples(instance_id,site,sampled_at,cpu_percent,rss_bytes,heap_used_bytes,heap_total_bytes,system_free_bytes,system_total_bytes,event_loop_p95_ms,event_loop_max_ms,api_rps,api_p95_ms,api_error_rate,pg_total,pg_idle,pg_waiting,pg_query_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,[m.instanceId,m.site,m.sampledAt,m.cpuPercent,m.rssBytes,m.heapUsedBytes,m.heapTotalBytes,m.systemFreeBytes,m.systemTotalBytes,m.eventLoopP95Ms,m.eventLoopMaxMs,m.apiRps,m.apiP95Ms,m.apiErrorRate,m.pgTotal,m.pgIdle,m.pgWaiting,m.pgQueryMs]);
+      const cutoff=new Date(Date.now()-METRICS_RETENTION_HOURS*3600*1000).toISOString();
+      await pool.query('DELETE FROM system_metric_samples WHERE sampled_at<$1',[cutoff]);
+    }catch(e){console.warn('performance sample failed:',e?.message||e)}
+  },METRICS_SAMPLE_MS).unref();
   setTimeout(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*1000).unref();
   app.listen(PORT,()=>console.log(`Car Dealer Central API listening on http://localhost:${PORT} | HA=${CENTRAL_HA_ENABLED?'on':'off'} role=${haRuntime.dbRole}`));
 }
