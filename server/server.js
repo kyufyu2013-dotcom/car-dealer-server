@@ -290,7 +290,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=9;
+const SERVER_SCHEMA_TARGET=10;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -594,6 +594,18 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_load_test_runs_time ON load_test_runs(started_at DESC);
       UPDATE desktop_update_policy SET latest_version='0.9.9',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v9' WHERE id=1 AND latest_version='0.9.8';
     `
+  },
+  {
+    version:10,
+    name:'phase8b-load-capacity-analysis',
+    sql:`
+      ALTER TABLE load_test_runs ADD COLUMN IF NOT EXISTS capacity_score INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE load_test_runs ADD COLUMN IF NOT EXISTS estimated_nodes INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE load_test_runs ADD COLUMN IF NOT EXISTS bottleneck TEXT NOT NULL DEFAULT '';
+      ALTER TABLE load_test_runs ADD COLUMN IF NOT EXISTS analysis JSONB NOT NULL DEFAULT '{}'::jsonb;
+      CREATE INDEX IF NOT EXISTS idx_load_test_runs_capacity ON load_test_runs(capacity_score DESC,started_at DESC);
+      UPDATE desktop_update_policy SET latest_version='0.10.0',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v10' WHERE id=1 AND latest_version='0.9.9';
+    `
   }
 ];
 
@@ -789,14 +801,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.47',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.48',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.47',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8a-load-tested-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.48',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8b-capacity-analyzed-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1332,7 +1344,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.9.9').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.0').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1342,6 +1354,43 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   }catch(e){next(e)}
 });
 
+
+function analyzeLoadTestRun(row){
+  const targetNodes=Math.max(0,Number(row.target_nodes||row.targetNodes||0));
+  const intervalMs=Math.max(1000,Number(row.heartbeat_interval_ms||row.heartbeatIntervalMs||15000));
+  const expectedRps=targetNodes/(intervalMs/1000);
+  const actualRps=Math.max(0,Number(row.rps||0));
+  const total=Math.max(0,Number(row.total_requests||row.totalRequests||0));
+  const errors=Math.max(0,Number(row.error_count||row.errorCount||0));
+  const errorRate=total?errors/total:1;
+  const p95=Math.max(0,Number(row.p95_ms||row.p95Ms||0));
+  const p99=Math.max(0,Number(row.p99_ms||row.p99Ms||0));
+  const throughputRatio=expectedRps>0?actualRps/expectedRps:0;
+  let score=100;
+  if(errorRate>0.05)score-=55; else if(errorRate>0.01)score-=35; else if(errorRate>0.001)score-=18; else if(errorRate>0)score-=8;
+  if(throughputRatio<0.75)score-=35; else if(throughputRatio<0.9)score-=20; else if(throughputRatio<0.98)score-=8;
+  if(p99>3000)score-=30; else if(p99>1500)score-=20; else if(p99>800)score-=12; else if(p99>400)score-=5;
+  if(p95>1000)score-=12; else if(p95>500)score-=6;
+  score=Math.max(0,Math.min(100,Math.round(score)));
+  let bottleneck='none',summary='目前測試範圍內未看到明顯瓶頸';
+  if(errorRate>=0.01){bottleneck='errors';summary='錯誤率偏高，先檢查 Server / PostgreSQL 錯誤與連線上限';}
+  else if(throughputRatio<0.9){bottleneck='throughput';summary='實際吞吐低於理論目標，可能受 CPU、DB connections 或網路限制';}
+  else if(p99>800||p95>500){bottleneck='latency';summary='尾端延遲偏高，優先檢查 PostgreSQL 查詢、connection pool 與 CPU';}
+  const sustainableRps=Math.max(0,actualRps*(errorRate===0?0.85:errorRate<0.001?0.75:0.6));
+  const estimatedNodes=Math.max(0,Math.floor(sustainableRps*(intervalMs/1000)));
+  const grade=score>=90?'A':score>=80?'B':score>=65?'C':score>=50?'D':'F';
+  const recommendedNodes=score>=80?Math.max(targetNodes,estimatedNodes):Math.min(targetNodes,estimatedNodes);
+  return {score,grade,bottleneck,summary,errorRate,expectedRps,actualRps,throughputRatio,p95Ms:p95,p99Ms:p99,sustainableRps,estimatedNodes,recommendedNodes,heartbeatIntervalMs:intervalMs};
+}
+
+async function persistLoadTestAnalysis(runId){
+  const q=await pool.query('SELECT * FROM load_test_runs WHERE run_id=$1',[runId]);
+  if(!q.rows[0])return null;
+  const a=analyzeLoadTestRun(q.rows[0]);
+  await pool.query('UPDATE load_test_runs SET capacity_score=$1,estimated_nodes=$2,bottleneck=$3,analysis=$4::jsonb WHERE run_id=$5',[a.score,a.estimatedNodes,a.bottleneck,JSON.stringify(a),runId]);
+  return a;
+}
+
 app.post('/api/load-test/run/finish',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100);if(!runId)return res.status(400).json({error:'runId required'});
@@ -1350,7 +1399,8 @@ app.post('/api/load-test/run/finish',loadTestAuth,async(req,res,next)=>{
     await pool.query(`UPDATE load_test_runs SET completed_at=$1,status=$2,total_requests=$3,success_count=$4,error_count=$5,rps=$6,p50_ms=$7,p95_ms=$8,p99_ms=$9,max_ms=$10,detail=COALESCE(detail,'{}'::jsonb)||$11::jsonb WHERE run_id=$12`,
       [now(),String(b.status||'completed').slice(0,30),nums('totalRequests'),nums('successCount'),nums('errorCount'),nums('rps'),nums('p50Ms'),nums('p95Ms'),nums('p99Ms'),nums('maxMs'),JSON.stringify(detail),runId]);
     const active=Number((await pool.query('SELECT COUNT(*)::int AS n FROM load_test_nodes WHERE run_id=$1',[runId])).rows[0]?.n||0);
-    res.json({ok:true,runId,virtualNodesSeen:active});
+    const analysis=await persistLoadTestAnalysis(runId);
+    res.json({ok:true,runId,virtualNodesSeen:active,analysis});
   }catch(e){next(e)}
 });
 
@@ -1358,7 +1408,12 @@ app.get('/api/super/load-tests',superAuth,async(req,res,next)=>{
   try{
     const {rows}=await pool.query('SELECT * FROM load_test_runs ORDER BY started_at DESC LIMIT 50');
     const active=Number((await pool.query("SELECT COUNT(*)::int AS n FROM load_test_nodes WHERE last_seen_at >= $1",[new Date(Date.now()-60000).toISOString()])).rows[0]?.n||0);
-    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:rows});
+    const completed=rows.filter(r=>String(r.status||'').startsWith('completed'));
+    const analyzed=completed.map(r=>{const a=(r.analysis&&Object.keys(r.analysis).length)?r.analysis:analyzeLoadTestRun(r);return {...r,analysis:a,capacity_score:Number(r.capacity_score||a.score||0),estimated_nodes:Number(r.estimated_nodes||a.estimatedNodes||0),bottleneck:r.bottleneck||a.bottleneck};});
+    const best=analyzed.slice().sort((a,b)=>Number(b.estimated_nodes||0)-Number(a.estimated_nodes||0))[0]||null;
+    const latest=analyzed[0]||null;
+    const capacity={latest:latest?latest.analysis:null,best:best?best.analysis:null,bestRunId:best?.run_id||'',testedMaxNodes:analyzed.reduce((m,r)=>Math.max(m,Number(r.target_nodes||0)),0),recommendation:!analyzed.length?'尚無測試資料':(best?.analysis?.score>=80?`目前證據支持約 ${Number(best.analysis.recommendedNodes||0).toLocaleString()} 個節點等級；正式容量仍應保留至少 20% 餘裕。`:'目前測試尚未達到穩定商用門檻，先處理瓶頸再提高節點數。')};
+    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:analyzed,capacity});
   }catch(e){next(e)}
 });
 
@@ -1729,7 +1784,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.35',apiVersion:'2.4.47',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.36',apiVersion:'2.4.48',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
