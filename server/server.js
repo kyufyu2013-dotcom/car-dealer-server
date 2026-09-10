@@ -195,7 +195,7 @@ function compareSemver(a,b){
 async function getDesktopUpdatePolicy(client=pool){
   const {rows}=await client.query('SELECT * FROM desktop_update_policy WHERE id=1');
   const r=rows[0]||{};
-  return {enabled:!!r.enabled,channel:String(r.channel||'stable'),latestVersion:cleanSemver(r.latest_version||'0.9.3'),minimumVersion:cleanSemver(r.minimum_version||'0.0.0'),downloadUrl:String(r.download_url||''),releaseNotes:String(r.release_notes||''),packageSha256:String(r.package_sha256||'').toLowerCase(),packageSignature:String(r.package_signature||''),updatedAt:r.updated_at||'',updatedBy:r.updated_by||''};
+  return {enabled:!!r.enabled,channel:String(r.channel||'stable'),latestVersion:cleanSemver(r.latest_version||'0.9.5'),minimumVersion:cleanSemver(r.minimum_version||'0.0.0'),downloadUrl:String(r.download_url||''),releaseNotes:String(r.release_notes||''),packageSha256:String(r.package_sha256||'').toLowerCase(),packageSignature:String(r.package_signature||''),updatedAt:r.updated_at||'',updatedBy:r.updated_by||''};
 }
 function signUpdateManifestPayload(payload){
   const body=b64url(JSON.stringify(payload));
@@ -260,7 +260,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=4;
+const SERVER_SCHEMA_TARGET=5;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -408,7 +408,7 @@ const SERVER_MIGRATIONS=[
         id INTEGER PRIMARY KEY CHECK(id=1),
         enabled BOOLEAN NOT NULL DEFAULT FALSE,
         channel TEXT NOT NULL DEFAULT 'stable',
-        latest_version TEXT NOT NULL DEFAULT '0.9.3',
+        latest_version TEXT NOT NULL DEFAULT '0.9.5',
         minimum_version TEXT NOT NULL DEFAULT '0.0.0',
         download_url TEXT NOT NULL DEFAULT '',
         release_notes TEXT NOT NULL DEFAULT '',
@@ -418,8 +418,29 @@ const SERVER_MIGRATIONS=[
         updated_by TEXT NOT NULL DEFAULT ''
       );
       INSERT INTO desktop_update_policy(id,enabled,channel,latest_version,minimum_version,download_url,release_notes,package_sha256,package_signature,updated_at,updated_by)
-      VALUES(1,FALSE,'stable','0.9.3','0.0.0','','','','',CURRENT_TIMESTAMP::text,'migration')
+      VALUES(1,FALSE,'stable','0.9.5','0.0.0','','','','',CURRENT_TIMESTAMP::text,'migration')
       ON CONFLICT(id) DO NOTHING;
+    `
+  },
+  {
+    version:5,
+    name:'phase6c-desktop-update-events',
+    sql:`
+      CREATE TABLE IF NOT EXISTS desktop_update_events(
+        id BIGSERIAL PRIMARY KEY,
+        company_id TEXT NOT NULL DEFAULT '',
+        attempt_id TEXT NOT NULL,
+        from_version TEXT NOT NULL DEFAULT '',
+        target_version TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        detail TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_update_attempt ON desktop_update_events(company_id,attempt_id);
+      CREATE INDEX IF NOT EXISTS idx_update_events_time ON desktop_update_events(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_update_events_company ON desktop_update_events(company_id,updated_at DESC);
     `
   }
 ];
@@ -559,7 +580,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.42',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6a-signed-update-policy'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.43',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase6c-update-observability'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1370,6 +1391,32 @@ app.get('/api/super/companies/:id/sync-events',superAuth,async(req,res,next)=>{
     const limit=Math.max(1,Math.min(200,Number(req.query.limit||100)));
     const {rows}=await pool.query('SELECT id,event_type,status,message,actor,operation_id,created_at FROM sync_events WHERE company_id=$1 ORDER BY id DESC LIMIT $2',[req.params.id,limit]);
     res.json({events:rows});
+  }catch(e){next(e)}
+});
+
+app.post('/api/node/update-report',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可回報更新狀態'});
+    const b=req.body||{},attemptId=String(b.attemptId||'').trim().slice(0,120);
+    if(!attemptId)return res.status(400).json({error:'缺少更新識別碼'});
+    const allowed=new Set(['download_started','install_launched','success','failed']);
+    const status=allowed.has(String(b.status||''))?String(b.status):'failed';
+    const detail=String(b.detail||'').slice(0,1000),ts=now();
+    const completed=['success','failed'].includes(status)?ts:null;
+    await pool.query(`INSERT INTO desktop_update_events(company_id,attempt_id,from_version,target_version,status,detail,started_at,updated_at,completed_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$7,$8)
+      ON CONFLICT(company_id,attempt_id) DO UPDATE SET from_version=excluded.from_version,target_version=excluded.target_version,status=excluded.status,detail=excluded.detail,updated_at=excluded.updated_at,completed_at=COALESCE(excluded.completed_at,desktop_update_events.completed_at)`,
+      [req.auth.companyId,attemptId,cleanSemver(b.fromVersion||'0.0.0'),cleanSemver(b.targetVersion||'0.0.0'),status,detail,ts,completed]);
+    if(status==='failed')await recordDiagnostic(req.auth.companyId,'UPDATE_INSTALL_001','desktop_update',detail||'Desktop 更新失敗',{severity:'error',appVersion:b.fromVersion||'',actor:req.auth.username||'',context:{attemptId,targetVersion:b.targetVersion||''}});
+    res.json({ok:true,status});
+  }catch(e){next(e)}
+});
+
+app.get('/api/super/update-events',superAuth,async(req,res,next)=>{
+  try{
+    const limit=Math.max(1,Math.min(500,Number(req.query.limit||200)));
+    const rows=(await pool.query(`SELECT e.*,c.name AS company_name FROM desktop_update_events e LEFT JOIN companies c ON c.id=e.company_id ORDER BY e.updated_at DESC LIMIT $1`,[limit])).rows;
+    res.json({events:rows,generatedAt:now()});
   }catch(e){next(e)}
 });
 
