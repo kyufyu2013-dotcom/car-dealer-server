@@ -856,14 +856,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.50',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.51',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.50',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8c-super-managed-loadtest-performance-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.51',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase8c-super-managed-loadtest-direct-performance-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1399,7 +1399,7 @@ app.post('/api/load-test/heartbeat',loadTestAuth,async(req,res,next)=>{
   try{
     const b=req.body||{},runId=String(b.runId||'').slice(0,100),nodeId=String(b.nodeId||'').slice(0,120),virtualCompanyId=String(b.companyId||'').slice(0,120);
     if(!runId||!nodeId||!virtualCompanyId)return res.status(400).json({error:'runId/nodeId/companyId required'});
-    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.2').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
+    const seq=Math.max(0,Number(b.seq||0)),appVersion=String(b.appVersion||'0.10.3').slice(0,40),payloadBytes=Math.max(0,Math.min(1000000,Number(b.payloadBytes||0)));
     await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
       VALUES($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
@@ -1481,7 +1481,7 @@ async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIn
             await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at)
               VALUES($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,virtual_company_id=EXCLUDED.virtual_company_id,app_version=EXCLUDED.app_version,last_seq=EXCLUDED.last_seq,payload_bytes=EXCLUDED.payload_bytes,last_seen_at=EXCLUDED.last_seen_at`,
-              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.2',seq,512,now()]);
+              [`managed_${runId}_${n}`,runId,`managed_company_${n}`,'0.10.3',seq,512,now()]);
             rt.successCount++;
           }catch(e){rt.errorCount++;rt.lastError=String(e?.message||e).slice(0,500)}
           finally{const ms=Number(process.hrtime.bigint()-t0)/1e6;latencies.push(ms);if(latencies.length>200000)latencies.splice(0,latencies.length-100000);rt.totalRequests++;}
@@ -1508,8 +1508,6 @@ async function runManagedLoadTest({runId,targetNodes,durationSeconds,heartbeatIn
 
 app.post('/api/super/load-tests/start',superAuth,async(req,res,next)=>{
   try{
-    if(!LOAD_TEST_ENABLED)return res.status(409).json({error:'壓力測試目前未啟用。請先在 Server 設定 LOAD_TEST_ENABLED=true。'});
-    if(!LOAD_TEST_TOKEN||LOAD_TEST_TOKEN.length<16)return res.status(409).json({error:'LOAD_TEST_TOKEN 尚未設定或長度不足 16 字元。'});
     if(managedLoadTest.running)return res.status(409).json({error:'目前已有壓力測試正在執行。'});
     const b=req.body||{};
     const allowedNodes=[100,1000,5000,10000],allowedDurations=[30,60,300];
@@ -1544,7 +1542,7 @@ app.get('/api/super/load-tests',superAuth,async(req,res,next)=>{
     const best=analyzed.slice().sort((a,b)=>Number(b.estimated_nodes||0)-Number(a.estimated_nodes||0))[0]||null;
     const latest=analyzed[0]||null;
     const capacity={latest:latest?latest.analysis:null,best:best?best.analysis:null,bestRunId:best?.run_id||'',testedMaxNodes:analyzed.reduce((m,r)=>Math.max(m,Number(r.target_nodes||0)),0),recommendation:!analyzed.length?'尚無測試資料':(best?.analysis?.score>=80?`目前證據支持約 ${Number(best.analysis.recommendedNodes||0).toLocaleString()} 個節點等級；正式容量仍應保留至少 20% 餘裕。`:'目前測試尚未達到穩定商用門檻，先處理瓶頸再提高節點數。')};
-    res.json({enabled:LOAD_TEST_ENABLED,maxRps:LOAD_TEST_MAX_RPS,tokenConfigured:LOAD_TEST_TOKEN.length>=16,activeVirtualNodes:active,runs:analyzed,capacity,managed:{...managedLoadTest,expectedRps:managedLoadTest.targetNodes?managedLoadTest.targetNodes/(managedLoadTest.heartbeatIntervalMs/1000):0}});
+    res.json({managedReady:true,maxRps:LOAD_TEST_MAX_RPS,activeVirtualNodes:active,runs:analyzed,capacity,managed:{...managedLoadTest,expectedRps:managedLoadTest.targetNodes?managedLoadTest.targetNodes/(managedLoadTest.heartbeatIntervalMs/1000):0}});
   }catch(e){next(e)}
 });
 
@@ -1915,7 +1913,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.38',apiVersion:'2.4.50',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.39',apiVersion:'2.4.51',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
