@@ -15,6 +15,22 @@ const JWT_SECRET = process.env.JWT_SECRET || 'DEV_ONLY_CHANGE_THIS_SECRET_BEFORE
 const SUPER_ADMIN_USER = process.env.SUPER_ADMIN_USER || 'm200530366';
 const SUPER_ADMIN_PASSWORD = process.env.SUPER_ADMIN_PASSWORD || '00000000';
 const DATABASE_URL = process.env.DATABASE_URL;
+// Production: set OFFLINE_LICENSE_PRIVATE_KEY / OFFLINE_LICENSE_PUBLIC_KEY in the server environment.
+// The bundled key is a development fallback so the package works immediately; rotate it before paid rollout.
+const OFFLINE_LICENSE_PRIVATE_KEY = (process.env.OFFLINE_LICENSE_PRIVATE_KEY || `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIC7vypfOaya2RQ/Or9GJ39xf4+0BoqDt939beqY0QHYS
+-----END PRIVATE KEY-----`).replace(/\\n/g,'\n');
+const OFFLINE_LICENSE_PUBLIC_KEY = (process.env.OFFLINE_LICENSE_PUBLIC_KEY || `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA9HcbP6jcb7lfwCpp5gw1Jm5lB6aDGyCy2XbY4/uyXJU=
+-----END PUBLIC KEY-----`).replace(/\\n/g,'\n');
+const OFFLINE_GRACE_SECONDS = 72*60*60;
+function b64url(v){return Buffer.from(v).toString('base64url')}
+function offlineVerifier(password){const salt=crypto.randomBytes(16).toString('hex');const hash=crypto.scryptSync(String(password),salt,64,{N:16384,r:8,p:1}).toString('hex');return `${salt}:${hash}`;}
+function issueOfflineTicket(company,user,password,seconds=OFFLINE_GRACE_SECONDS){
+  const issuedAtMs=Date.now(); const duration=Math.max(5,Math.min(Number(seconds)||OFFLINE_GRACE_SECONDS,OFFLINE_GRACE_SECONDS));
+  const payload={v:1,company:companyDto(company),user:userDto(user),companyId:company.id,userId:user.id,username:user.username,role:user.role,tokenVersion:Number(user.token_version||0),issuedAtMs,offlineUntilMs:issuedAtMs+duration*1000,offlineVerifier:offlineVerifier(password)};
+  const body=b64url(JSON.stringify(payload)); const sig=crypto.sign(null,Buffer.from(body),OFFLINE_LICENSE_PRIVATE_KEY).toString('base64url'); return `${body}.${sig}`;
+}
 
 if (!DATABASE_URL) {
   console.error('FATAL: DATABASE_URL is missing.');
@@ -71,6 +87,8 @@ function companyDto(c){
     contactEmail:c.contact_email||'',
     trial:!!c.trial,
     status:companyStatus(c),
+    lastOnlineAt:c.last_auth_at||'',
+    trialRemainingSeconds:c.expires_at?Math.max(0,Math.floor((new Date(c.expires_at+'T23:59:59+08:00').getTime()-Date.now())/1000)):null,
     mainUsername:c.main_username||''
   };
 }
@@ -158,7 +176,8 @@ async function initDb(){
       created_at TEXT NOT NULL,
       created_by TEXT NOT NULL DEFAULT 'self',
       contact_email TEXT,
-      trial BOOLEAN NOT NULL DEFAULT TRUE
+      trial BOOLEAN NOT NULL DEFAULT TRUE,
+      last_auth_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS users(
@@ -182,6 +201,7 @@ async function initDb(){
       updated_at TEXT NOT NULL
     );
 
+    ALTER TABLE companies ADD COLUMN IF NOT EXISTS last_auth_at TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS base_salary DOUBLE PRECISION NOT NULL DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TEXT;
@@ -195,6 +215,14 @@ async function initDb(){
       last_seen_at TEXT NOT NULL,
       local_data_bytes BIGINT NOT NULL DEFAULT 0,
       capabilities JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE TABLE IF NOT EXISTS offline_license_tests(
+      company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+      enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      duration_seconds INTEGER NOT NULL DEFAULT 60,
+      simulate_outage BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS dealer_node_requests(
@@ -286,7 +314,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.17',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.18',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -343,7 +371,8 @@ app.post('/api/company/register',async(req,res,next)=>{
     `,[companyCode,1,JSON.stringify(snapshot),now()]);
     await client.query('COMMIT');
 
-    res.json({token:signUser(user),company:companyDto({...company,main_username:username}),user:userDto(user),snapshot,version:1});
+    const registeredCompany={...company,main_username:username};
+    res.json({token:signUser(user),company:companyDto(registeredCompany),user:userDto(user),snapshot,version:1,offlineTicket:issueOfflineTicket(registeredCompany,user,password,OFFLINE_GRACE_SECONDS),offlinePolicy:{graceSeconds:OFFLINE_GRACE_SECONDS,test:false}});
   }catch(e){
     try{ await client.query('ROLLBACK'); }catch{}
     next(e);
@@ -362,8 +391,13 @@ app.post('/api/auth/login',async(req,res,next)=>{
     const u=rows[0];
     if(!u||!verifyPassword(password,u.password_hash))return res.status(401).json({error:'帳號或密碼錯誤'});
 
+    const test=(await pool.query('SELECT * FROM offline_license_tests WHERE company_id=$1',[companyCode])).rows[0];
+    if(test?.enabled && test?.simulate_outage)return res.status(503).json({error:'授權服務暫時無回應',offlineFaultTest:true});
     const snap=await getSnapshot(companyCode);
-    res.json({token:signUser(u),company:companyDto(c),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
+    await pool.query('UPDATE companies SET last_auth_at=$1 WHERE id=$2',[now(),companyCode]);
+    const fresh=await getCompany(companyCode);
+    const offlineSeconds=test?.enabled?Number(test.duration_seconds||60):OFFLINE_GRACE_SECONDS;
+    res.json({token:signUser(u),company:companyDto(fresh),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,offlineTicket:issueOfflineTicket(fresh,u,password,offlineSeconds),offlinePolicy:{graceSeconds:offlineSeconds,test:!!test?.enabled}});
   }catch(e){ next(e); }
 });
 
@@ -994,6 +1028,10 @@ app.post('/api/node/commands/:id/result',auth,requireActiveCompany,async(req,res
     res.json({ok:true});
   }catch(e){next(e)}
 });
+
+
+app.get('/api/super/companies/:id/offline-test',superAuth,async(req,res,next)=>{try{const r=(await pool.query('SELECT * FROM offline_license_tests WHERE company_id=$1',[req.params.id])).rows[0];res.json({enabled:!!r?.enabled,durationSeconds:Number(r?.duration_seconds||60),simulateOutage:!!r?.simulate_outage,updatedAt:r?.updated_at||null});}catch(e){next(e)}});
+app.put('/api/super/companies/:id/offline-test',superAuth,async(req,res,next)=>{try{const b=req.body||{};const sec=Math.max(5,Math.min(259200,Number(b.durationSeconds||60)));await pool.query(`INSERT INTO offline_license_tests(company_id,enabled,duration_seconds,simulate_outage,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id) DO UPDATE SET enabled=excluded.enabled,duration_seconds=excluded.duration_seconds,simulate_outage=excluded.simulate_outage,updated_at=excluded.updated_at`,[req.params.id,!!b.enabled,sec,!!b.simulateOutage,now()]);res.json({ok:true,enabled:!!b.enabled,durationSeconds:sec,simulateOutage:!!b.simulateOutage});}catch(e){next(e)}});
 
 app.get('/api/super/data',superAuth,async(req,res,next)=>{
   try{
