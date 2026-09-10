@@ -164,12 +164,15 @@ function snapshotForUser(snapshot,user){
   return user?.role==='sales'?salesSafeSnapshot(snapshot,user):snapshot;
 }
 
-function signUser(u){
+function signUser(u,rememberLogin=false){
   return jwt.sign(
-    {sub:u.id,companyId:u.company_id,role:u.role,username:u.username,tokenVersion:Number(u.token_version||0)},
+    {sub:u.id,companyId:u.company_id,role:u.role,username:u.username,tokenVersion:Number(u.token_version||0),rememberLogin:!!rememberLogin},
     JWT_SECRET,
-    {expiresIn:'12h'}
+    {expiresIn:rememberLogin?'15d':'12h'}
   );
+}
+function refreshedUserToken(req,u){
+  return req?.auth?.rememberLogin?signUser(u,true):null;
 }
 function signSuper(){
   return jwt.sign({sub:'platform-admin',role:'platformAdmin'},JWT_SECRET,{expiresIn:'12h'});
@@ -324,7 +327,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.27',architecture:'local-first-phase3'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.28',architecture:'local-first-phase3'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -391,7 +394,7 @@ app.post('/api/company/register',async(req,res,next)=>{
 
 app.post('/api/auth/login',async(req,res,next)=>{
   try{
-    const {companyCode,username,password}=req.body||{};
+    const {companyCode,username,password,rememberLogin=false}=req.body||{};
     const c=await getCompany(companyCode);
     if(!c)return res.status(401).json({error:'找不到此車行代碼'});
     const st=companyStatus(c);
@@ -407,7 +410,7 @@ app.post('/api/auth/login',async(req,res,next)=>{
     await pool.query('UPDATE companies SET last_auth_at=$1 WHERE id=$2',[now(),companyCode]);
     const fresh=await getCompany(companyCode);
     const offlineSeconds=test?.enabled?Number(test.duration_seconds||60):OFFLINE_GRACE_SECONDS;
-    res.json({token:signUser(u),company:companyDto(fresh),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,offlineTicket:issueOfflineTicket(fresh,u,password,offlineSeconds),offlinePolicy:{graceSeconds:offlineSeconds,test:!!test?.enabled}});
+    res.json({token:signUser(u,!!rememberLogin),company:companyDto(fresh),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,offlineTicket:issueOfflineTicket(fresh,u,password,offlineSeconds),offlinePolicy:{graceSeconds:offlineSeconds,test:!!test?.enabled},rememberLogin:!!rememberLogin});
   }catch(e){ next(e); }
 });
 
@@ -416,7 +419,7 @@ app.get('/api/session/restore',auth,requireActiveCompany,async(req,res,next)=>{
     const u=await getUserById(req.auth.companyId,req.auth.sub);
     if(!u)return res.status(401).json({error:'帳號已失效'});
     const snap=await getSnapshot(req.auth.companyId);
-    res.json({company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
+    res.json({token:refreshedUserToken(req,u),company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version});
   }catch(e){ next(e); }
 });
 
@@ -433,7 +436,7 @@ app.get('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
     const u=await getUserById(req.auth.companyId,req.auth.sub);
     if(!u)return res.status(401).json({error:'帳號已失效'});
     const snap=await getSnapshot(req.auth.companyId);
-    res.json({company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,updatedAt:snap.updatedAt});
+    res.json({token:refreshedUserToken(req,u),company:companyDto(req.company),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,updatedAt:snap.updatedAt});
   }catch(e){ next(e); }
 });
 
