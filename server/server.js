@@ -453,7 +453,7 @@ app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.36',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4b-migration-safety'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.38',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase4b-migration-safety'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1245,11 +1245,11 @@ app.get('/api/super/health',superAuth,async(req,res,next)=>{
     const companies=(await pool.query('SELECT * FROM companies ORDER BY created_at DESC')).rows;
     const nodes=(await pool.query('SELECT * FROM dealer_nodes')).rows;
     const snaps=(await pool.query('SELECT company_id,updated_at FROM snapshots')).rows;
-    const failed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM sync_events WHERE status<>'ok' AND created_at>$1 GROUP BY company_id",[new Date(Date.now()-24*3600*1000).toISOString()])).rows;
+    const failed=(await pool.query("SELECT company_id,COUNT(*)::int n FROM sync_events WHERE status<>'ok' AND event_type<>'node_offline' AND created_at>$1 GROUP BY company_id",[new Date(Date.now()-24*3600*1000).toISOString()])).rows;
     const nb=new Map(nodes.map(x=>[x.company_id,x])),sb=new Map(snaps.map(x=>[x.company_id,x])),fb=new Map(failed.map(x=>[x.company_id,Number(x.n||0)]));
     const rows=companies.map(c=>{
-      const n=nb.get(c.id),st=sb.get(c.id);let score=0;const issues=[];
-      if(nodeOnline(n)){score+=40}else issues.push('Dealer Node 離線');
+      const n=nb.get(c.id),st=sb.get(c.id);let score=40;const issues=[];
+      // Node 在線/離線屬於營業主機使用狀態，只保留狀態與事件紀錄，不納入健康度扣分。
       if(c.enabled){score+=20}else issues.push('車行已停用');
       const authAge=Date.now()-Date.parse(c.last_auth_at||'');if(Number.isFinite(authAge)&&authAge<7*86400000)score+=20;else issues.push('最近 7 天無授權登入');
       const snapAge=Date.now()-Date.parse(st?.updated_at||'');if(Number.isFinite(snapAge)&&snapAge<2*86400000)score+=20;else if(Number.isFinite(snapAge)&&snapAge<7*86400000){score+=10;issues.push('資料同步超過 2 天')}else issues.push('資料同步超過 7 天');
