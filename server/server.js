@@ -117,7 +117,7 @@ async function phase9eDisasterRecovery(j){
   let stage='尋找最近備份',b=null,backupSource='latest-existing',freshBackupReason='';
   const start=Date.now();
   try{
-    b=(await pool.query("SELECT backup_id,created_at,started_at,completed_at,local_path,offsite_status,verification_status,drill_status,row_count,table_count FROM central_backup_events WHERE status IN ('success','partial') ORDER BY id DESC LIMIT 1")).rows[0]||null;
+    b=(await pool.query("SELECT backup_id,started_at,completed_at,local_path,offsite_status,verification_status,drill_status,row_count,table_count FROM central_backup_events WHERE status IN ('success','partial') ORDER BY id DESC LIMIT 1")).rows[0]||null;
     // Render 的本機磁碟可能在重新部署後被清空；如果 DB 還留著舊備份紀錄、但實體檔已不存在，
     // 9E 會自動建立一份新的隔離驗證備份，避免只因 ephemeral disk 而得到沒有意義的 FAIL。
     if(b?.local_path){
@@ -126,7 +126,7 @@ async function phase9eDisasterRecovery(j){
     if(!b){
       stage='建立本次 9E 驗證用中央備份';
       const created=await createCentralBackup('resilience_9e',j.actor);
-      b=(await pool.query('SELECT backup_id,created_at,started_at,completed_at,local_path,offsite_status,verification_status,drill_status,row_count,table_count FROM central_backup_events WHERE backup_id=$1',[created.backupId])).rows[0];
+      b=(await pool.query('SELECT backup_id,started_at,completed_at,local_path,offsite_status,verification_status,drill_status,row_count,table_count FROM central_backup_events WHERE backup_id=$1',[created.backupId])).rows[0];
       backupSource='fresh-created-for-9e';
     }
     stage='驗證備份完整性';
@@ -135,7 +135,7 @@ async function phase9eDisasterRecovery(j){
     const r=await drillCentralBackup(b.backup_id,j.actor);
     stage='計算 RTO / RPO';
     const rto=(Date.now()-start)/1000;
-    const backupAt=Date.parse(verified.createdAt||b.created_at||b.completed_at||b.started_at||'');
+    const backupAt=Date.parse(verified.createdAt||b.completed_at||b.started_at||'');
     const rpo=Number.isFinite(backupAt)?Math.max(0,(Date.now()-backupAt)/1000):null;
     return finishSuiteRun(j,'passed',{backupId:b.backup_id,restoreId:r.restoreId,rowCount:r.rowCount,tableCount:r.tableCount,rtoSeconds:rto,rpoSeconds:rpo,mode:'transactional-temp-table-drill',productionDataChanged:false,backupSource,freshBackupReason,verification:'passed',detail:`備份驗證與隔離 Restore Drill 通過，共驗證 ${Number(r.rowCount||0).toLocaleString()} 筆資料。`})
   }catch(e){
@@ -1127,14 +1127,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.3',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.4',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.3',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.4',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2184,7 +2184,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.5.3',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.5.4',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
