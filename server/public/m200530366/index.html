@@ -19,6 +19,15 @@ button,input,select{font:inherit}button{cursor:pointer}
 .brand{font-size:20px;font-weight:700;margin-bottom:5px}.subbrand{font-size:12px;color:#9ca3af;margin-bottom:22px}
 .nav button{width:100%;text-align:left;border:0;background:transparent;color:#d1d5db;padding:11px;border-radius:8px;margin:2px 0}
 .nav button:hover,.nav button.active{background:#374151;color:#fff}
+.nav-section{font-size:11px;color:#6b7280;font-weight:700;letter-spacing:.08em;padding:14px 10px 5px;text-transform:uppercase}
+.nav-section:first-child{padding-top:2px}
+.nav-advanced{margin-top:8px;border-top:1px solid #253044;padding-top:8px}
+.nav-advanced summary{list-style:none;cursor:pointer;color:#e5e7eb;padding:11px;border-radius:8px;font-weight:700;user-select:none}
+.nav-advanced summary::-webkit-details-marker{display:none}
+.nav-advanced summary:hover{background:#253044}
+.nav-advanced[open] summary{background:#1f2937;margin-bottom:4px}
+.nav-advanced button{padding-left:20px!important;color:#b9c2cf!important}
+.nav-advanced button.active{color:#fff!important}
 .content{flex:1;min-width:0;padding:22px}.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px}
 .top h1{font-size:25px;margin:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;margin-bottom:18px}
 .card,.panel{background:#fff;border-radius:14px;padding:18px;box-shadow:0 4px 18px #0000000b}
@@ -58,20 +67,27 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
       <div class="brand">🚘 Super Admin</div>
       <div class="subbrand">全車行資料中心</div>
       <div class="nav">
+        <div class="nav-section">日常營運</div>
         <button id="navOverview" class="active" onclick="showPage('overview')">🏢 車行總覽</button>
         <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
         <button id="navSales" onclick="showPage('sales')">💰 全部成交</button>
         <button id="navUsers" onclick="showPage('users')">👥 全部帳號</button>
+
+        <div class="nav-section">系統管理</div>
         <button id="navHealth" onclick="showPage('health')">🩺 系統健康</button>
         <button id="navDiagnostics" onclick="showPage('diagnostics')">🧰 錯誤診斷</button>
-        <button id="navUpdates" onclick="showPage('updates')">🚀 版本更新</button>
         <button id="navBackups" onclick="showPage('backups')">🛡️ 中央備份</button>
-        <button id="navHa" onclick="showPage('ha')">🛰️ 容災架構</button>
-        <button id="navLoadtest" onclick="showPage('loadtest')">⚙️ 壓力測試</button>
-        <button id="navPerformance" onclick="showPage('performance')">📊 效能監控</button>
-        <button id="navResilience" onclick="showPage('resilience')">🧯 故障演練</button>
         <button id="navSecurity" onclick="showPage('security')">🛡️ 安全與稽核</button>
-        <button id="navCommercial" onclick="showPage('commercial')">🚀 商用上線</button>
+        <button id="navUpdates" onclick="showPage('updates')">🚀 版本更新</button>
+
+        <details class="nav-advanced" id="advancedOps">
+          <summary>🔧 進階維運 ▾</summary>
+          <button id="navHa" onclick="showPage('ha')">🛰️ 容災架構</button>
+          <button id="navLoadtest" onclick="showPage('loadtest')">⚙️ 壓力測試</button>
+          <button id="navPerformance" onclick="showPage('performance')">📊 效能監控</button>
+          <button id="navResilience" onclick="showPage('resilience')">🧯 故障演練</button>
+          <button id="navCommercial" onclick="showPage('commercial')">🚀 商用上線驗收</button>
+        </details>
       </div>
     </aside>
     <main class="content">
@@ -171,6 +187,7 @@ loginPass.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 function showPage(p){
   currentPage=p;saveSession();
   ["overview","vehicles","sales","users","health","diagnostics","updates","backups","ha","loadtest","performance","resilience","security","commercial"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1)).classList.toggle("active",x===p));
+  const adv=document.getElementById("advancedOps");if(adv&&["ha","loadtest","performance","resilience","commercial"].includes(p))adv.open=true;
   const titles={overview:"車行總覽",vehicles:"全部車輛",sales:"全部成交",users:"全部帳號",health:"系統健康",diagnostics:"錯誤診斷",updates:"版本更新",backups:"中央備份",ha:"容災架構",loadtest:"壓力測試",performance:"效能監控",resilience:"故障演練",security:"安全與稽核",commercial:"商用上線"};pageTitle.textContent=titles[p]||"Super Admin";
   if(p==="diagnostics"&&Date.now()-lastDiagnosticsAt>5000)refreshDiagnostics(false);else if(p==="backups"&&Date.now()-lastBackupsAt>5000)refreshBackups(false);else if(p==="ha"&&Date.now()-lastHaAt>5000)refreshHa(false);else if(p==="loadtest"&&Date.now()-lastLoadTestAt>5000)refreshLoadTests(false);else if(p==="performance"&&Date.now()-lastPerformanceAt>3000)refreshPerformance(false);else if(p==="resilience"&&Date.now()-lastResilienceAt>3000)refreshResilience(false);else if(p==="security")refreshSecurity(false);else if(p==="commercial")refreshCommercial(false);else renderCurrent();
 }
