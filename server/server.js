@@ -477,7 +477,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=17;
+const SERVER_SCHEMA_TARGET=18;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -968,6 +968,75 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_commercial_acceptance_time ON commercial_acceptance_events(created_at DESC);
       UPDATE desktop_update_policy SET updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v17' WHERE id=1;
     `
+  },
+  {
+    version:18,
+    name:'phase12-subscription-licensing-payment-provider-architecture',
+    sql:`
+      CREATE TABLE IF NOT EXISTS subscription_plans(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', active BOOLEAN NOT NULL DEFAULT TRUE,
+        price_cents BIGINT NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'TWD', billing_interval TEXT NOT NULL DEFAULT 'month',
+        billing_interval_count INTEGER NOT NULL DEFAULT 1, trial_days INTEGER NOT NULL DEFAULT 0, grace_days INTEGER NOT NULL DEFAULT 7,
+        max_nodes INTEGER NOT NULL DEFAULT 1, features JSONB NOT NULL DEFAULT '{}'::jsonb, sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_subscription_plans_active_sort ON subscription_plans(active,sort_order,name);
+
+      CREATE TABLE IF NOT EXISTS payment_providers(
+        id TEXT PRIMARY KEY, provider_type TEXT NOT NULL, display_name TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        mode TEXT NOT NULL DEFAULT 'test', webhook_enabled BOOLEAN NOT NULL DEFAULT FALSE, adapter_key TEXT NOT NULL DEFAULT '',
+        capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO payment_providers(id,provider_type,display_name,enabled,mode,webhook_enabled,adapter_key,capabilities,config,created_at,updated_at) VALUES
+        ('manual','manual','人工收款 / 銀行轉帳',TRUE,'live',FALSE,'manual','{"manualConfirm":true}'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text),
+        ('webhook_generic','webhook','Webhook 金流通知（預留）',FALSE,'test',TRUE,'generic_webhook','{"webhook":true,"oneTime":true}'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text),
+        ('credit_card','card','信用卡 / 定期扣款（預留）',FALSE,'test',TRUE,'card_adapter','{"card":true,"recurring":true,"oneTime":true}'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text),
+        ('virtual_account','virtual_account','ATM / 虛擬帳號（預留）',FALSE,'test',TRUE,'virtual_account_adapter','{"virtualAccount":true,"webhook":true}'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text),
+        ('wallet','wallet','第三方支付 / 行動錢包（預留）',FALSE,'test',TRUE,'wallet_adapter','{"wallet":true,"webhook":true}'::jsonb,'{}'::jsonb,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text)
+      ON CONFLICT(id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS dealer_subscriptions(
+        company_id TEXT PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE, plan_id TEXT REFERENCES subscription_plans(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'trial', current_period_start TEXT, current_period_end TEXT, grace_until TEXT,
+        auto_renew BOOLEAN NOT NULL DEFAULT FALSE, cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
+        provider_id TEXT REFERENCES payment_providers(id) ON DELETE SET NULL, external_customer_id TEXT NOT NULL DEFAULT '',
+        external_subscription_id TEXT NOT NULL DEFAULT '', payment_method_ref TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_dealer_subscriptions_status_end ON dealer_subscriptions(status,current_period_end);
+
+      CREATE TABLE IF NOT EXISTS payment_transactions(
+        id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        provider_id TEXT REFERENCES payment_providers(id) ON DELETE SET NULL, provider_transaction_id TEXT,
+        amount_cents BIGINT NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'TWD', payment_type TEXT NOT NULL DEFAULT 'manual',
+        status TEXT NOT NULL DEFAULT 'pending', description TEXT NOT NULL DEFAULT '', idempotency_key TEXT,
+        paid_at TEXT, confirmed_at TEXT, confirmed_by TEXT NOT NULL DEFAULT '', raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_provider_tx_unique ON payment_transactions(provider_id,provider_transaction_id) WHERE provider_transaction_id IS NOT NULL AND provider_transaction_id<>'';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_idempotency_unique ON payment_transactions(idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key<>'';
+      CREATE INDEX IF NOT EXISTS idx_payment_company_time ON payment_transactions(company_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_payment_status_time ON payment_transactions(status,created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS payment_webhook_events(
+        id BIGSERIAL PRIMARY KEY, provider_id TEXT NOT NULL, provider_event_id TEXT NOT NULL, event_type TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'received', transaction_id TEXT NOT NULL DEFAULT '', payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        error_text TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL, processed_at TEXT,
+        UNIQUE(provider_id,provider_event_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_payment_webhook_time ON payment_webhook_events(received_at DESC);
+
+      CREATE TABLE IF NOT EXISTS subscription_events(
+        id BIGSERIAL PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE, event_type TEXT NOT NULL,
+        old_status TEXT NOT NULL DEFAULT '', new_status TEXT NOT NULL DEFAULT '', old_period_end TEXT, new_period_end TEXT,
+        source TEXT NOT NULL DEFAULT '', reference_id TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_subscription_events_company_time ON subscription_events(company_id,created_at DESC);
+
+      UPDATE desktop_update_policy SET updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v18' WHERE id=1;
+    `
   }
 ];
 
@@ -1131,8 +1200,11 @@ async function requireActiveCompany(req,res,next){
     const c=await getCompany(req.auth.companyId);
     if(!c)return res.status(403).json({error:'車行不存在'});
     const st=companyStatus(c);
-    if(st!=='啟用中')return res.status(403).json({error:`車行授權狀態：${st}`});
-    req.company=c;
+    const billing=await subscriptionAccess(c.id);
+    if(['已停用','尚未啟用'].includes(st))return res.status(403).json({error:`車行授權狀態：${st}`});
+    if(!billing.managed&&st!=='啟用中')return res.status(403).json({error:`車行授權狀態：${st}`});
+    if(billing.managed&&!billing.allowed)return res.status(403).json({error:`訂閱授權狀態：${billing.status}`,subscriptionStatus:billing.status});
+    req.company=c;req.subscription=billing;
     next();
   }catch(e){ next(e); }
 }
@@ -1158,7 +1230,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'11.0.0',apiVersion:'3.1.3',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'12.0.0',apiVersion:'4.0.0',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -1223,6 +1295,16 @@ async function phase11ProductionReadiness(){
   return {status,note,acceptance,pilot,checkedAt:now()};
 }
 
+
+// Phase 12A-12D: Subscription & Licensing（訂閱、付款與授權中心）
+function dateOnly(v){return String(v||'').slice(0,10)}
+function addPlanPeriod(base,interval='month',count=1){const d=new Date(`${dateOnly(base)||today()}T12:00:00+08:00`),n=Math.max(1,Number(count)||1);if(interval==='year')d.setFullYear(d.getFullYear()+n);else if(interval==='day')d.setDate(d.getDate()+n);else d.setMonth(d.getMonth()+n);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function addDateDays(base,days=0){const d=new Date(`${dateOnly(base)||today()}T12:00:00+08:00`);d.setDate(d.getDate()+Number(days||0));return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+async function subscriptionAccess(companyId,client=pool){const q=await client.query(`SELECT s.*,p.name AS plan_name,p.grace_days,p.billing_interval,p.billing_interval_count,p.price_cents,p.currency FROM dealer_subscriptions s LEFT JOIN subscription_plans p ON p.id=s.plan_id WHERE s.company_id=$1`,[companyId]);const x=q.rows[0];if(!x)return {managed:false,status:'legacy',allowed:true};const t=today(),end=dateOnly(x.current_period_end),grace=dateOnly(x.grace_until);let status=String(x.status||'active'),allowed=true;if(['suspended','cancelled'].includes(status))allowed=false;else if(x.cancel_at_period_end&&end&&t>end){status='cancelled';allowed=false}else if(end&&t>end){if(grace&&t<=grace){status='grace_period';allowed=true}else{status='past_due';allowed=false}}else if(status==='past_due')status='active';return {managed:true,...x,status,allowed,planName:x.plan_name||'',periodEnd:end,graceUntil:grace}}
+async function refreshSubscriptionStatuses(){try{const rows=(await pool.query(`SELECT company_id,status,current_period_end,grace_until,cancel_at_period_end FROM dealer_subscriptions`)).rows,t=today();for(const r of rows){let n=r.status;const end=dateOnly(r.current_period_end),gr=dateOnly(r.grace_until);if(['suspended','cancelled'].includes(n))continue;if(r.cancel_at_period_end&&end&&t>end)n='cancelled';else if(end&&t>end)n=gr&&t<=gr?'grace_period':'past_due';else if(['past_due','grace_period','trial'].includes(n))n='active';if(n!==r.status)await pool.query(`UPDATE dealer_subscriptions SET status=$1,updated_at=$2 WHERE company_id=$3`,[n,now(),r.company_id])}}catch(e){console.warn('subscription status refresh failed:',e?.message||e)}}
+async function phase12Summary(){await refreshSubscriptionStatuses();const [plans,providers,subs,pays,events,companies]=await Promise.all([pool.query(`SELECT * FROM subscription_plans ORDER BY sort_order,name`),pool.query(`SELECT id,provider_type,display_name,enabled,mode,webhook_enabled,adapter_key,capabilities,created_at,updated_at FROM payment_providers ORDER BY CASE WHEN id='manual' THEN 0 ELSE 1 END,display_name`),pool.query(`SELECT s.*,c.name AS company_name,c.enabled,c.expires_at,p.name AS plan_name,p.price_cents,p.currency,p.billing_interval,p.billing_interval_count,p.grace_days FROM dealer_subscriptions s JOIN companies c ON c.id=s.company_id LEFT JOIN subscription_plans p ON p.id=s.plan_id ORDER BY c.name`),pool.query(`SELECT t.*,c.name AS company_name,pr.display_name AS provider_name FROM payment_transactions t JOIN companies c ON c.id=t.company_id LEFT JOIN payment_providers pr ON pr.id=t.provider_id ORDER BY t.created_at DESC LIMIT 100`),pool.query(`SELECT e.*,c.name AS company_name FROM subscription_events e JOIN companies c ON c.id=e.company_id ORDER BY e.id DESC LIMIT 100`),pool.query(`SELECT id,name,enabled,expires_at,trial FROM companies ORDER BY name`)]);return {serverVersion:'12.0.0',apiVersion:'4.0.0',plans:plans.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,events:events.rows,companies:companies.rows}}
+async function subscriptionEvent(client,companyId,eventType,o={}){await client.query(`INSERT INTO subscription_events(company_id,event_type,old_status,new_status,old_period_end,new_period_end,source,reference_id,actor,detail,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[companyId,eventType,o.oldStatus||'',o.newStatus||'',o.oldPeriodEnd||null,o.newPeriodEnd||null,o.source||'',o.referenceId||'',o.actor||'',o.detail||'',now()])}
+
 const app=express();
 app.disable('x-powered-by');
 app.use(securityHeaders);
@@ -1259,14 +1341,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'3.1.3',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'4.0.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'3.1.3',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase11-commercial-launch'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'4.0.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase12-subscription-licensing'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1337,7 +1419,10 @@ app.post('/api/auth/login',loginGuard('dealer'),async(req,res,next)=>{
     const c=await getCompany(companyCode);
     if(!c)return res.status(401).json({error:'找不到此車行代碼'});
     const st=companyStatus(c);
-    if(st!=='啟用中')return res.status(403).json({error:`車行目前${st}`});
+    const billing=await subscriptionAccess(c.id);
+    if(['已停用','尚未啟用'].includes(st))return res.status(403).json({error:`車行目前${st}`});
+    if(!billing.managed&&st!=='啟用中')return res.status(403).json({error:`車行目前${st}`});
+    if(billing.managed&&!billing.allowed)return res.status(403).json({error:`訂閱授權狀態：${billing.status}`,subscriptionStatus:billing.status});
 
     const {rows}=await pool.query('SELECT * FROM users WHERE company_id=$1 AND username=$2 AND enabled=TRUE',[companyCode,username]);
     const u=rows[0];
@@ -1349,7 +1434,7 @@ app.post('/api/auth/login',loginGuard('dealer'),async(req,res,next)=>{
     await pool.query('UPDATE companies SET last_auth_at=$1 WHERE id=$2',[now(),companyCode]);
     const fresh=await getCompany(companyCode);
     const offlineSeconds=test?.enabled?Number(test.duration_seconds||60):OFFLINE_GRACE_SECONDS;
-    res.json({token:signUser(u,!!rememberLogin),company:companyDto(fresh),user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,offlineTicket:issueOfflineTicket(fresh,u,password,offlineSeconds),offlinePolicy:{graceSeconds:offlineSeconds,test:!!test?.enabled},rememberLogin:!!rememberLogin});
+    res.json({token:signUser(u,!!rememberLogin),company:{...companyDto(fresh),subscription:billing.managed?{status:billing.status,planName:billing.planName,currentPeriodEnd:billing.periodEnd,graceUntil:billing.graceUntil,autoRenew:!!billing.auto_renew}:null},user:userDto(u),snapshot:snapshotForUser(snap.snapshot,u),version:snap.version,offlineTicket:issueOfflineTicket(fresh,u,password,offlineSeconds),offlinePolicy:{graceSeconds:offlineSeconds,test:!!test?.enabled},rememberLogin:!!rememberLogin});
   }catch(e){ next(e); }
 });
 
@@ -2295,7 +2380,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events'];
+const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -2316,7 +2401,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'11.0.0',apiVersion:'3.1.3',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'12.0.0',apiVersion:'4.0.0',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -2329,7 +2414,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events'];
+const CENTRAL_RESTORE_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
@@ -2802,16 +2887,27 @@ app.get('/api/super/security-center',superAuth,async(req,res,next)=>{try{const [
 app.get('/api/super/security/audit',superAuth,async(req,res,next)=>{try{const page=Math.max(1,Number(req.query.page||1)),limit=10,offset=(page-1)*limit,filter=String(req.query.category||'').trim();const where=filter?'WHERE category=$1':'';const params=filter?[filter]:[];const total=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM security_audit_events ${where}`,params)).rows[0]?.n||0);const rows=(await pool.query(`SELECT id,actor,actor_role,company_id,action,category,status,ip,target_type,target_id,detail,metadata,created_at FROM security_audit_events ${where} ORDER BY id DESC LIMIT 10 OFFSET ${offset}`,params)).rows;res.json({rows,page,pageSize:limit,total,totalPages:Math.max(1,Math.ceil(total/limit))})}catch(e){next(e)}});
 app.post('/api/super/security/integrity-check',superAuth,async(req,res,next)=>{try{const result=await phase10DataIntegritySummary();await auditSecurityEvent(req,{action:'phase10c_integrity_check',category:'data_integrity',status:result.status,detail:`duplicateUsers=${result.duplicateUsers}, missingSnapshots=${result.missingSnapshots}, saleProblems=${result.saleProblems}`});res.json(result)}catch(e){next(e)}});
 app.get('/api/super/security/release-readiness',superAuth,async(req,res,next)=>{try{res.json(await phase10ReleaseReadiness())}catch(e){next(e)}});
-app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'11.0.0','3.1.3',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
+app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'12.0.0','4.0.0',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
 app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const rows=(await pool.query(`SELECT * FROM release_control_events ORDER BY id DESC LIMIT 50`)).rows;res.json({rows})}catch(e){next(e)}});
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'11.0.0',apiVersion:'3.1.3',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'12.0.0',apiVersion:'4.0.0',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
-app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'11.0.0',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
+app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'12.0.0',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/cancel',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='cancelled',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_cancel',category:'commercial_launch',status:'success',targetType:'company',targetId:companyId,detail:'Pilot cancelled'});res.json({ok:true})}catch(e){next(e)}});
+
+
+// -------------------- Phase 12A-12D Subscription & Licensing Center --------------------
+app.get('/api/super/subscriptions',superAuth,async(req,res,next)=>{try{res.json(await phase12Summary())}catch(e){next(e)}});
+app.post('/api/super/subscriptions/plans',superAuth,async(req,res,next)=>{try{const b=req.body||{},name=String(b.name||'').trim();if(!name)return res.status(400).json({error:'請輸入方案名稱'});const id=String(b.id||`plan_${crypto.randomBytes(5).toString('hex')}`).replace(/[^A-Za-z0-9_-]/g,'').slice(0,60),interval=['month','year','day'].includes(b.billingInterval)?b.billingInterval:'month',ts=now();await pool.query(`INSERT INTO subscription_plans(id,name,description,active,price_cents,currency,billing_interval,billing_interval_count,trial_days,grace_days,max_nodes,features,sort_order,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$14) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,active=EXCLUDED.active,price_cents=EXCLUDED.price_cents,currency=EXCLUDED.currency,billing_interval=EXCLUDED.billing_interval,billing_interval_count=EXCLUDED.billing_interval_count,trial_days=EXCLUDED.trial_days,grace_days=EXCLUDED.grace_days,max_nodes=EXCLUDED.max_nodes,features=EXCLUDED.features,sort_order=EXCLUDED.sort_order,updated_at=EXCLUDED.updated_at`,[id,name,String(b.description||'').slice(0,500),b.active!==false,Math.max(0,Math.round(Number(b.price||0)*100)),String(b.currency||'TWD').slice(0,10),interval,Math.max(1,Number(b.billingIntervalCount)||1),Math.max(0,Number(b.trialDays)||0),Math.max(0,Number(b.graceDays)||0),Math.max(1,Number(b.maxNodes)||1),JSON.stringify(b.features&&typeof b.features==='object'?b.features:{}),Number(b.sortOrder)||0,ts]);res.json({ok:true,id})}catch(e){next(e)}});
+app.post('/api/super/subscriptions/assign',superAuth,async(req,res,next)=>{const client=await pool.connect();try{const companyId=String(req.body?.companyId||''),planId=String(req.body?.planId||'');if(!companyId||!planId)return res.status(400).json({error:'請選擇車行與方案'});await client.query('BEGIN');const plan=(await client.query('SELECT * FROM subscription_plans WHERE id=$1 AND active=TRUE',[planId])).rows[0],company=(await client.query('SELECT * FROM companies WHERE id=$1 FOR UPDATE',[companyId])).rows[0];if(!plan||!company){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車行或方案'})}const old=(await client.query('SELECT * FROM dealer_subscriptions WHERE company_id=$1 FOR UPDATE',[companyId])).rows[0],start=today(),end=old?.current_period_end||company.expires_at||addPlanPeriod(start,plan.billing_interval,plan.billing_interval_count),grace=addDateDays(end,plan.grace_days),ts=now();await client.query(`INSERT INTO dealer_subscriptions(company_id,plan_id,status,current_period_start,current_period_end,grace_until,auto_renew,cancel_at_period_end,provider_id,created_at,updated_at) VALUES($1,$2,'active',$3,$4,$5,FALSE,FALSE,'manual',$6,$6) ON CONFLICT(company_id) DO UPDATE SET plan_id=EXCLUDED.plan_id,status='active',grace_until=EXCLUDED.grace_until,updated_at=EXCLUDED.updated_at`,[companyId,planId,start,end,grace,ts]);await subscriptionEvent(client,companyId,'plan_assigned',{oldStatus:old?.status||'',newStatus:'active',oldPeriodEnd:old?.current_period_end,newPeriodEnd:end,source:'super_admin',actor:req.auth.username||req.auth.sub,detail:`指定方案：${plan.name}`});await client.query('COMMIT');res.json({ok:true})}catch(e){try{await client.query('ROLLBACK')}catch{}next(e)}finally{try{client.release()}catch{}}});
+app.post('/api/super/subscriptions/manual-payment',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||''),amount=Math.max(0,Number(req.body?.amount||0));if(!companyId)return res.status(400).json({error:'請選擇車行'});const sub=(await pool.query(`SELECT s.*,p.price_cents,p.currency,p.name plan_name FROM dealer_subscriptions s LEFT JOIN subscription_plans p ON p.id=s.plan_id WHERE s.company_id=$1`,[companyId])).rows[0];if(!sub)return res.status(400).json({error:'請先替車行指定訂閱方案'});const id=`pay_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,ts=now();await pool.query(`INSERT INTO payment_transactions(id,company_id,provider_id,amount_cents,currency,payment_type,status,description,created_at,updated_at) VALUES($1,$2,'manual',$3,$4,'manual','pending',$5,$6,$6)`,[id,companyId,Math.round((amount||Number(sub.price_cents||0)/100)*100),sub.currency||'TWD',String(req.body?.description||`人工收款：${sub.plan_name||''}`).slice(0,500),ts]);res.json({ok:true,paymentId:id})}catch(e){next(e)}});
+app.post('/api/super/subscriptions/payments/:id/confirm',superAuth,async(req,res,next)=>{const client=await pool.connect();try{await client.query('BEGIN');const pay=(await client.query(`SELECT * FROM payment_transactions WHERE id=$1 FOR UPDATE`,[req.params.id])).rows[0];if(!pay){await client.query('ROLLBACK');return res.status(404).json({error:'找不到付款紀錄'})}if(pay.status==='paid'){await client.query('ROLLBACK');return res.json({ok:true,alreadyProcessed:true})}if(pay.status!=='pending'){await client.query('ROLLBACK');return res.status(400).json({error:`此付款目前為 ${pay.status}，無法確認`})}const sub=(await client.query(`SELECT s.*,p.billing_interval,p.billing_interval_count,p.grace_days,p.name plan_name FROM dealer_subscriptions s JOIN subscription_plans p ON p.id=s.plan_id WHERE s.company_id=$1 FOR UPDATE`,[pay.company_id])).rows[0];if(!sub){await client.query('ROLLBACK');return res.status(400).json({error:'找不到有效訂閱方案'})}const base=sub.current_period_end&&sub.current_period_end>=today()?sub.current_period_end:today(),newEnd=addPlanPeriod(base,sub.billing_interval,sub.billing_interval_count),grace=addDateDays(newEnd,sub.grace_days),ts=now();await client.query(`UPDATE payment_transactions SET status='paid',paid_at=$1,confirmed_at=$1,confirmed_by=$2,updated_at=$1 WHERE id=$3`,[ts,req.auth.username||req.auth.sub,pay.id]);await client.query(`UPDATE dealer_subscriptions SET status='active',current_period_start=COALESCE(current_period_start,$1),current_period_end=$2,grace_until=$3,cancel_at_period_end=FALSE,provider_id='manual',updated_at=$4 WHERE company_id=$5`,[today(),newEnd,grace,ts,pay.company_id]);await client.query(`UPDATE companies SET enabled=TRUE,expires_at=$1,trial=FALSE WHERE id=$2`,[grace,pay.company_id]);await subscriptionEvent(client,pay.company_id,'payment_confirmed',{oldStatus:sub.status,newStatus:'active',oldPeriodEnd:sub.current_period_end,newPeriodEnd:newEnd,source:'manual_payment',referenceId:pay.id,actor:req.auth.username||req.auth.sub,detail:`人工確認付款，自動續期至 ${newEnd}`});await client.query('COMMIT');res.json({ok:true,newPeriodEnd:newEnd,graceUntil:grace})}catch(e){try{await client.query('ROLLBACK')}catch{}next(e)}finally{client.release()}});
+app.post('/api/super/subscriptions/:companyId/action',superAuth,async(req,res,next)=>{const client=await pool.connect();try{const companyId=req.params.companyId,action=String(req.body?.action||'');await client.query('BEGIN');const sub=(await client.query('SELECT * FROM dealer_subscriptions WHERE company_id=$1 FOR UPDATE',[companyId])).rows[0];if(!sub){await client.query('ROLLBACK');return res.status(404).json({error:'尚未建立訂閱'})}let status=sub.status,cancel=sub.cancel_at_period_end,enabled=true;if(action==='suspend'){status='suspended';enabled=false}else if(action==='resume'){status='active';cancel=false}else if(action==='cancel_at_period_end'){cancel=true}else if(action==='cancel_now'){status='cancelled';enabled=false}else{await client.query('ROLLBACK');return res.status(400).json({error:'未知操作'})}await client.query(`UPDATE dealer_subscriptions SET status=$1,cancel_at_period_end=$2,updated_at=$3 WHERE company_id=$4`,[status,cancel,now(),companyId]);await client.query(`UPDATE companies SET enabled=$1 WHERE id=$2`,[enabled,companyId]);await subscriptionEvent(client,companyId,action,{oldStatus:sub.status,newStatus:status,oldPeriodEnd:sub.current_period_end,newPeriodEnd:sub.current_period_end,source:'super_admin',actor:req.auth.username||req.auth.sub});await client.query('COMMIT');res.json({ok:true})}catch(e){try{await client.query('ROLLBACK')}catch{}next(e)}finally{client.release()}});
+app.get('/api/super/subscriptions/webhooks',superAuth,async(req,res,next)=>{try{res.json({rows:(await pool.query(`SELECT * FROM payment_webhook_events ORDER BY id DESC LIMIT 100`)).rows})}catch(e){next(e)}});
+app.post('/api/payments/webhook/:providerId',async(req,res,next)=>{try{const provider=(await pool.query(`SELECT * FROM payment_providers WHERE id=$1`,[req.params.providerId])).rows[0];if(!provider||!provider.enabled)return res.status(503).json({error:'此付款通道尚未啟用'});return res.status(501).json({error:'付款 Provider Adapter 尚未安裝；Webhook 入口已預留',providerId:provider.id,adapterKey:provider.adapter_key})}catch(e){next(e)}});
 
 app.use((err,req,res,next)=>{
   console.error(err);
@@ -2837,6 +2933,8 @@ async function start(){
     await refreshHaRuntime({allowMigration:false,recordTransition:false});
   }
   await loadMaintenanceRuntime();
+  await refreshSubscriptionStatuses();
+  setInterval(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')refreshSubscriptionStatuses()},60*1000).unref();
   setInterval(()=>{if(!CENTRAL_HA_ENABLED||haRuntime.dbRole==='primary')maybeRunScheduledCentralBackup()},15*60*1000).unref();
   setInterval(async()=>{
     try{
