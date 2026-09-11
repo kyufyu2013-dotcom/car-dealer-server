@@ -149,10 +149,22 @@ async function phase9eDisasterRecovery(j){
   }
 }
 async function phase9fSoak(j){
-  const hours=Math.max(1,Math.min(72,Number(j.config.hours||1))),end=Date.now()+hours*3600000;let first=null,last=null,maxRss=0,maxP95=0,maxWait=0,samples=0;
-  while(Date.now()<end&&!j.cancelRequested){const m=await collectSystemMetrics();first=first||m;last=m;maxRss=Math.max(maxRss,m.rssBytes);maxP95=Math.max(maxP95,m.apiP95Ms);maxWait=Math.max(maxWait,m.pgWaiting);samples++;await pool.query(`INSERT INTO resilience_soak_samples(suite_id,sampled_at,cpu_percent,rss_bytes,api_p95_ms,api_error_rate,pg_waiting,event_loop_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[j.suiteId,m.sampledAt,m.cpuPercent,m.rssBytes,m.apiP95Ms,m.apiErrorRate,m.pgWaiting,m.eventLoopP95Ms]);j.progress=Math.min(99,Math.round((1-(end-Date.now())/(hours*3600000))*100));await sleep(60000)}
-  const growth=first&&last?last.rssBytes-first.rssBytes:0,growthPct=first?.rssBytes?growth/first.rssBytes*100:0;const result={requestedHours:hours,samples,memoryGrowthBytes:growth,memoryGrowthPercent:growthPct,maxRssBytes:maxRss,maxApiP95Ms:maxP95,maxPgWaiting:maxWait,startedMetric:first,endedMetric:last};
-  const status=j.cancelRequested?'cancelled':growthPct<25&&maxP95<1000&&maxWait<5?'passed':growthPct<50&&maxP95<2000?'warning':'failed';return finishSuiteRun(j,status,result);
+  const hours=Math.max(1,Math.min(72,Number(j.config.hours||1))),startedMs=Date.now(),end=startedMs+hours*3600000;
+  let first=null,last=null,maxRss=0,maxP95=0,maxWait=0,maxErrorRate=0,maxEventLoop=0,samples=0;
+  while(Date.now()<end&&!j.cancelRequested){
+    const m=await collectSystemMetrics();first=first||m;last=m;maxRss=Math.max(maxRss,m.rssBytes);maxP95=Math.max(maxP95,m.apiP95Ms);maxWait=Math.max(maxWait,m.pgWaiting);maxErrorRate=Math.max(maxErrorRate,Number(m.apiErrorRate||0));maxEventLoop=Math.max(maxEventLoop,Number(m.eventLoopP95Ms||0));samples++;
+    await pool.query(`INSERT INTO resilience_soak_samples(suite_id,sampled_at,cpu_percent,rss_bytes,api_p95_ms,api_error_rate,pg_waiting,event_loop_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[j.suiteId,m.sampledAt,m.cpuPercent,m.rssBytes,m.apiP95Ms,m.apiErrorRate,m.pgWaiting,m.eventLoopP95Ms]);
+    j.progress=Math.min(99,Math.round((Date.now()-startedMs)/(hours*3600000)*100));
+    // 以短間隔等待，讓「提前停止」不必等滿下一個 60 秒採樣週期才生效。
+    for(let waited=0;waited<60000&&Date.now()<end&&!j.cancelRequested;waited+=2000)await sleep(Math.min(2000,60000-waited));
+  }
+  const stoppedMs=Date.now(),actualSeconds=Math.max(0,(stoppedMs-startedMs)/1000),growth=first&&last?last.rssBytes-first.rssBytes:0,growthPct=first?.rssBytes?growth/first.rssBytes*100:0;
+  const healthy=samples>0&&growthPct<25&&maxP95<1000&&maxWait<5&&maxErrorRate<0.01&&maxEventLoop<100;
+  const earlyStopped=!!j.cancelRequested;
+  const result={requestedHours:hours,actualRunSeconds:actualSeconds,actualRunMinutes:actualSeconds/60,earlyStopped,stopMode:earlyStopped?'manual_early_stop':'completed',samples,memoryGrowthBytes:growth,memoryGrowthPercent:growthPct,maxRssBytes:maxRss,maxApiP95Ms:maxP95,maxPgWaiting:maxWait,maxApiErrorRate:maxErrorRate,maxEventLoopP95Ms:maxEventLoop,startedMetric:first,endedMetric:last,note:earlyStopped?'本次由 Super Admin 手動提前停止；PASS/FAIL 僅代表實際運行期間的監測結果，不代表已完成原設定耐久時數。':'已跑滿原設定耐久測試時間。'};
+  // 使用者要求：提前停止時也立即結算；停止前全部正常就 PASS，否則 FAIL，並保留 Early Stop 標記與實際運行時間。
+  const status=earlyStopped?(healthy?'passed':'failed'):(healthy?'passed':(growthPct<50&&maxP95<2000?'warning':'failed'));
+  return finishSuiteRun(j,status,result);
 }
 async function launchSuite(phase,config,actor){
   const defs={C:{type:'reconnect_storm',title:'Phase 9C｜Node Reconnect Storm（節點重連風暴）',fn:phase9cReconnectStorm},D:{type:'fault_recovery',title:'Phase 9D｜PostgreSQL / API Fault Recovery（故障恢復）',fn:phase9dFaultRecovery},E:{type:'disaster_recovery',title:'Phase 9E｜Disaster Recovery（災難復原驗證）',fn:phase9eDisasterRecovery},F:{type:'soak_test',title:'Phase 9F｜Soak Test（長時間耐久測試）',fn:phase9fSoak}};const d=defs[phase];if(!d)throw new Error('未知 Phase');const j=await createSuiteRun(`9${phase}`,d.type,d.title,config,actor);d.fn(j).catch(e=>finishSuiteRun(j,'failed',{error:String(e?.message||e)}).catch(()=>{}));return suitePublic(j);
@@ -1115,14 +1127,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.2',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.3',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.2',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.3',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2172,7 +2184,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.5.2',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.5.3',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -2330,6 +2342,20 @@ app.post('/api/super/resilience/suite/start',superAuth,async(req,res,next)=>{
     const actor=req.auth?.username||SUPER_ADMIN_USER;
     const run=await launchSuite(phase,config,actor);
     res.status(202).json({ok:true,run});
+  }catch(e){next(e)}
+});
+
+
+app.post('/api/super/resilience/suite/stop',superAuth,async(req,res,next)=>{
+  try{
+    const suiteId=String(req.body?.suiteId||'').trim();
+    if(!suiteId)return res.status(400).json({error:'缺少測試 ID。'});
+    const j=resilienceJobs.get(suiteId);
+    if(!j)return res.status(404).json({error:'找不到正在執行的測試；可能已完成或 Server 曾重新啟動。'});
+    if(j.phase!=='9F')return res.status(400).json({error:'目前只允許提前停止 9F Soak Test（長時間耐久測試）。'});
+    if(j.status!=='running')return res.status(409).json({error:'這個 9F 已經不是執行中狀態。'});
+    j.cancelRequested=true;j.stopRequestedAt=now();j.stopRequestedBy=req.auth?.username||SUPER_ADMIN_USER;
+    res.status(202).json({ok:true,message:'已送出提前停止要求，系統會立即以停止前資料結算 PASS / FAIL。',run:suitePublic(j)});
   }catch(e){next(e)}
 });
 
