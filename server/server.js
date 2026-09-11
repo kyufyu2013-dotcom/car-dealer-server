@@ -87,6 +87,46 @@ async function loadMaintenanceRuntime(){
 }
 
 
+
+// Phase 9C-9F: Production Resilience Suite（商用韌性驗證中心）.
+// Synthetic tests are isolated from dealership tables. Destructive PostgreSQL promotion is intentionally excluded.
+const resilienceJobs=new Map();
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function suitePublic(j){if(!j)return null;const {cancelRequested,...x}=j;return x}
+async function createSuiteRun(phase,testType,title,config,actor){
+  const suiteId=`rs_${phase.toLowerCase()}_${crypto.randomUUID()}`,startedAt=now();
+  await pool.query(`INSERT INTO resilience_suite_runs(suite_id,phase,test_type,status,title,config,result,started_at,actor) VALUES($1,$2,$3,'running',$4,$5::jsonb,'{}'::jsonb,$6,$7)`,[suiteId,phase,testType,title,JSON.stringify(config||{}),startedAt,actor]);
+  const j={suiteId,phase,testType,title,status:'running',config:config||{},result:{},startedAt,completedAt:null,actor,progress:0,cancelRequested:false};resilienceJobs.set(suiteId,j);return j;
+}
+async function finishSuiteRun(j,status,result){j.status=status;j.result=result||{};j.completedAt=now();j.progress=100;await pool.query('UPDATE resilience_suite_runs SET status=$1,result=$2::jsonb,completed_at=$3 WHERE suite_id=$4',[status,JSON.stringify(j.result),j.completedAt,j.suiteId]);return suitePublic(j)}
+async function suiteRows(){const rows=(await pool.query('SELECT * FROM resilience_suite_runs ORDER BY id DESC LIMIT 100')).rows;return rows.map(r=>({...r,live:suitePublic(resilienceJobs.get(r.suite_id))}))}
+async function phase9cReconnectStorm(j){
+  const cfg=j.config,nodes=Math.max(100,Math.min(10000,Number(cfg.nodes||10000))),jitterMs=Math.max(250,Math.min(30000,Number(cfg.jitterMs||10000))),concurrency=Math.max(10,Math.min(500,Number(cfg.concurrency||150))),maxAttempts=3;
+  const before=await collectSystemMetrics(),started=Date.now(),lat=[],attempts={};let ok=0,failed=0,idx=0;
+  async function worker(){while(idx<nodes&&!j.cancelRequested){const n=++idx;await sleep(Math.floor(Math.random()*jitterMs));let good=false;for(let a=1;a<=maxAttempts&&!good;a++){attempts[a]=(attempts[a]||0)+1;const t=process.hrtime.bigint();try{await pool.query(`INSERT INTO load_test_nodes(node_id,run_id,virtual_company_id,app_version,last_seq,payload_bytes,last_seen_at) VALUES($1,$2,$3,'0.11.0',$4,512,$5) ON CONFLICT(node_id) DO UPDATE SET run_id=EXCLUDED.run_id,last_seq=EXCLUDED.last_seq,last_seen_at=EXCLUDED.last_seen_at`,[`storm_${j.suiteId}_${n}`,j.suiteId,`storm_company_${n}`,a,now()]);good=true;ok++}catch{if(a<maxAttempts)await sleep(Math.min(2000,250*2**(a-1)+Math.random()*250));else failed++}finally{lat.push(Number(process.hrtime.bigint()-t)/1e6)}}j.progress=Math.min(99,Math.round((ok+failed)/nodes*100));}}
+  await Promise.all(Array.from({length:Math.min(concurrency,nodes)},worker));const after=await collectSystemMetrics(),elapsed=(Date.now()-started)/1000,rate=nodes?ok/nodes:0;
+  const result={nodes,successCount:ok,failedCount:failed,reconnectSuccessRate:rate,recoverySeconds:elapsed,p95Ms:percentile(lat,.95),p99Ms:percentile(lat,.99),attempts,before,after,jitterMs,backoff:'exponential'};
+  const status=j.cancelRequested?'cancelled':rate>=.99&&result.p95Ms<1000?'passed':rate>=.95?'warning':'failed';return finishSuiteRun(j,status,result);
+}
+async function phase9dFaultRecovery(j){
+  const samples=[];let failures=0;for(let i=0;i<20&&!j.cancelRequested;i++){const t=process.hrtime.bigint();try{await Promise.race([pool.query('SELECT 1 AS ok'),new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),1500))]);samples.push(Number(process.hrtime.bigint()-t)/1e6)}catch{failures++}await sleep(100)}
+  const m=await collectSystemMetrics();const errorRate=failures/20;const result={probeCount:20,failures,errorRate,p95Ms:percentile(samples,.95),pgWaiting:m.pgWaiting,pgQueryMs:m.pgQueryMs,apiP95Ms:m.apiP95Ms,eventLoopP95Ms:m.eventLoopP95Ms,note:'安全故障恢復驗證：不會關閉正式 PostgreSQL，也不會自動 Promote。'};
+  const status=j.cancelRequested?'cancelled':errorRate===0&&m.pgWaiting===0?'passed':errorRate<=.05?'warning':'failed';return finishSuiteRun(j,status,result);
+}
+async function phase9eDisasterRecovery(j){
+  const b=(await pool.query("SELECT backup_id,created_at,started_at FROM central_backup_events WHERE status IN ('success','partial') ORDER BY id DESC LIMIT 1")).rows[0];if(!b)return finishSuiteRun(j,'failed',{error:'尚無可用中央備份，無法執行災難復原驗證。'});
+  const start=Date.now();try{const r=await drillCentralBackup(b.backup_id,j.actor);const rto=(Date.now()-start)/1000;const backupAt=Date.parse(b.created_at||b.started_at||'');const rpo=Number.isFinite(backupAt)?Math.max(0,(Date.now()-backupAt)/1000):null;return finishSuiteRun(j,'passed',{backupId:b.backup_id,restoreId:r.restoreId,rowCount:r.rowCount,tableCount:r.tableCount,rtoSeconds:rto,rpoSeconds:rpo,mode:'transactional-temp-table-drill',productionDataChanged:false})}catch(e){return finishSuiteRun(j,'failed',{error:String(e?.message||e)})}
+}
+async function phase9fSoak(j){
+  const hours=Math.max(1,Math.min(72,Number(j.config.hours||1))),end=Date.now()+hours*3600000;let first=null,last=null,maxRss=0,maxP95=0,maxWait=0,samples=0;
+  while(Date.now()<end&&!j.cancelRequested){const m=await collectSystemMetrics();first=first||m;last=m;maxRss=Math.max(maxRss,m.rssBytes);maxP95=Math.max(maxP95,m.apiP95Ms);maxWait=Math.max(maxWait,m.pgWaiting);samples++;await pool.query(`INSERT INTO resilience_soak_samples(suite_id,sampled_at,cpu_percent,rss_bytes,api_p95_ms,api_error_rate,pg_waiting,event_loop_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[j.suiteId,m.sampledAt,m.cpuPercent,m.rssBytes,m.apiP95Ms,m.apiErrorRate,m.pgWaiting,m.eventLoopP95Ms]);j.progress=Math.min(99,Math.round((1-(end-Date.now())/(hours*3600000))*100));await sleep(60000)}
+  const growth=first&&last?last.rssBytes-first.rssBytes:0,growthPct=first?.rssBytes?growth/first.rssBytes*100:0;const result={requestedHours:hours,samples,memoryGrowthBytes:growth,memoryGrowthPercent:growthPct,maxRssBytes:maxRss,maxApiP95Ms:maxP95,maxPgWaiting:maxWait,startedMetric:first,endedMetric:last};
+  const status=j.cancelRequested?'cancelled':growthPct<25&&maxP95<1000&&maxWait<5?'passed':growthPct<50&&maxP95<2000?'warning':'failed';return finishSuiteRun(j,status,result);
+}
+async function launchSuite(phase,config,actor){
+  const defs={C:{type:'reconnect_storm',title:'Phase 9C｜Node Reconnect Storm（節點重連風暴）',fn:phase9cReconnectStorm},D:{type:'fault_recovery',title:'Phase 9D｜PostgreSQL / API Fault Recovery（故障恢復）',fn:phase9dFaultRecovery},E:{type:'disaster_recovery',title:'Phase 9E｜Disaster Recovery（災難復原驗證）',fn:phase9eDisasterRecovery},F:{type:'soak_test',title:'Phase 9F｜Soak Test（長時間耐久測試）',fn:phase9fSoak}};const d=defs[phase];if(!d)throw new Error('未知 Phase');const j=await createSuiteRun(`9${phase}`,d.type,d.title,config,actor);d.fn(j).catch(e=>finishSuiteRun(j,'failed',{error:String(e?.message||e)}).catch(()=>{}));return suitePublic(j);
+}
+
 // Phase 8C: lightweight central performance telemetry. Technical metrics are Super Admin only.
 const METRICS_SAMPLE_MS=Math.max(5000,Math.min(60000,Number(process.env.METRICS_SAMPLE_MS||15000)));
 const METRICS_RETENTION_HOURS=Math.max(1,Math.min(24*30,Number(process.env.METRICS_RETENTION_HOURS||72)));
@@ -394,7 +434,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=14;
+const SERVER_SCHEMA_TARGET=15;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -806,6 +846,39 @@ const SERVER_MIGRATIONS=[
       ON CONFLICT(id) DO NOTHING;
       UPDATE desktop_update_policy SET latest_version='0.10.7',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v14' WHERE id=1 AND latest_version='0.10.7';
     `
+  },
+  {
+    version:15,
+    name:'phase9c9f-production-resilience-suite',
+    sql:`
+      CREATE TABLE IF NOT EXISTS resilience_suite_runs(
+        id BIGSERIAL PRIMARY KEY,
+        suite_id TEXT NOT NULL UNIQUE,
+        phase TEXT NOT NULL,
+        test_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        title TEXT NOT NULL DEFAULT '',
+        config JSONB NOT NULL DEFAULT '{}'::jsonb,
+        result JSONB NOT NULL DEFAULT '{}'::jsonb,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        actor TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_resilience_suite_runs_phase_time ON resilience_suite_runs(phase,started_at DESC);
+      CREATE TABLE IF NOT EXISTS resilience_soak_samples(
+        id BIGSERIAL PRIMARY KEY,
+        suite_id TEXT NOT NULL,
+        sampled_at TEXT NOT NULL,
+        cpu_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+        rss_bytes BIGINT NOT NULL DEFAULT 0,
+        api_p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        api_error_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+        pg_waiting INTEGER NOT NULL DEFAULT 0,
+        event_loop_p95_ms DOUBLE PRECISION NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_resilience_soak_samples_suite_time ON resilience_soak_samples(suite_id,sampled_at);
+      UPDATE desktop_update_policy SET latest_version='0.11.0',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v15' WHERE id=1;
+    `
   }
 ];
 
@@ -1011,14 +1084,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.4.55',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.4.55',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2068,7 +2141,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.3.43',apiVersion:'2.4.55',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.4.55',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
