@@ -2267,7 +2267,40 @@ async function resilienceSummary(){
   const control=await controlledDrillCapabilities(); return {current,events,control,destructiveDrillsEnabled:true,note:'Phase 9B 已加入受控維護中斷、DB 重新連線、Backup/Restore、警報鏈路與 HA Peer 探測。真正的 PostgreSQL Promote 仍由基礎設施層負責，不由應用程式直接執行。',generatedAt:now()};
 }
 app.get('/api/super/resilience',superAuth,async(req,res,next)=>{try{res.json(await resilienceSummary())}catch(e){next(e)}});
-app.post('/api/super/resilience/run',superAuth,async(req,res,next)=>{try{res.json(await runResilienceDrill(SUPER_ADMIN_USER))}catch(e){next(e)}});
+app.post('/api/super/resilience/run',superAuth,async(req,res,next)=>{try{res.json(await runResilienceDrill(req.auth?.username||SUPER_ADMIN_USER))}catch(e){next(e)}});
+
+// Phase 9C-9F API routes. These routes are consumed by the Super Admin resilience page.
+app.get('/api/super/resilience/suite',superAuth,async(req,res,next)=>{
+  try{
+    const runs=await suiteRows();
+    const active=[...resilienceJobs.values()].filter(x=>x&&x.status==='running').map(suitePublic);
+    res.json({runs,active,generatedAt:now()});
+  }catch(e){next(e)}
+});
+
+app.post('/api/super/resilience/suite/start',superAuth,async(req,res,next)=>{
+  try{
+    const raw=String(req.body?.phase||'').trim().toUpperCase();
+    const m=raw.match(/^9?([C-F])$/);
+    if(!m)return res.status(400).json({error:'Phase 只允許 9C / 9D / 9E / 9F。'});
+    const phase=m[1],config=(req.body?.config&&typeof req.body.config==='object')?req.body.config:{};
+    if(phase==='C'){
+      const nodes=Number(config.nodes||1000);
+      if(![100,1000,5000,10000].includes(nodes))return res.status(400).json({error:'9C Node 數量只允許 100 / 1000 / 5000 / 10000。'});
+      config.nodes=nodes;
+      config.jitterMs=Math.max(250,Math.min(30000,Number(config.jitterMs||10000)));
+      config.concurrency=Math.max(10,Math.min(500,Number(config.concurrency||150)));
+    }
+    if(phase==='F'){
+      const hours=Number(config.hours||1);
+      if(![1,6,24,72].includes(hours))return res.status(400).json({error:'9F 時間只允許 1 / 6 / 24 / 72 小時。'});
+      config.hours=hours;
+    }
+    const actor=req.auth?.username||SUPER_ADMIN_USER;
+    const run=await launchSuite(phase,config,actor);
+    res.status(202).json({ok:true,run});
+  }catch(e){next(e)}
+});
 
 
 // Phase 9B: controlled, auditable drills. No shell commands and no automatic PostgreSQL promotion are executed here.
