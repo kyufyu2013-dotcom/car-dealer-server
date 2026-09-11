@@ -477,7 +477,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=15;
+const SERVER_SCHEMA_TARGET=16;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -922,6 +922,34 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_resilience_soak_samples_suite_time ON resilience_soak_samples(suite_id,sampled_at);
       UPDATE desktop_update_policy SET latest_version='0.11.0',updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v15' WHERE id=1;
     `
+  },
+  {
+    version:16,
+    name:'phase10-security-audit-integrity-release-governance',
+    sql:`
+      CREATE TABLE IF NOT EXISTS security_audit_events(
+        id BIGSERIAL PRIMARY KEY,
+        actor TEXT NOT NULL DEFAULT '', actor_role TEXT NOT NULL DEFAULT '', company_id TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'api', status TEXT NOT NULL DEFAULT 'success',
+        ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', target_type TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_security_audit_time ON security_audit_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_security_audit_category ON security_audit_events(category,created_at DESC);
+      CREATE TABLE IF NOT EXISTS idempotency_keys(
+        id BIGSERIAL PRIMARY KEY, company_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', route TEXT NOT NULL,
+        idem_key TEXT NOT NULL, request_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'seen', created_at TEXT NOT NULL,
+        UNIQUE(company_id,actor_id,route,idem_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_idempotency_time ON idempotency_keys(created_at DESC);
+      CREATE TABLE IF NOT EXISTS release_control_events(
+        id BIGSERIAL PRIMARY KEY, release_id TEXT NOT NULL UNIQUE, server_version TEXT NOT NULL DEFAULT '', api_version TEXT NOT NULL DEFAULT '',
+        schema_version INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'attention', readiness JSONB NOT NULL DEFAULT '{}'::jsonb,
+        actor TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_release_control_time ON release_control_events(created_at DESC);
+      UPDATE desktop_update_policy SET updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v16' WHERE id=1;
+    `
   }
 ];
 
@@ -1097,9 +1125,31 @@ function superAuth(req,res,next){
   });
 }
 
+
+// Phase 10A-10D: Production Security & Data Integrity Suite（商用安全與資料完整性中心）
+const SECURITY_RATE_WINDOW_MS=60_000;
+const SECURITY_API_MAX=Math.max(60,Math.min(3000,Number(process.env.SECURITY_API_MAX_PER_MINUTE||600)));
+const SECURITY_LOGIN_MAX=Math.max(3,Math.min(30,Number(process.env.SECURITY_LOGIN_MAX_PER_15MIN||8)));
+const SECURITY_LOGIN_WINDOW_MS=15*60_000;
+const rateWindows=new Map(),loginWindows=new Map();
+function remoteIp(req){return String(req.headers['x-forwarded-for']||req.ip||'').split(',')[0].trim().slice(0,120)}
+function bucketCheck(map,key,windowMs,max){const t=Date.now();let x=map.get(key);if(!x||t-x.startedAt>=windowMs){x={startedAt:t,count:0};map.set(key,x)}x.count++;return {allowed:x.count<=max,count:x.count,remaining:Math.max(0,max-x.count),resetAt:new Date(x.startedAt+windowMs).toISOString()}}
+function safeAuditPayload(body){if(!body||typeof body!=='object')return {};const out={};for(const [k,v] of Object.entries(body)){if(/pass|token|secret|key|authorization/i.test(k))out[k]='[REDACTED]';else if(typeof v==='string')out[k]=v.slice(0,300);else if(typeof v==='number'||typeof v==='boolean'||v==null)out[k]=v;else out[k]='[OBJECT]'}return out}
+async function auditSecurityEvent(req,{action='',category='api',status='success',detail='',targetType='',targetId='',metadata={}}={}){try{await pool.query(`INSERT INTO security_audit_events(actor,actor_role,company_id,action,category,status,ip,user_agent,target_type,target_id,detail,metadata,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)`,[String(req.auth?.username||req.auth?.sub||req.body?.username||'anonymous').slice(0,150),String(req.auth?.role||'').slice(0,80),String(req.auth?.companyId||'').slice(0,150),String(action||`${req.method} ${req.path}`).slice(0,220),String(category).slice(0,80),String(status).slice(0,40),remoteIp(req),String(req.headers['user-agent']||'').slice(0,400),String(targetType).slice(0,80),String(targetId).slice(0,180),String(detail).slice(0,1000),JSON.stringify(metadata||{}),now()])}catch(e){console.warn('security audit unavailable:',e?.message||e)}}
+function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=()');res.setHeader('Cross-Origin-Opener-Policy','same-origin');res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");next()}
+function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
+function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
+async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'10.0.0',apiVersion:'3.0.0',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 const app=express();
+app.disable('x-powered-by');
+app.use(securityHeaders);
 app.use(cors({origin:true,credentials:false}));
 app.use(express.json({limit:'30mb'}));
+app.use('/api',generalRateLimit);
+// Phase 10B Audit Log（稽核紀錄）: mutations and login results are recorded; secrets are redacted.
+app.use(['/api/auth/login','/api/super/login'],(req,res,next)=>{const started=Date.now();res.on('finish',()=>auditSecurityEvent(req,{action:req.path.includes('/super/')?'super_login':'dealer_login',category:'authentication',status:res.statusCode<400?'success':(res.statusCode===429?'blocked':'rejected'),detail:`HTTP ${res.statusCode} / ${Date.now()-started}ms`}));next()});
+app.use('/api',(req,res,next)=>{if(!['POST','PUT','PATCH','DELETE'].includes(req.method)||req.path==='/auth/login'||req.path==='/super/login')return next();const started=Date.now();res.on('finish',()=>{if(!req.auth)return;const category=req.path.startsWith('/super/')?'super_admin':req.path.startsWith('/admin/')?'dealer_admin':'dealer';auditSecurityEvent(req,{action:`${req.method} ${req.path}`,category,status:res.statusCode<400?'success':'rejected',detail:`HTTP ${res.statusCode} / ${Date.now()-started}ms`,metadata:{body:safeAuditPayload(req.body)}})});next()});
 app.use((req,res,next)=>{const started=process.hrtime.bigint();res.on('finish',()=>{const ms=Number(process.hrtime.bigint()-started)/1e6;recordApiPerf(ms,res.statusCode)});next()});
 app.use('/sales', express.static(path.join(__dirname,'public','sales'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
 app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
@@ -1127,14 +1177,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'2.5.5',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'3.0.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'2.5.5',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase9b-controlled-resilience-drill-ha'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'3.0.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'production-phase10-security-integrity-governance'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1199,7 +1249,7 @@ app.post('/api/company/register',async(req,res,next)=>{
   }finally{ client.release(); }
 });
 
-app.post('/api/auth/login',async(req,res,next)=>{
+app.post('/api/auth/login',loginGuard('dealer'),async(req,res,next)=>{
   try{
     const {companyCode,username,password,rememberLogin=false}=req.body||{};
     const c=await getCompany(companyCode);
@@ -1604,7 +1654,7 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
 });
 
 // -------------------- Super Admin cloud API --------------------
-app.post('/api/super/login',(req,res)=>{
+app.post('/api/super/login',loginGuard('super'),(req,res)=>{
   const {username,password}=req.body||{};
   if(username!==SUPER_ADMIN_USER||password!==SUPER_ADMIN_PASSWORD)return res.status(401).json({error:'Super Admin 帳號或密碼錯誤'});
   res.json({token:signSuper(),user:{username:SUPER_ADMIN_USER,role:'platformAdmin'}});
@@ -2163,7 +2213,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs'];
+const CENTRAL_BACKUP_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -2184,7 +2234,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'9.4.0',apiVersion:'2.5.5',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'10.0.0',apiVersion:'3.0.0',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -2197,7 +2247,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs'];
+const CENTRAL_RESTORE_TABLES=['companies','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
@@ -2663,6 +2713,15 @@ app.delete('/api/super/companies/:id',superAuth,async(req,res,next)=>{
     res.json({ok:true,deleted:{id:c.id,name:c.name}});
   }catch(e){ next(e); }
 });
+
+
+// -------------------- Phase 10A-10D Security / Audit / Integrity / Rollback readiness --------------------
+app.get('/api/super/security-center',superAuth,async(req,res,next)=>{try{const [integrity,release,auditCount]=await Promise.all([phase10DataIntegritySummary(),phase10ReleaseReadiness(),pool.query(`SELECT COUNT(*)::int AS n FROM security_audit_events`)]);res.json({security:{status:'enabled',securityHeaders:true,loginProtection:true,rateLimit:{apiPerMinute:SECURITY_API_MAX,loginAttemptsPer15Min:SECURITY_LOGIN_MAX},tokenVerification:true,superAdminIsolation:true,sensitiveErrorMasking:true},integrity,release,auditCount:Number(auditCount.rows[0]?.n||0),generatedAt:now()})}catch(e){next(e)}});
+app.get('/api/super/security/audit',superAuth,async(req,res,next)=>{try{const page=Math.max(1,Number(req.query.page||1)),limit=10,offset=(page-1)*limit,filter=String(req.query.category||'').trim();const where=filter?'WHERE category=$1':'';const params=filter?[filter]:[];const total=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM security_audit_events ${where}`,params)).rows[0]?.n||0);const rows=(await pool.query(`SELECT id,actor,actor_role,company_id,action,category,status,ip,target_type,target_id,detail,metadata,created_at FROM security_audit_events ${where} ORDER BY id DESC LIMIT 10 OFFSET ${offset}`,params)).rows;res.json({rows,page,pageSize:limit,total,totalPages:Math.max(1,Math.ceil(total/limit))})}catch(e){next(e)}});
+app.post('/api/super/security/integrity-check',superAuth,async(req,res,next)=>{try{const result=await phase10DataIntegritySummary();await auditSecurityEvent(req,{action:'phase10c_integrity_check',category:'data_integrity',status:result.status,detail:`duplicateUsers=${result.duplicateUsers}, missingSnapshots=${result.missingSnapshots}, saleProblems=${result.saleProblems}`});res.json(result)}catch(e){next(e)}});
+app.get('/api/super/security/release-readiness',superAuth,async(req,res,next)=>{try{res.json(await phase10ReleaseReadiness())}catch(e){next(e)}});
+app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'10.0.0','3.0.0',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
+app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const rows=(await pool.query(`SELECT * FROM release_control_events ORDER BY id DESC LIMIT 50`)).rows;res.json({rows})}catch(e){next(e)}});
 
 app.use((err,req,res,next)=>{
   console.error(err);
