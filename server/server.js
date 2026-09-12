@@ -1913,14 +1913,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.11',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.13',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.11',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-operating-cost-history-pagination'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.13',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-staff-lifecycle-month-filter'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2235,8 +2235,18 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       const targetId=String(staffChangeContext?.employeeId||'');
       if(deletions.length===1&&targetId&&String(deletions[0].id)!==targetId){await client.query('ROLLBACK');return res.status(409).json({error:'人員異動資料已變更，請重新操作'});}
       for(const u of deletions){
-        await client.query('UPDATE users SET enabled=FALSE,token_version=token_version+1,updated_at=$1 WHERE id=$2',[now(),u.id]);
-        await client.query(`INSERT INTO staff_change_events(company_id,event_type,employee_id,employee_name,position,branch_id,actor_id,actor_name,actor_role,reason,owner_read_at,created_at) VALUES($1,'removed',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[req.auth.companyId,String(u.id),String(u.name||''),String(u.position||''),String(u.branch_id||''),String(authUser.id),actorName,String(authUser.role||''),deletionReason,String(authUser.id)===companyOwnerId?now():null,now()]);
+        const removedAt=now(),removedMonth=payrollCurrentMonth();
+        await client.query('UPDATE users SET enabled=FALSE,token_version=token_version+1,updated_at=$1 WHERE id=$2',[removedAt,u.id]);
+        await client.query(`INSERT INTO staff_change_events(company_id,event_type,employee_id,employee_name,position,branch_id,actor_id,actor_name,actor_role,reason,owner_read_at,created_at) VALUES($1,'removed',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[req.auth.companyId,String(u.id),String(u.name||''),String(u.position||''),String(u.branch_id||''),String(authUser.id),actorName,String(authUser.role||''),deletionReason,String(authUser.id)===companyOwnerId?removedAt:null,removedAt]);
+        // Keep the departure month as history, but remove this employee from every unlocked future payroll snapshot.
+        const futurePeriods=(await client.query('SELECT month,employee_ids FROM payroll_month_periods WHERE company_id=$1 AND month>$2 AND locked=FALSE',[req.auth.companyId,removedMonth])).rows;
+        for(const fp of futurePeriods){
+          const before=Array.isArray(fp.employee_ids)?fp.employee_ids.map(String):[];
+          const after=before.filter(id=>id!==String(u.id));
+          if(after.length!==before.length)await client.query('UPDATE payroll_month_periods SET employee_ids=$1::jsonb,updated_at=$2 WHERE company_id=$3 AND month=$4',[JSON.stringify(after),removedAt,req.auth.companyId,fp.month]);
+        }
+        // A future month is not financial history yet; remove any accidentally pre-settled future payroll for the departed employee.
+        await client.query('DELETE FROM payroll_settlements WHERE company_id=$1 AND employee_id=$2 AND month>$3',[req.auth.companyId,String(u.id),removedMonth]);
       }
     }
 
@@ -2481,13 +2491,14 @@ app.post('/api/operating-costs/entries',auth,requireActiveCompany,async(req,res,
 app.delete('/api/operating-costs/entries/:id',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await operatingCostActor(req,client);if(!canManageOperatingCosts(actor))return res.status(403).json({error:'你的帳號沒有管理營運成本權限'});const reason=String(req.body?.reason||'').trim();if(!reason)return res.status(400).json({error:'作廢原因不能空白'});
   const row=(await client.query('SELECT * FROM operating_cost_entries WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!row)return res.status(404).json({error:'找不到成本紀錄'});if(actor.role!=='admin'&&!(row.allocation_mode==='branch'&&String(row.branch_id)===String(actor.branch_id||'')))return res.status(403).json({error:'不能作廢其他分店的成本'});
-  const ts=now();
+  const ts=now(),stopRecurring=!!req.body?.stopRecurring&&row.source_type==='recurring'&&!!row.recurring_rule_id;
   await client.query('BEGIN');
   await client.query(`UPDATE operating_cost_entries SET status='voided',voided_at=$1,voided_by=$2,void_reason=$3,updated_at=$1 WHERE id=$4`,[ts,String(actor.name||actor.username||''),reason.slice(0,500),row.id]);
-  if(row.source_type==='recurring'&&row.recurring_rule_id){
-    await client.query(`UPDATE operating_cost_rules SET enabled=FALSE,end_month=COALESCE(end_month,$1),updated_at=$2 WHERE id=$3 AND company_id=$4`,[row.month,ts,row.recurring_rule_id,req.auth.companyId]);
+  if(stopRecurring){
+    await client.query(`UPDATE operating_cost_rules SET enabled=FALSE,end_month=$1,updated_at=$2 WHERE id=$3 AND company_id=$4`,[row.month,ts,row.recurring_rule_id,req.auth.companyId]);
+    await client.query(`UPDATE operating_cost_entries SET status='voided',voided_at=$1,voided_by=$2,void_reason=$3,updated_at=$1 WHERE company_id=$4 AND recurring_rule_id=$5 AND month>$6 AND status='active'`,[ts,String(actor.name||actor.username||''),`固定成本已於 ${row.month} 停止：${reason}`.slice(0,500),req.auth.companyId,row.recurring_rule_id,row.month]);
   }
-  await client.query('COMMIT');res.json({ok:true,recurringRuleStopped:row.source_type==='recurring'&&!!row.recurring_rule_id});
+  await client.query('COMMIT');res.json({ok:true,recurringRuleStopped:stopRecurring});
 }catch(e){next(e)}finally{client.release()}});
 app.post('/api/operating-costs/rules',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await operatingCostActor(req,client);if(!canManageOperatingCosts(actor))return res.status(403).json({error:'你的帳號沒有管理營運成本權限'});const b=req.body||{},name=String(b.name||'').trim(),amount=Math.max(0,Number(b.amount||0)),mode=String(b.allocationMode||'company'),branchId=String(b.branchId||''),startMonth=String(b.startMonth||today().slice(0,7)),endMonth=String(b.endMonth||''),day=Math.max(1,Math.min(28,Number(b.dayOfMonth)||1));
@@ -2864,7 +2875,12 @@ async function ensurePayrollPeriod(client,companyId,month,{refreshCurrent=true,a
     row=(await client.query(`INSERT INTO payroll_month_periods(company_id,month,employee_ids,locked,created_at,updated_at) VALUES($1,$2,$3::jsonb,FALSE,$4,$4) ON CONFLICT(company_id,month) DO UPDATE SET updated_at=payroll_month_periods.updated_at RETURNING *`,[companyId,month,JSON.stringify(users),now()])).rows[0];
   }
   let ids=Array.isArray(row.employee_ids)?row.employee_ids.map(String):[];
-  if(!row.locked && refreshCurrent && String(month)===payrollCurrentMonth()){
+  if(!row.locked && String(month)>payrollCurrentMonth()){
+    // Future payroll months always follow the current active staff roster.
+    // If someone leaves this month, any pre-created future snapshot must stop carrying that employee.
+    ids=(await client.query("SELECT id FROM users WHERE company_id=$1 AND enabled=TRUE AND role<>'admin' ORDER BY id",[companyId])).rows.map(x=>String(x.id));
+  }else if(!row.locked && refreshCurrent && String(month)===payrollCurrentMonth()){
+    // Current month keeps historical membership even after a mid-month departure, while still adding new hires.
     const current=(await client.query("SELECT id FROM users WHERE company_id=$1 AND enabled=TRUE AND role<>'admin' ORDER BY id",[companyId])).rows.map(x=>String(x.id));
     ids=[...new Set([...ids,...current])];
   }
