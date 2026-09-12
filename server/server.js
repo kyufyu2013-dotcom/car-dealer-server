@@ -334,6 +334,8 @@ function branchDto(b){
     enabled:!!b.enabled,
     address:b.address||'',
     phone:b.phone||'',
+    saleApprovalMode:b.sale_approval_mode||'branch_manager',
+    saleApproverUserId:b.sale_approver_user_id||'',
     createdAt:b.created_at||'',
     updatedAt:b.updated_at||''
   };
@@ -355,11 +357,39 @@ function userDto(u){
     branchId:u.branch_id||'',
     commissionRate:Number(u.commission_rate||0),
     baseSalary:Number(u.base_salary||0),
+    permissions:(u.permissions&&typeof u.permissions==='object')?u.permissions:{},
     enabled:!!u.enabled,
     passwordChangedAt:u.password_changed_at||'',
     passwordChangedBy:u.password_changed_by||''
   };
 }
+
+const ROLE_PERMISSION_DEFAULTS={
+  admin:{vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:true,saleApprove:true,saleReject:true,saleCancel:true,peopleManage:true,viewCosts:true,viewReports:true},
+  branchManager:{vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:false,saleApprove:true,saleReject:true,saleCancel:false,peopleManage:true,viewCosts:true,viewReports:true},
+  sales:{vehicleCreate:false,vehicleEdit:false,vehicleDelete:false,vehicleTransfer:false,saleApprove:false,saleReject:false,saleCancel:false,peopleManage:false,viewCosts:false,viewReports:false}
+};
+function effectivePermissions(user){return {...(ROLE_PERMISSION_DEFAULTS[user?.role]||{}),...((user?.permissions&&typeof user.permissions==='object')?user.permissions:{})}}
+function hasPermission(user,key){return !!effectivePermissions(user)[key]}
+async function resolveSaleApprover(companyId,branchId,client=pool){
+  const branch=(await client.query('SELECT * FROM branches WHERE id=$1 AND company_id=$2',[branchId,companyId])).rows[0];
+  if(!branch)return null;
+  const admin=(await client.query("SELECT * FROM users WHERE company_id=$1 AND role='admin' AND enabled=TRUE ORDER BY updated_at ASC LIMIT 1",[companyId])).rows[0]||null;
+  const mode=String(branch.sale_approval_mode||'branch_manager');
+  if(mode==='specific_user'&&branch.sale_approver_user_id){
+    const u=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[branch.sale_approver_user_id,companyId])).rows[0];
+    if(u&&hasPermission(u,'saleApprove')&&(u.role==='admin'||String(u.branch_id||'')===String(branchId)))return {type:'specific_user',user:u};
+  }
+  if(mode==='branch_manager'){
+    const managers=(await client.query("SELECT * FROM users WHERE company_id=$1 AND branch_id=$2 AND role='branchManager' AND enabled=TRUE ORDER BY updated_at ASC",[companyId,branchId])).rows;
+    const u=managers.find(x=>hasPermission(x,'saleApprove'));
+    if(u)return {type:'branch_manager',user:u};
+  }
+  if(admin&&hasPermission(admin,'saleApprove'))return {type:'company_admin',user:admin};
+  return admin?{type:'company_admin',user:admin}:null;
+}
+function stampApprovalTarget(request,target){request.approvalTargetType=target?.type||'company_admin';request.approvalTargetUserId=target?.user?.id||'';request.approvalTargetName=target?.user?.name||target?.user?.username||'公司管理員';return request}
+function canActOnSaleRequest(user,request){if(!user||!hasPermission(user,'saleApprove'))return false;if(!request?.approvalTargetUserId)return user.role==='admin';return String(request.approvalTargetUserId)===String(user.id||'')}
 
 function salesSafeSnapshot(snapshot,user){
   const d=snapshot&&typeof snapshot==='object'?snapshot:{};
@@ -412,7 +442,7 @@ function branchManagerSafeSnapshot(snapshot,user){
   const branchId=String(user?.branch_id||'');
   const cars=(Array.isArray(d.cars)?d.cars:[]).filter(c=>String(c?.branchId||'')===branchId);
   const carIds=new Set(cars.map(c=>String(c.id)));
-  const requests=(Array.isArray(d.saleRequests)?d.saleRequests:[]).filter(r=>String(r?.branchId||'')===branchId||carIds.has(String(r?.carId||'')));
+  const requests=(Array.isArray(d.saleRequests)?d.saleRequests:[]).filter(r=>(String(r?.branchId||'')===branchId||carIds.has(String(r?.carId||'')))&&(r.status!=='待確認'||String(r.approvalTargetUserId||'')===String(user?.id||'')));
   const users=(Array.isArray(d.users)?d.users:[]).filter(u=>String(u?.id||'')===String(user?.id||'')||(u?.role==='sales'&&String(u?.branchId||'')===branchId));
   const userIds=new Set(users.map(u=>String(u.id)));
   const salaryHistory=(Array.isArray(d.salaryHistory)?d.salaryHistory:[]).filter(x=>userIds.has(String(x?.salesId||'')));
@@ -515,7 +545,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=23;
+const SERVER_SCHEMA_TARGET=24;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1199,6 +1229,16 @@ const SERVER_MIGRATIONS=[
 
       UPDATE desktop_update_policy SET updated_at=CURRENT_TIMESTAMP::text,updated_by='migration-v23' WHERE id=1;
     `
+  },
+  {
+    version:24,
+    name:'phase14b2-configurable-permissions-approval-routing',
+    sql:`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE branches ADD COLUMN IF NOT EXISTS sale_approval_mode TEXT NOT NULL DEFAULT 'branch_manager';
+      ALTER TABLE branches ADD COLUMN IF NOT EXISTS sale_approver_user_id TEXT;
+      CREATE INDEX IF NOT EXISTS idx_users_company_branch_role ON users(company_id,branch_id,role,enabled);
+    `
   }];
 
 async function ensureMigrationTable(client=pool){
@@ -1401,7 +1441,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.1.1',apiVersion:'6.1.1',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.2.0',apiVersion:'6.2.0',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -1519,7 +1559,7 @@ async function phase12Summary(options={}){
     pool.query(`SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,COUNT(*) FILTER (WHERE status IN ('grace_period','past_due','suspended'))::int AS attention FROM dealer_subscriptions`)
   ]);
   return {
-    serverVersion:'14.1.1',apiVersion:'6.1.1',
+    serverVersion:'14.2.0',apiVersion:'6.2.0',
     plans:plans.rows,planOptions:planOptions.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,
     planPagination:{page:planSafePage,pageSize,total:planTotal,totalPages:planTotalPages,search:planSearch,status:planStatus},
     subscriptionPagination:{page:subSafePage,pageSize,total:subTotal,totalPages:subTotalPages,search:subscriptionSearch,status:subscriptionStatus},
@@ -1568,14 +1608,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.1.1',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.2.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.1.1',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14b-branch-inventory-permissions'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.2.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14b2-configurable-permissions-approval-routing'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1808,6 +1848,7 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
     const isBranchManager=req.auth.role==='branchManager';
     const managerBranchId=String(authUser.branch_id||'');
     if(isBranchManager&&!managerBranchId)return res.status(403).json({error:'分店主管尚未指定所屬分店'});
+    const authPerms=effectivePermissions(authUser);
 
     await client.query('BEGIN');
     const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
@@ -1849,22 +1890,23 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       if(userBranchId&&!branchIds.has(userBranchId)){await client.query('ROLLBACK');return res.status(400).json({error:`職員 ${x.name||x.username} 的所屬分店不存在或已停用`});}
       let nextRole=['admin','branchManager','sales'].includes(String(x.role||''))?String(x.role):'sales';
       if(isBranchManager){
+        if(!authPerms.peopleManage&&String(x.id)!==String(authUser.id)){await client.query('ROLLBACK');return res.status(403).json({error:'你的帳號沒有管理人員權限'});}
         if(String(x.id)===String(authUser.id)){nextRole='branchManager';x.branchId=managerBranchId;}
         else if(nextRole!=='sales'||userBranchId!==managerBranchId){await client.query('ROLLBACK');return res.status(403).json({error:'分店主管只能管理自己分店的業務帳號'});}
       }
       x.role=nextRole;
       if(old){
         await client.query(`
-          UPDATE users SET username=$1,password_hash=$2,name=$3,role=$4,commission_rate=$5,base_salary=$6,enabled=TRUE,updated_at=$7,branch_id=$8
-          WHERE id=$9 AND company_id=$10
-        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,old.id,req.auth.companyId]);
+          UPDATE users SET username=$1,password_hash=$2,name=$3,role=$4,commission_rate=$5,base_salary=$6,enabled=TRUE,updated_at=$7,branch_id=$8,permissions=$9::jsonb
+          WHERE id=$10 AND company_id=$11
+        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,JSON.stringify(x.permissions||old.permissions||{}),old.id,req.auth.companyId]);
         if(old.id!==x.id){ x.id=old.id; keep.add(old.id); }
       }else{
         if(!ph)return res.status(400).json({error:`新帳號 ${x.username} 必須設定密碼`});
         await client.query(`
-          INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10)
-        `,[x.id,req.auth.companyId,x.username,ph,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null]);
+          INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id,permissions)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10,$11::jsonb)
+        `,[x.id,req.auth.companyId,x.username,ph,x.name||x.username,x.role||'sales',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,JSON.stringify(x.permissions||{})]);
       }
       x.branchId=userBranchId||'';x.password='';
     }
@@ -1882,6 +1924,12 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       const baseRequests=Array.isArray(base.saleRequests)?base.saleRequests:[];
       const baseCarMap=new Map(baseCars.map(c=>[String(c.id),c]));
 
+      // Phase 14B.2: role is a template; per-user permissions decide actual actions, while branch scope remains enforced.
+      const existingIds=new Set(baseCars.filter(c=>String(c.branchId||'')===managerBranchId).map(c=>String(c.id)));
+      const incomingIds0=new Set(incomingCars.map(c=>String(c.id)));
+      if([...incomingIds0].some(id=>!existingIds.has(id))&&!authPerms.vehicleCreate){await client.query('ROLLBACK');return res.status(403).json({error:'你的帳號沒有新增車輛權限'});}
+      if([...existingIds].some(id=>!incomingIds0.has(id))&&!authPerms.vehicleDelete){await client.query('ROLLBACK');return res.status(403).json({error:'你的帳號沒有刪除車輛權限'});}
+      if(!authPerms.vehicleEdit&&incomingCars.some(car=>existingIds.has(String(car.id)))){await client.query('ROLLBACK');return res.status(403).json({error:'你的帳號沒有編輯車輛權限'});}
       // Phase 14B.1: branch managers may CRUD inventory only inside their own branch.
       // They still cannot move vehicles across branches or alter final sale state via snapshot upload.
       for(const car of incomingCars){
@@ -1918,6 +1966,10 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       clean=base;
     }
 
+    if(req.auth.role==='admin'){
+      clean.saleRequests=Array.isArray(clean.saleRequests)?clean.saleRequests:[];
+      for(const sr of clean.saleRequests){if(sr.status==='待確認'&&!sr.directByAdmin){const target=await resolveSaleApprover(req.auth.companyId,String(sr.branchId||defaultBranchId),client);stampApprovalTarget(sr,target);}}
+    }
     const ver=existing.version+1;
     await client.query(`
       INSERT INTO snapshots(company_id,version,json,updated_at)
@@ -1967,9 +2019,14 @@ app.patch('/api/admin/branches/:id',auth,requireActiveCompany,async(req,res,next
     const old=(await pool.query('SELECT * FROM branches WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];
     if(!old)return res.status(404).json({error:'找不到分店'});
     const name=req.body?.name===undefined?old.name:String(req.body.name||'').trim(),address=req.body?.address===undefined?old.address:String(req.body.address||'').trim().slice(0,300),phone=req.body?.phone===undefined?old.phone:String(req.body.phone||'').trim().slice(0,80),enabled=req.body?.enabled===undefined?old.enabled:!!req.body.enabled;
+    const saleApprovalMode=req.body?.saleApprovalMode===undefined?String(old.sale_approval_mode||'branch_manager'):String(req.body.saleApprovalMode||'branch_manager');
+    const saleApproverUserId=req.body?.saleApproverUserId===undefined?String(old.sale_approver_user_id||''):String(req.body.saleApproverUserId||'');
+    if(!['branch_manager','company_admin','specific_user'].includes(saleApprovalMode))return res.status(400).json({error:'成交審核方式不正確'});
+    if(saleApprovalMode==='specific_user'&&!saleApproverUserId)return res.status(400).json({error:'請選擇指定審核人'});
     if(!name)return res.status(400).json({error:'分店名稱不能空白'});
     if(old.is_head_office&&!enabled)return res.status(400).json({error:'總店不能停用'});
-    const q=await pool.query(`UPDATE branches SET name=$1,address=$2,phone=$3,enabled=$4,updated_at=$5 WHERE id=$6 AND company_id=$7 RETURNING *`,[name,address,phone,enabled,now(),old.id,req.auth.companyId]);
+    const q=await pool.query(`UPDATE branches SET name=$1,address=$2,phone=$3,enabled=$4,sale_approval_mode=$5,sale_approver_user_id=$6,updated_at=$7 WHERE id=$8 AND company_id=$9 RETURNING *`,[name,address,phone,enabled,saleApprovalMode,saleApprovalMode==='specific_user'?saleApproverUserId:null,now(),old.id,req.auth.companyId]);
+    if(req.body?.saleApprovalMode!==undefined||req.body?.saleApproverUserId!==undefined){const snap=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0];if(snap){const d=JSON.parse(JSON.stringify(snap.json||{}));d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];const target=await resolveSaleApprover(req.auth.companyId,old.id,pool);let changed=false;for(const r of d.saleRequests){if(r.status==='待確認'&&String(r.branchId||'')===String(old.id)){stampApprovalTarget(r,target);changed=true}}if(changed)await pool.query('UPDATE snapshots SET version=version+1,json=$1::jsonb,updated_at=$2 WHERE company_id=$3',[JSON.stringify(d),now(),req.auth.companyId]);}}
     res.json({ok:true,branch:branchDto(q.rows[0])});
   }catch(e){next(e)}
 });
@@ -2029,6 +2086,8 @@ app.post('/api/account/change-password',auth,requireActiveCompany,async(req,res,
 app.post('/api/admin/users/:userId/reset-password',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     if(!['admin','branchManager'].includes(req.auth.role))return res.status(403).json({error:'僅公司管理員或分店主管可重設業務密碼'});
+    const actor=(await pool.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(!actor||!hasPermission(actor,'peopleManage'))return res.status(403).json({error:'你的帳號沒有管理人員權限'});
     const newPassword=String(req.body?.newPassword||'');
     if(newPassword.length<6)return res.status(400).json({error:'新密碼至少 6 碼'});
     const {rows}=await pool.query("SELECT * FROM users WHERE id=$1 AND company_id=$2 AND role='sales' AND enabled=TRUE",[req.params.userId,req.auth.companyId]);
@@ -2073,11 +2132,13 @@ app.post('/api/sales/request',auth,requireActiveCompany,async(req,res,next)=>{
     const rate=Number(u.commission_rate||0),floor=Number(c.floorPrice||0);
     const commissionMode=c.commissionMode==='fixed'?'fixed':'percentage',fixedCommissionAmount=Math.max(0,Number(c.fixedCommissionAmount||0));
     const expectedCommission=commissionMode==='fixed'?fixedCommissionAmount:Math.max(0,sell-floor)*rate/100;
-    d.saleRequests.push({
+    const saleRequest={
       id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,operationId:operationId||`legacy_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,branchId:c.branchId||'',carId:c.id,plate:c.plate,model:c.model,
       floorPrice:floor,sellPrice:sell,saleDate:body.saleDate||today(),requestedAt:today(),salesId:u.id,salesName:u.name,
       commissionRate:rate,commissionMode,fixedCommissionAmount,expectedCommission,status:'待確認'
-    });
+    };
+    stampApprovalTarget(saleRequest,await resolveSaleApprover(req.auth.companyId,c.branchId,client));
+    d.saleRequests.push(saleRequest);
     const ver=existing.version+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
     await client.query('COMMIT');
@@ -2114,6 +2175,7 @@ app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,re
     const commissionMode=c.commissionMode==='fixed'?'fixed':'percentage',fixedCommissionAmount=Math.max(0,Number(c.fixedCommissionAmount||0));
     const expectedCommission=commissionMode==='fixed'?fixedCommissionAmount:Math.max(0,sell-floor)*rate/100;
     const r={id:`req_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,branchId:c.branchId||'',carId:c.id,plate:c.plate,model:c.model,floorPrice:floor,sellPrice:sell,saleDate:saleDate||today(),requestedAt:today(),salesId:u.id,salesName:u.name,commissionRate:rate,commissionMode,fixedCommissionAmount,expectedCommission,status:'待確認',directByAdmin:true};
+    stampApprovalTarget(r,{type:'company_admin',user:(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2',[req.auth.sub,req.auth.companyId])).rows[0]});
     d.saleRequests.push(r);
     const ver=Number(lock.rows[0].version||0)+1;
     await client.query('UPDATE snapshots SET version=$1,json=$2::jsonb,updated_at=$3 WHERE company_id=$4',[ver,JSON.stringify(cloudOperationalSnapshot(d)),now(),req.auth.companyId]);
@@ -2124,7 +2186,8 @@ app.post('/api/admin/sale/direct-request',auth,requireActiveCompany,async(req,re
 app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅公司管理員可操作成交流程'});
+    const actingUser=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(!actingUser||!hasPermission(actingUser,'saleApprove'))return res.status(403).json({error:'你的帳號沒有確認成交權限'});
     const {requestId,transfer=0,fuel=0,license=0,other=0,otherName='',localTotalCost=0}=req.body||{};
     await client.query('BEGIN');
     const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
@@ -2132,6 +2195,7 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
     const d=lock.rows[0].json||{};d.cars=Array.isArray(d.cars)?d.cars:[];d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
     const r=d.saleRequests.find(x=>String(x.id)===String(requestId));
     if(!r){await client.query('ROLLBACK');return res.status(404).json({error:'找不到成交申請'});}
+    if(!canActOnSaleRequest(actingUser,r)){await client.query('ROLLBACK');return res.status(403).json({error:`此成交申請目前由 ${r.approvalTargetName||'其他人員'} 負責審核`});}
     if(!(await enforceManagerBranch(req,r.branchId,client))){await client.query('ROLLBACK');return res.status(403).json({error:'分店主管只能處理自己分店的成交申請'});}
     if(r.status!=='待確認'){await client.query('ROLLBACK');return res.status(409).json({error:`此申請目前為「${r.status}」，不可重複確認`});}
     const c=d.cars.find(x=>String(x.id)===String(r.carId));
@@ -2160,7 +2224,8 @@ app.post('/api/admin/sale/confirm',auth,requireActiveCompany,async(req,res,next)
 app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅公司管理員可操作成交流程'});
+    const actingUser=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(!actingUser||!hasPermission(actingUser,'saleCancel'))return res.status(403).json({error:'你的帳號沒有取消成交權限'});
     const {carId,reason}=req.body||{};
     const why=String(reason||'').trim();
     if(!why)return res.status(400).json({error:'取消成交原因不可空白'});
@@ -2211,7 +2276,8 @@ app.post('/api/admin/sale/cancel',auth,requireActiveCompany,async(req,res,next)=
 app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅公司管理員可操作成交流程'});
+    const actingUser=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(!actingUser||!hasPermission(actingUser,'saleReject'))return res.status(403).json({error:'你的帳號沒有駁回成交權限'});
     const {requestId,reason}=req.body||{};if(!String(reason||'').trim())return res.status(400).json({error:'駁回原因不可空白'});
     await client.query('BEGIN');
     const lock=await client.query('SELECT version,json FROM snapshots WHERE company_id=$1 FOR UPDATE',[req.auth.companyId]);
@@ -2219,6 +2285,7 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
     const d=lock.rows[0].json||{};d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
     const r=d.saleRequests.find(x=>String(x.id)===String(requestId));
     if(!r){await client.query('ROLLBACK');return res.status(404).json({error:'找不到成交申請'});}
+    if(!canActOnSaleRequest(actingUser,r)){await client.query('ROLLBACK');return res.status(403).json({error:`此成交申請目前由 ${r.approvalTargetName||'其他人員'} 負責審核`});}
     if(!(await enforceManagerBranch(req,r.branchId,client))){await client.query('ROLLBACK');return res.status(403).json({error:'分店主管只能處理自己分店的成交申請'});}
     if(r.status!=='待確認'){await client.query('ROLLBACK');return res.status(409).json({error:`此申請目前為「${r.status}」，不可再次處理`});}
     r.status='已駁回';r.rejectReason=String(reason).trim();r.rejectedAt=now();
@@ -2817,7 +2884,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.1.1',apiVersion:'6.1.1',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.2.0',apiVersion:'6.2.0',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -3211,9 +3278,13 @@ app.patch('/api/super/companies/:id/branches/:branchId',superAuth,async(req,res,
     const old=(await pool.query('SELECT * FROM branches WHERE id=$1 AND company_id=$2',[req.params.branchId,req.params.id])).rows[0];
     if(!old)return res.status(404).json({error:'找不到分店'});
     const name=req.body?.name===undefined?old.name:String(req.body.name||'').trim(),address=req.body?.address===undefined?old.address:String(req.body.address||'').trim().slice(0,300),phone=req.body?.phone===undefined?old.phone:String(req.body.phone||'').trim().slice(0,80),enabled=req.body?.enabled===undefined?old.enabled:!!req.body.enabled;
+    const saleApprovalMode=req.body?.saleApprovalMode===undefined?String(old.sale_approval_mode||'branch_manager'):String(req.body.saleApprovalMode||'branch_manager');
+    const saleApproverUserId=req.body?.saleApproverUserId===undefined?String(old.sale_approver_user_id||''):String(req.body.saleApproverUserId||'');
+    if(!['branch_manager','company_admin','specific_user'].includes(saleApprovalMode))return res.status(400).json({error:'成交審核方式不正確'});
+    if(saleApprovalMode==='specific_user'&&!saleApproverUserId)return res.status(400).json({error:'請選擇指定審核人'});
     if(!name)return res.status(400).json({error:'分店名稱不能空白'});if(name.length>80)return res.status(400).json({error:'分店名稱過長'});
     if(old.is_head_office&&!enabled)return res.status(400).json({error:'總店不能停用'});
-    const q=await pool.query(`UPDATE branches SET name=$1,address=$2,phone=$3,enabled=$4,updated_at=$5 WHERE id=$6 AND company_id=$7 RETURNING *`,[name,address,phone,enabled,now(),old.id,req.params.id]);
+    const q=await pool.query(`UPDATE branches SET name=$1,address=$2,phone=$3,enabled=$4,sale_approval_mode=$5,sale_approver_user_id=$6,updated_at=$7 WHERE id=$8 AND company_id=$9 RETURNING *`,[name,address,phone,enabled,saleApprovalMode,saleApprovalMode==='specific_user'?saleApproverUserId:null,now(),old.id,req.params.id]);
     res.json({ok:true,branch:branchDto(q.rows[0])});
   }catch(e){next(e)}
 });
@@ -3361,14 +3432,14 @@ app.get('/api/super/security-center',superAuth,async(req,res,next)=>{try{const [
 app.get('/api/super/security/audit',superAuth,async(req,res,next)=>{try{const page=Math.max(1,Number(req.query.page||1)),limit=10,offset=(page-1)*limit,filter=String(req.query.category||'').trim();const where=filter?'WHERE category=$1':'';const params=filter?[filter]:[];const total=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM security_audit_events ${where}`,params)).rows[0]?.n||0);const rows=(await pool.query(`SELECT id,actor,actor_role,company_id,action,category,status,ip,target_type,target_id,detail,metadata,created_at FROM security_audit_events ${where} ORDER BY id DESC LIMIT 10 OFFSET ${offset}`,params)).rows;res.json({rows,page,pageSize:limit,total,totalPages:Math.max(1,Math.ceil(total/limit))})}catch(e){next(e)}});
 app.post('/api/super/security/integrity-check',superAuth,async(req,res,next)=>{try{const result=await phase10DataIntegritySummary();await auditSecurityEvent(req,{action:'phase10c_integrity_check',category:'data_integrity',status:result.status,detail:`duplicateUsers=${result.duplicateUsers}, missingSnapshots=${result.missingSnapshots}, saleProblems=${result.saleProblems}`});res.json(result)}catch(e){next(e)}});
 app.get('/api/super/security/release-readiness',superAuth,async(req,res,next)=>{try{res.json(await phase10ReleaseReadiness())}catch(e){next(e)}});
-app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'14.1.1','6.1.1',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
+app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'14.2.0','6.2.0',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
 app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const rows=(await pool.query(`SELECT * FROM release_control_events ORDER BY id DESC LIMIT 50`)).rows;res.json({rows})}catch(e){next(e)}});
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.1.1',apiVersion:'6.1.1',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.2.0',apiVersion:'6.2.0',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
-app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.1.1',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
+app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.2.0',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/cancel',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='cancelled',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_cancel',category:'commercial_launch',status:'success',targetType:'company',targetId:companyId,detail:'Pilot cancelled'});res.json({ok:true})}catch(e){next(e)}});
 
