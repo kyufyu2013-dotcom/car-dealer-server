@@ -1913,14 +1913,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.10',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.11',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.10',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-superadmin-vehicle-sale-price-label'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.11',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-operating-cost-history-pagination'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2481,7 +2481,13 @@ app.post('/api/operating-costs/entries',auth,requireActiveCompany,async(req,res,
 app.delete('/api/operating-costs/entries/:id',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await operatingCostActor(req,client);if(!canManageOperatingCosts(actor))return res.status(403).json({error:'你的帳號沒有管理營運成本權限'});const reason=String(req.body?.reason||'').trim();if(!reason)return res.status(400).json({error:'作廢原因不能空白'});
   const row=(await client.query('SELECT * FROM operating_cost_entries WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!row)return res.status(404).json({error:'找不到成本紀錄'});if(actor.role!=='admin'&&!(row.allocation_mode==='branch'&&String(row.branch_id)===String(actor.branch_id||'')))return res.status(403).json({error:'不能作廢其他分店的成本'});
-  await client.query(`UPDATE operating_cost_entries SET status='voided',voided_at=$1,voided_by=$2,void_reason=$3,updated_at=$1 WHERE id=$4`,[now(),String(actor.name||actor.username||''),reason.slice(0,500),row.id]);res.json({ok:true});
+  const ts=now();
+  await client.query('BEGIN');
+  await client.query(`UPDATE operating_cost_entries SET status='voided',voided_at=$1,voided_by=$2,void_reason=$3,updated_at=$1 WHERE id=$4`,[ts,String(actor.name||actor.username||''),reason.slice(0,500),row.id]);
+  if(row.source_type==='recurring'&&row.recurring_rule_id){
+    await client.query(`UPDATE operating_cost_rules SET enabled=FALSE,end_month=COALESCE(end_month,$1),updated_at=$2 WHERE id=$3 AND company_id=$4`,[row.month,ts,row.recurring_rule_id,req.auth.companyId]);
+  }
+  await client.query('COMMIT');res.json({ok:true,recurringRuleStopped:row.source_type==='recurring'&&!!row.recurring_rule_id});
 }catch(e){next(e)}finally{client.release()}});
 app.post('/api/operating-costs/rules',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await operatingCostActor(req,client);if(!canManageOperatingCosts(actor))return res.status(403).json({error:'你的帳號沒有管理營運成本權限'});const b=req.body||{},name=String(b.name||'').trim(),amount=Math.max(0,Number(b.amount||0)),mode=String(b.allocationMode||'company'),branchId=String(b.branchId||''),startMonth=String(b.startMonth||today().slice(0,7)),endMonth=String(b.endMonth||''),day=Math.max(1,Math.min(28,Number(b.dayOfMonth)||1));
