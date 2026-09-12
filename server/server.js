@@ -1913,14 +1913,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.13',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.14',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.13',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-staff-lifecycle-month-filter'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.14',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-payroll-month-six-card-boundary'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2848,6 +2848,8 @@ app.post('/api/admin/staff-events/read-all',auth,requireActiveCompany,async(req,
 
 // -------------------- Phase 14B.4 payroll month period / close --------------------
 function payrollCurrentMonth(){return today().slice(0,7)}
+function payrollShiftMonth(month,delta=0){const [y,m]=String(month||payrollCurrentMonth()).split('-').map(Number);const d=new Date(Date.UTC(y,m-1+Number(delta||0),1));return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`}
+function payrollMaxOpenMonth(){return payrollShiftMonth(payrollCurrentMonth(),1)}
 async function companyPayrollActivation(client,companyId){
   const c=(await client.query('SELECT system_activation_date,start_date FROM companies WHERE id=$1',[companyId])).rows[0]||{};
   const date=String(c.system_activation_date||c.start_date||today()).slice(0,10),month=date.slice(0,7);
@@ -2867,6 +2869,7 @@ function payrollMonthStatus(period,month,expectedCount,settledCount){
 }
 async function ensurePayrollPeriod(client,companyId,month,{refreshCurrent=true,addEmployeeId=''}={}){
   if(!/^\d{4}-\d{2}$/.test(String(month||'')))throw new Error('INVALID_PAYROLL_MONTH');
+  if(String(month)>payrollMaxOpenMonth())throw new Error('PAYROLL_MONTH_TOO_FAR');
   const boundary=await isPayrollBeforeActivation(client,companyId,month);
   if(boundary.before)return {company_id:companyId,month,employee_ids:[],locked:false,preActivation:true,activationDate:boundary.activation.date,activationMonth:boundary.activation.month};
   let row=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 AND month=$2',[companyId,month])).rows[0];
@@ -2902,11 +2905,11 @@ async function payrollPeriodSummary(client,companyId,month,period=null){
   return {month,status:payrollMonthStatus(period,month,expectedCount,settledCount),expectedCount,settledCount,remainingCount:Math.max(0,expectedCount-settledCount),locked:!!period.locked,lockedAt:period.locked_at||null,lockedBy:period.locked_by||'',unlockedAt:period.unlocked_at||null,unlockedBy:period.unlocked_by||''};
 }
 async function recentPayrollMonthStates(client,companyId,focusMonth){
-  const activation=await companyPayrollActivation(client,companyId);
-  const rows=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 AND month >= $2 ORDER BY month DESC LIMIT 12',[companyId,activation.month])).rows;
+  const activation=await companyPayrollActivation(client,companyId),maxMonth=payrollMaxOpenMonth();
+  const rows=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 AND month >= $2 AND month <= $3 ORDER BY month DESC LIMIT 72',[companyId,activation.month,maxMonth])).rows;
   const map=new Map(rows.map(r=>[String(r.month),r]));
-  for(const m of [payrollCurrentMonth(),String(focusMonth)])if(m&&m>=activation.month&&!map.has(m)){const p=await ensurePayrollPeriod(client,companyId,m,{refreshCurrent:m===payrollCurrentMonth()});if(!p.preActivation)map.set(m,p)}
-  const months=[...map.keys()].filter(m=>m>=activation.month).sort().reverse().slice(0,12),out=[];
+  for(const m of [payrollCurrentMonth(),String(focusMonth)])if(m&&m>=activation.month&&m<=maxMonth&&!map.has(m)){const p=await ensurePayrollPeriod(client,companyId,m,{refreshCurrent:m===payrollCurrentMonth()});if(!p.preActivation)map.set(m,p)}
+  const months=[...map.keys()].filter(m=>m>=activation.month&&m<=maxMonth).sort().reverse().slice(0,72),out=[];
   for(const m of months)out.push(await payrollPeriodSummary(client,companyId,m,map.get(m)));
   return out;
 }
@@ -2938,7 +2941,7 @@ app.get('/api/admin/payroll',auth,requireActiveCompany,async(req,res,next)=>{
     const monthState=await payrollPeriodSummary(pool,req.auth.companyId,month,period),monthStates=await recentPayrollMonthStates(pool,req.auth.companyId,month);
     const events=(await pool.query('SELECT action,actor,detail,created_at FROM payroll_month_events WHERE company_id=$1 AND month=$2 ORDER BY id DESC LIMIT 20',[req.auth.companyId,month])).rows;
     res.json({month,costMode,monthState,monthStates,events,settlements:q.rows.map(x=>({id:x.id,employeeId:x.employee_id,employeeName:x.employee_name,position:x.position||'',salaryType:x.salary_type||'fixed',branchId:x.branch_id||'',baseSalary:Number(x.base_salary||0),commission:Number(x.commission||0),allowance:Number(x.allowance||0),overtime:Number(x.overtime||0),deductions:Number(x.deductions||0),totalCost:Number(x.total_cost||0),status:x.status,settledAt:x.settled_at,settledBy:x.settled_by,note:x.note||''})),employees:usersQ.rows.map(userDto),systemActivationDate:activation.date,systemActivationMonth:activation.month,beforeActivation:false});
-  }catch(e){if(e?.message==='INVALID_PAYROLL_MONTH')return res.status(400).json({error:'月份格式不正確'});next(e)}
+  }catch(e){if(e?.message==='INVALID_PAYROLL_MONTH')return res.status(400).json({error:'月份格式不正確'});if(e?.message==='PAYROLL_MONTH_TOO_FAR')return res.status(400).json({error:`薪資月份最多只能預先查看到 ${payrollMaxOpenMonth()}`});next(e)}
 });
 
 app.put('/api/admin/payroll/settings',auth,requireActiveCompany,async(req,res,next)=>{
