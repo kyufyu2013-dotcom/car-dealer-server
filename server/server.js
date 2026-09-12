@@ -322,7 +322,12 @@ function companyDto(c){
     lastOnlineAt:c.last_auth_at||'',
     trialRemainingSeconds:c.expires_at?Math.max(0,Math.floor((new Date(c.expires_at+'T23:59:59+08:00').getTime()-Date.now())/1000)):null,
     mainUsername:c.main_username||'',
-    payrollCostMode:['realtime_estimate','settled_only'].includes(String(c.payroll_cost_mode||''))?String(c.payroll_cost_mode):'realtime_estimate'
+    payrollCostMode:['realtime_estimate','settled_only'].includes(String(c.payroll_cost_mode||''))?String(c.payroll_cost_mode):'realtime_estimate',
+    ownerUserId:c.owner_user_id||'',
+    systemActivationDate:c.system_activation_date||c.start_date||'',
+    systemActivationMonth:String(c.system_activation_date||c.start_date||'').slice(0,7),
+    systemActivationSetAt:c.system_activation_set_at||'',
+    systemActivationSetBy:c.system_activation_set_by||''
   };
 }
 function branchDto(b){
@@ -562,7 +567,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=27;
+const SERVER_SCHEMA_TARGET=28;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1326,6 +1331,35 @@ const SERVER_MIGRATIONS=[
       SELECT c.id,to_char(CURRENT_DATE,'YYYY-MM'),COALESCE((SELECT jsonb_agg(u.id ORDER BY u.id) FROM users u WHERE u.company_id=c.id AND u.enabled=TRUE AND u.role<>'admin'),'[]'::jsonb),FALSE,CURRENT_TIMESTAMP::text,CURRENT_TIMESTAMP::text
       FROM companies c ON CONFLICT(company_id,month) DO NOTHING;
     `
+  },
+  {
+    version:28,
+    name:'phase14b6-company-activation-boundary',
+    sql:`
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS system_activation_date TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS system_activation_set_at TEXT;
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS system_activation_set_by TEXT NOT NULL DEFAULT '';
+      ALTER TABLE companies ADD COLUMN IF NOT EXISTS owner_user_id TEXT;
+      UPDATE companies c SET owner_user_id=(
+        SELECT u.id FROM users u WHERE u.company_id=c.id AND u.role='admin' ORDER BY u.updated_at ASC,u.id ASC LIMIT 1
+      ) WHERE COALESCE(c.owner_user_id,'')='';
+      UPDATE companies SET system_activation_date=COALESCE(NULLIF(system_activation_date,''),NULLIF(start_date,''),LEFT(created_at,10),CURRENT_DATE::text)
+      WHERE COALESCE(system_activation_date,'')='';
+      UPDATE companies SET system_activation_set_at=COALESCE(NULLIF(system_activation_set_at,''),created_at,CURRENT_TIMESTAMP::text)
+      WHERE COALESCE(system_activation_set_at,'')='';
+      CREATE TABLE IF NOT EXISTS company_setting_events(
+        id BIGSERIAL PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        setting_key TEXT NOT NULL,
+        old_value TEXT NOT NULL DEFAULT '',
+        new_value TEXT NOT NULL DEFAULT '',
+        actor_id TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_company_setting_events_company ON company_setting_events(company_id,id DESC);
+    `
   }];
 
 async function ensureMigrationTable(client=pool){
@@ -1528,7 +1562,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.5.0',apiVersion:'6.5.0',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.6.0',apiVersion:'6.6.0',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -1646,7 +1680,7 @@ async function phase12Summary(options={}){
     pool.query(`SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,COUNT(*) FILTER (WHERE status IN ('grace_period','past_due','suspended'))::int AS attention FROM dealer_subscriptions`)
   ]);
   return {
-    serverVersion:'14.5.0',apiVersion:'6.5.0',
+    serverVersion:'14.6.0',apiVersion:'6.6.0',
     plans:plans.rows,planOptions:planOptions.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,
     planPagination:{page:planSafePage,pageSize,total:planTotal,totalPages:planTotalPages,search:planSearch,status:planStatus},
     subscriptionPagination:{page:subSafePage,pageSize,total:subTotal,totalPages:subTotalPages,search:subscriptionSearch,status:subscriptionStatus},
@@ -1695,14 +1729,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.5.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.6.0',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.5.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14b5-monthly-dashboard'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.6.0',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14b6-company-activation-boundary'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -1747,11 +1781,12 @@ app.post('/api/company/register',async(req,res,next)=>{
 
     await client.query('BEGIN');
     await client.query(`
-      INSERT INTO companies(id,name,enabled,start_date,expires_at,created_at,created_by,contact_email,trial)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      INSERT INTO companies(id,name,enabled,start_date,expires_at,created_at,created_by,contact_email,trial,system_activation_date,system_activation_set_at,system_activation_set_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$4,$6,$7)
     `,[company.id,company.name,true,company.start_date,company.expires_at,company.created_at,company.created_by,company.contact_email,true]);
     await client.query(`INSERT INTO branches(id,company_id,code,name,is_head_office,enabled,address,phone,created_at,updated_at) VALUES($1,$2,'MAIN','總店',TRUE,TRUE,'','',$3,$3)`,[companyCode+'_main',companyCode,now()]);
     user.branch_id=companyCode+'_main';
+    await client.query('UPDATE companies SET owner_user_id=$1 WHERE id=$2',[user.id,companyCode]);
     await client.query(`
       INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
@@ -2156,6 +2191,39 @@ app.put('/api/admin/company/settings',auth,requireActiveCompany,async(req,res,ne
   }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
 });
 
+
+app.put('/api/admin/company/activation',auth,requireActiveCompany,async(req,res,next)=>{
+  const client=await pool.connect();
+  try{
+    const actor=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    const company=(await client.query('SELECT * FROM companies WHERE id=$1',[req.auth.companyId])).rows[0];
+    if(!actor||!company)return res.status(404).json({error:'公司或帳號不存在'});
+    const ownerId=String(company.owner_user_id||'');
+    if(!ownerId||String(actor.id)!==ownerId)return res.status(403).json({error:'只有公司老闆帳號可以修改系統正式啟用日'});
+    const activationDate=String(req.body?.systemActivationDate||'').trim();
+    const currentPassword=String(req.body?.currentPassword||'');
+    const reason=String(req.body?.reason||'').trim().slice(0,500);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(activationDate))return res.status(400).json({error:'正式啟用日格式不正確'});
+    if(activationDate>today())return res.status(400).json({error:'正式啟用日不能晚於今天'});
+    if(!verifyPassword(currentPassword,actor.password_hash))return res.status(401).json({error:'目前密碼錯誤'});
+    const oldDate=String(company.system_activation_date||company.start_date||today()).slice(0,10);
+    if(activationDate===oldDate)return res.json({ok:true,company:companyDto(company),unchanged:true});
+    if(!reason)return res.status(400).json({error:'修改正式啟用日必須填寫原因'});
+    const newMonth=activationDate.slice(0,7);
+    const earliestSettled=(await client.query('SELECT MIN(month) AS month FROM payroll_settlements WHERE company_id=$1',[req.auth.companyId])).rows[0]?.month||'';
+    const earliestLocked=(await client.query('SELECT MIN(month) AS month FROM payroll_month_periods WHERE company_id=$1 AND locked=TRUE',[req.auth.companyId])).rows[0]?.month||'';
+    const protectedMonths=[earliestSettled,earliestLocked].filter(Boolean).sort();
+    if(protectedMonths.length&&newMonth>protectedMonths[0])return res.status(409).json({error:`${protectedMonths[0]} 已有正式薪資結算或封帳資料，正式啟用日不能改到該月份之後`});
+    await client.query('BEGIN');
+    const at=now(),who=actor.name||actor.username;
+    await client.query('UPDATE companies SET system_activation_date=$1,system_activation_set_at=$2,system_activation_set_by=$3 WHERE id=$4',[activationDate,at,who,req.auth.companyId]);
+    await client.query(`INSERT INTO company_setting_events(company_id,setting_key,old_value,new_value,actor_id,actor,reason,created_at) VALUES($1,'system_activation_date',$2,$3,$4,$5,$6,$7)`,[req.auth.companyId,oldDate,activationDate,actor.id,who,reason,at]);
+    await client.query('COMMIT');
+    const updated=(await pool.query('SELECT * FROM companies WHERE id=$1',[req.auth.companyId])).rows[0];
+    res.json({ok:true,company:companyDto(updated)});
+  }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}
+});
+
 app.post('/api/account/change-password',auth,requireActiveCompany,async(req,res,next)=>{
   try{
     const {currentPassword,newPassword}=req.body||{};
@@ -2386,7 +2454,15 @@ app.post('/api/admin/sale/reject',auth,requireActiveCompany,async(req,res,next)=
 
 // -------------------- Phase 14B.4 payroll month period / close --------------------
 function payrollCurrentMonth(){return today().slice(0,7)}
+async function companyPayrollActivation(client,companyId){
+  const c=(await client.query('SELECT system_activation_date,start_date FROM companies WHERE id=$1',[companyId])).rows[0]||{};
+  const date=String(c.system_activation_date||c.start_date||today()).slice(0,10),month=date.slice(0,7);
+  return {date,month};
+}
+async function isPayrollBeforeActivation(client,companyId,month){const a=await companyPayrollActivation(client,companyId);return {before:String(month)<a.month,activation:a};}
+
 function payrollMonthStatus(period,month,expectedCount,settledCount){
+  if(period?.preActivation)return 'pre_activation';
   if(period?.locked)return 'closed';
   if(String(month)===payrollCurrentMonth())return 'in_progress';
   if(String(month)>payrollCurrentMonth())return 'in_progress';
@@ -2397,6 +2473,8 @@ function payrollMonthStatus(period,month,expectedCount,settledCount){
 }
 async function ensurePayrollPeriod(client,companyId,month,{refreshCurrent=true,addEmployeeId=''}={}){
   if(!/^\d{4}-\d{2}$/.test(String(month||'')))throw new Error('INVALID_PAYROLL_MONTH');
+  const boundary=await isPayrollBeforeActivation(client,companyId,month);
+  if(boundary.before)return {company_id:companyId,month,employee_ids:[],locked:false,preActivation:true,activationDate:boundary.activation.date,activationMonth:boundary.activation.month};
   let row=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 AND month=$2',[companyId,month])).rows[0];
   if(!row){
     const users=(await client.query("SELECT id FROM users WHERE company_id=$1 AND enabled=TRUE AND role<>'admin' ORDER BY id",[companyId])).rows.map(x=>String(x.id));
@@ -2416,6 +2494,7 @@ async function ensurePayrollPeriod(client,companyId,month,{refreshCurrent=true,a
 }
 async function payrollPeriodSummary(client,companyId,month,period=null){
   period=period||await ensurePayrollPeriod(client,companyId,month,{refreshCurrent:false});
+  if(period?.preActivation)return {month,status:'pre_activation',expectedCount:0,settledCount:0,remainingCount:0,locked:false,systemActivationDate:period.activationDate||'',systemActivationMonth:period.activationMonth||String(period.activationDate||'').slice(0,7),beforeActivation:true};
   const ids=Array.isArray(period.employee_ids)?period.employee_ids.map(String):[];
   const q=await client.query('SELECT employee_id FROM payroll_settlements WHERE company_id=$1 AND month=$2',[companyId,month]);
   const settledSet=new Set(q.rows.map(x=>String(x.employee_id)));
@@ -2424,10 +2503,11 @@ async function payrollPeriodSummary(client,companyId,month,period=null){
   return {month,status:payrollMonthStatus(period,month,expectedCount,settledCount),expectedCount,settledCount,remainingCount:Math.max(0,expectedCount-settledCount),locked:!!period.locked,lockedAt:period.locked_at||null,lockedBy:period.locked_by||'',unlockedAt:period.unlocked_at||null,unlockedBy:period.unlocked_by||''};
 }
 async function recentPayrollMonthStates(client,companyId,focusMonth){
-  const rows=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 ORDER BY month DESC LIMIT 12',[companyId])).rows;
+  const activation=await companyPayrollActivation(client,companyId);
+  const rows=(await client.query('SELECT * FROM payroll_month_periods WHERE company_id=$1 AND month >= $2 ORDER BY month DESC LIMIT 12',[companyId,activation.month])).rows;
   const map=new Map(rows.map(r=>[String(r.month),r]));
-  for(const m of [payrollCurrentMonth(),String(focusMonth)])if(m&&!map.has(m)){const p=await ensurePayrollPeriod(client,companyId,m,{refreshCurrent:m===payrollCurrentMonth()});map.set(m,p)}
-  const months=[...map.keys()].sort().reverse().slice(0,12),out=[];
+  for(const m of [payrollCurrentMonth(),String(focusMonth)])if(m&&m>=activation.month&&!map.has(m)){const p=await ensurePayrollPeriod(client,companyId,m,{refreshCurrent:m===payrollCurrentMonth()});if(!p.preActivation)map.set(m,p)}
+  const months=[...map.keys()].filter(m=>m>=activation.month).sort().reverse().slice(0,12),out=[];
   for(const m of months)out.push(await payrollPeriodSummary(client,companyId,m,map.get(m)));
   return out;
 }
@@ -2439,6 +2519,13 @@ app.get('/api/admin/payroll',auth,requireActiveCompany,async(req,res,next)=>{
     if(!(u.role==='admin'||hasPermission(u,'viewReports')||hasPermission(u,'peopleManage')))return res.status(403).json({error:'沒有薪資／人事成本查看權限'});
     const month=String(req.query.month||payrollCurrentMonth());if(!/^\d{4}-\d{2}$/.test(month))return res.status(400).json({error:'月份格式不正確'});
     const period=await ensurePayrollPeriod(pool,req.auth.companyId,month,{refreshCurrent:true});
+    const activation=await companyPayrollActivation(pool,req.auth.companyId);
+    if(period.preActivation){
+      const company=(await pool.query('SELECT payroll_cost_mode FROM companies WHERE id=$1',[req.auth.companyId])).rows[0]||{};
+      const costMode=['realtime_estimate','settled_only'].includes(String(company.payroll_cost_mode||''))?String(company.payroll_cost_mode):'realtime_estimate';
+      const monthState=await payrollPeriodSummary(pool,req.auth.companyId,month,period),monthStates=await recentPayrollMonthStates(pool,req.auth.companyId,activation.month);
+      return res.json({month,costMode,monthState,monthStates,events:[],settlements:[],employees:[],systemActivationDate:activation.date,systemActivationMonth:activation.month,beforeActivation:true});
+    }
     const params=[req.auth.companyId,month];let branchClause='';
     if(u.role!=='admin'){params.push(String(u.branch_id||''));branchClause=` AND p.branch_id=$${params.length}`;}
     const q=await pool.query(`SELECT p.*,u.name employee_name,u.position,u.salary_type FROM payroll_settlements p JOIN users u ON u.id=p.employee_id WHERE p.company_id=$1 AND p.month=$2${branchClause} ORDER BY u.name,p.employee_id`,params);
@@ -2451,7 +2538,7 @@ app.get('/api/admin/payroll',auth,requireActiveCompany,async(req,res,next)=>{
     const costMode=['realtime_estimate','settled_only'].includes(String(company.payroll_cost_mode||''))?String(company.payroll_cost_mode):'realtime_estimate';
     const monthState=await payrollPeriodSummary(pool,req.auth.companyId,month,period),monthStates=await recentPayrollMonthStates(pool,req.auth.companyId,month);
     const events=(await pool.query('SELECT action,actor,detail,created_at FROM payroll_month_events WHERE company_id=$1 AND month=$2 ORDER BY id DESC LIMIT 20',[req.auth.companyId,month])).rows;
-    res.json({month,costMode,monthState,monthStates,events,settlements:q.rows.map(x=>({id:x.id,employeeId:x.employee_id,employeeName:x.employee_name,position:x.position||'',salaryType:x.salary_type||'fixed',branchId:x.branch_id||'',baseSalary:Number(x.base_salary||0),commission:Number(x.commission||0),allowance:Number(x.allowance||0),overtime:Number(x.overtime||0),deductions:Number(x.deductions||0),totalCost:Number(x.total_cost||0),status:x.status,settledAt:x.settled_at,settledBy:x.settled_by,note:x.note||''})),employees:usersQ.rows.map(userDto)});
+    res.json({month,costMode,monthState,monthStates,events,settlements:q.rows.map(x=>({id:x.id,employeeId:x.employee_id,employeeName:x.employee_name,position:x.position||'',salaryType:x.salary_type||'fixed',branchId:x.branch_id||'',baseSalary:Number(x.base_salary||0),commission:Number(x.commission||0),allowance:Number(x.allowance||0),overtime:Number(x.overtime||0),deductions:Number(x.deductions||0),totalCost:Number(x.total_cost||0),status:x.status,settledAt:x.settled_at,settledBy:x.settled_by,note:x.note||''})),employees:usersQ.rows.map(userDto),systemActivationDate:activation.date,systemActivationMonth:activation.month,beforeActivation:false});
   }catch(e){if(e?.message==='INVALID_PAYROLL_MONTH')return res.status(400).json({error:'月份格式不正確'});next(e)}
 });
 
@@ -2475,6 +2562,7 @@ app.post('/api/admin/payroll/month/lock',auth,requireActiveCompany,async(req,res
     if(month>=payrollCurrentMonth())return res.status(409).json({error:'目前月份尚未結束，不能封帳'});
     await client.query('BEGIN');
     const period=await ensurePayrollPeriod(client,req.auth.companyId,month,{refreshCurrent:false});
+    if(period.preActivation){await client.query('ROLLBACK');return res.status(409).json({error:`${period.activationDate||''} 為系統正式啟用日，啟用前月份不納入薪資月結`});}
     const summary=await payrollPeriodSummary(client,req.auth.companyId,month,period);
     if(summary.locked){await client.query('ROLLBACK');return res.json({ok:true,monthState:summary});}
     if(summary.remainingCount>0){await client.query('ROLLBACK');return res.status(409).json({error:`尚有 ${summary.remainingCount} 位員工未結算，不能封帳`});}
@@ -2493,6 +2581,7 @@ app.post('/api/admin/payroll/month/unlock',auth,requireActiveCompany,async(req,r
     const month=String(req.body?.month||'');if(!/^\d{4}-\d{2}$/.test(month))return res.status(400).json({error:'月份格式不正確'});
     const reason=String(req.body?.reason||'').trim().slice(0,500);if(!reason)return res.status(400).json({error:'解除封帳必須填寫原因'});
     await client.query('BEGIN');const period=await ensurePayrollPeriod(client,req.auth.companyId,month,{refreshCurrent:false});
+    if(period.preActivation){await client.query('ROLLBACK');return res.status(409).json({error:`${period.activationDate||''} 為系統正式啟用日，啟用前月份不納入薪資月結`});}
     if(!period.locked){await client.query('ROLLBACK');return res.json({ok:true,monthState:await payrollPeriodSummary(client,req.auth.companyId,month,period)});}
     const at=now(),who=actor.name||actor.username;
     await client.query('UPDATE payroll_month_periods SET locked=FALSE,unlocked_at=$1,unlocked_by=$2,updated_at=$1 WHERE company_id=$3 AND month=$4',[at,who,req.auth.companyId,month]);
@@ -2509,6 +2598,7 @@ app.post('/api/admin/payroll/settle',auth,requireActiveCompany,async(req,res,nex
     const employeeId=String(req.body?.employeeId||''),month=String(req.body?.month||today().slice(0,7));
     if(!/^\d{4}-\d{2}$/.test(month))return res.status(400).json({error:'月份格式不正確'});
     const period=await ensurePayrollPeriod(client,req.auth.companyId,month,{refreshCurrent:true,addEmployeeId:employeeId});
+    if(period.preActivation)return res.status(409).json({error:`${period.activationDate||''} 為系統正式啟用日，啟用前月份不納入薪資結算`});
     if(period.locked)return res.status(409).json({error:'此月份已封帳，如需修改請先由公司管理員解除封帳'});
     const emp=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[employeeId,req.auth.companyId])).rows[0];
     if(!emp)return res.status(404).json({error:'找不到員工'});
@@ -3116,7 +3206,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.5.0',apiVersion:'6.5.0',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.6.0',apiVersion:'6.6.0',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -3553,7 +3643,7 @@ app.post('/api/super/companies',superAuth,async(req,res,next)=>{
     const id=`admin_${crypto.randomUUID()}`;
     const defaultBranchId=companyCode+'_main';const snapshot={settings:{companyName,taxRate:0,defaultBranchId},users:[{id,username,password:'',name:ownerName,role:'admin',branchId:defaultBranchId,commissionRate:0,baseSalary:0}],cars:[],saleRequests:[],operationLogs:[]};
     await client.query('BEGIN');
-    await client.query(`INSERT INTO companies(id,name,enabled,start_date,expires_at,created_at,created_by,contact_email,trial) VALUES($1,$2,$3,$4,$5,$6,'manual',$7,$8)`,[companyCode,companyName,enabled,startDate,expiresAt,now(),String(b.email||''),trial]);
+    await client.query(`INSERT INTO companies(id,name,enabled,start_date,expires_at,created_at,created_by,contact_email,trial,system_activation_date,system_activation_set_at,system_activation_set_by,owner_user_id) VALUES($1,$2,$3,$4,$5,$6,'manual',$7,$8,$4,$6,'Super Admin',$9)`,[companyCode,companyName,enabled,startDate,expiresAt,now(),String(b.email||''),trial,id]);
     await client.query(`INSERT INTO branches(id,company_id,code,name,is_head_office,enabled,address,phone,created_at,updated_at) VALUES($1,$2,'MAIN','總店',TRUE,TRUE,'','',$3,$3)`,[defaultBranchId,companyCode,now()]);
     await client.query(`INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id) VALUES($1,$2,$3,$4,$5,'admin',0,0,TRUE,$6,$7)`,[id,companyCode,username,hashPassword(password),ownerName,now(),defaultBranchId]);
     await client.query(`INSERT INTO snapshots(company_id,version,json,updated_at) VALUES($1,1,$2::jsonb,$3)`,[companyCode,JSON.stringify(snapshot),now()]);
@@ -3664,14 +3754,14 @@ app.get('/api/super/security-center',superAuth,async(req,res,next)=>{try{const [
 app.get('/api/super/security/audit',superAuth,async(req,res,next)=>{try{const page=Math.max(1,Number(req.query.page||1)),limit=10,offset=(page-1)*limit,filter=String(req.query.category||'').trim();const where=filter?'WHERE category=$1':'';const params=filter?[filter]:[];const total=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM security_audit_events ${where}`,params)).rows[0]?.n||0);const rows=(await pool.query(`SELECT id,actor,actor_role,company_id,action,category,status,ip,target_type,target_id,detail,metadata,created_at FROM security_audit_events ${where} ORDER BY id DESC LIMIT 10 OFFSET ${offset}`,params)).rows;res.json({rows,page,pageSize:limit,total,totalPages:Math.max(1,Math.ceil(total/limit))})}catch(e){next(e)}});
 app.post('/api/super/security/integrity-check',superAuth,async(req,res,next)=>{try{const result=await phase10DataIntegritySummary();await auditSecurityEvent(req,{action:'phase10c_integrity_check',category:'data_integrity',status:result.status,detail:`duplicateUsers=${result.duplicateUsers}, missingSnapshots=${result.missingSnapshots}, saleProblems=${result.saleProblems}`});res.json(result)}catch(e){next(e)}});
 app.get('/api/super/security/release-readiness',superAuth,async(req,res,next)=>{try{res.json(await phase10ReleaseReadiness())}catch(e){next(e)}});
-app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'14.5.0','6.5.0',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
+app.post('/api/super/security/release-snapshot',superAuth,async(req,res,next)=>{try{const readiness=await phase10ReleaseReadiness(),releaseId=`rel_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO release_control_events(release_id,server_version,api_version,schema_version,status,readiness,actor,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)`,[releaseId,'14.6.0','6.6.0',readiness.schemaCurrent,readiness.status,JSON.stringify(readiness),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'release_readiness_snapshot',category:'release',status:'success',targetType:'release',targetId:releaseId,detail:'Rollback readiness snapshot created'});res.json({ok:true,releaseId,readiness})}catch(e){next(e)}});
 app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const rows=(await pool.query(`SELECT * FROM release_control_events ORDER BY id DESC LIMIT 50`)).rows;res.json({rows})}catch(e){next(e)}});
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.5.0',apiVersion:'6.5.0',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.6.0',apiVersion:'6.6.0',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
-app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.5.0',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
+app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.6.0',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/cancel',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='cancelled',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_cancel',category:'commercial_launch',status:'success',targetType:'company',targetId:companyId,detail:'Pilot cancelled'});res.json({ok:true})}catch(e){next(e)}});
 
