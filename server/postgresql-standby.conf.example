@@ -1,0 +1,5 @@
+# Example only — PostgreSQL 12+ standby uses standby.signal
+hot_standby = on
+# primary_conninfo must use a dedicated least-privilege replication account.
+# primary_conninfo = 'host=PRIMARY_IP port=5432 user=replicator password=CHANGE_ME application_name=central-standby sslmode=require'
+# primary_slot_name = 'central_standby_1'

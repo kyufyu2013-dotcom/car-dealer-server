@@ -2054,14 +2054,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.18',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.19',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.18',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.19',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -4555,8 +4555,7 @@ app.patch('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,ne
 
 // -------------------- Phase 15C：零件中心核心 --------------------
 function partDto(r){return {id:r.id,name:r.name||'',nickname:r.nickname||'',brand:r.brand||'',spec:r.spec||'',sourceSupplier:r.source_supplier||'',salePrice:Number(r.sale_price||0),partNo:r.part_no||'',barcode:r.barcode||'',note:r.note||'',avgCost:Number(r.avg_cost||0),quantity:Number(r.quantity||0),totalQuantity:Number(r.total_quantity||r.quantity||0),stockCost:Number(r.stock_cost||0),updatedAt:r.updated_at||''}}
-// Phase 15C：零件中心不做人員帳號／角色檢查，也不記錄操作人員。
-// 只要已登入且車行授權有效即可使用；分店由畫面傳入 branchId 決定。
+// Phase 15C：車行端零件中心不綁人員帳號／角色；登入且公司授權有效即可使用。
 function partClean(v,max=300){return String(v||'').trim().slice(0,max)}
 function partNumber(v){const n=Number(v);return Number.isFinite(n)?n:NaN}
 
@@ -4575,7 +4574,7 @@ app.post('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
   const b=req.body||{},name=partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});
   const salePrice=partNumber(b.salePrice||0);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});
   const ts=now(),id=`part_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
-  const r=(await pool.query(`INSERT INTO parts(id,company_id,name,nickname,brand,spec,source_supplier,sale_price,part_no,barcode,note,avg_cost,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,NULL,'',$12,$12) RETURNING *`,[id,req.auth.companyId,name,partClean(b.nickname),partClean(b.brand),partClean(b.spec),partClean(b.sourceSupplier,500),salePrice,partClean(b.partNo),partClean(b.barcode),partClean(b.note,2000),ts])).rows[0];
+  const r=(await pool.query(`INSERT INTO parts(id,company_id,name,nickname,brand,spec,source_supplier,sale_price,part_no,barcode,note,avg_cost,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$14,$14) RETURNING *`,[id,req.auth.companyId,name,partClean(b.nickname),partClean(b.brand),partClean(b.spec),partClean(b.sourceSupplier,500),salePrice,partClean(b.partNo),partClean(b.barcode),partClean(b.note,2000),null,'',ts])).rows[0];
   res.json({ok:true,part:partDto(r)});
 }catch(e){next(e)}});
 

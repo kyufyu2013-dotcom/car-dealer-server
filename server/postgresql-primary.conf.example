@@ -1,0 +1,7 @@
+# Example only — tune for your PostgreSQL version and workload
+wal_level = replica
+max_wal_senders = 10
+max_replication_slots = 10
+wal_keep_size = 2048MB
+hot_standby = on
+# archive_mode/archive_command should be configured for your backup design.
