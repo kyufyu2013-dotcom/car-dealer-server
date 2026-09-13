@@ -577,7 +577,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=33;
+const SERVER_SCHEMA_TARGET=34;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1573,6 +1573,33 @@ const SERVER_MIGRATIONS=[
       UPDATE users SET permissions=jsonb_set(COALESCE(permissions,'{}'::jsonb),'{serviceManage}','true'::jsonb,true)
       WHERE role IN ('admin','branchManager','staff') AND NOT (COALESCE(permissions,'{}'::jsonb) ? 'serviceManage');
     `
+  },
+  {
+    version:34,
+    name:'phase15b-service-order-items-status',
+    sql:`
+      UPDATE service_orders SET status='waiting_repair' WHERE status='open';
+      CREATE TABLE IF NOT EXISTS service_order_items(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        order_id TEXT NOT NULL REFERENCES service_orders(id) ON DELETE CASCADE,
+        item_name TEXT NOT NULL DEFAULT '',
+        sale_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+        labor_fee NUMERIC(14,2),
+        labor_hours NUMERIC(10,2),
+        description TEXT NOT NULL DEFAULT '',
+        technician_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        technician_name TEXT NOT NULL DEFAULT '',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_by_id TEXT NOT NULL DEFAULT '',
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_order_items_order_sort ON service_order_items(order_id,sort_order,created_at);
+      CREATE INDEX IF NOT EXISTS idx_service_order_items_company_order ON service_order_items(company_id,order_id);
+      CREATE INDEX IF NOT EXISTS idx_service_order_items_technician ON service_order_items(company_id,technician_id) WHERE technician_id IS NOT NULL;
+    `
   }];
 
 async function ensureMigrationTable(client=pool){
@@ -1971,14 +1998,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.15',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.16',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.15',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15a-service-vehicle-intake-core'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.16',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15b-service-order-core'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3718,7 +3745,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders'];
+const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -3752,7 +3779,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders'];
+const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
@@ -4398,7 +4425,9 @@ function normalizeServicePlate(value){
 function validServicePlate(value){return /^[A-Z]+-[0-9]+$/.test(normalizeServicePlate(value))}
 function normalizeServiceIdentity(value){return String(value||'').toUpperCase().replace(/[\s\-－—_]/g,'').replace(/[^A-Z0-9]/g,'').slice(0,80)}
 function serviceVehicleDto(r){return {id:r.id,plate:r.plate||'',customerName:r.customer_name||'',phone:r.phone||'',address:r.address||'',engineNo:r.engine_no||'',chassisNo:r.chassis_no||'',note:r.note||'',currentMileage:r.current_mileage===null?null:Number(r.current_mileage),createdBranchId:r.created_branch_id||'',lastBranchId:r.last_branch_id||'',lastVisitAt:r.last_visit_at||'',createdAt:r.created_at||'',updatedAt:r.updated_at||''}}
-function serviceOrderDto(r){return {id:r.id,vehicleId:r.vehicle_id,branchId:r.branch_id,branchName:r.branch_name||'',status:r.status||'open',plate:r.intake_plate||'',mileage:r.mileage===null?null:Number(r.mileage),engineNo:r.engine_no||'',chassisNo:r.chassis_no||'',note:r.customer_note_snapshot||'',arrivedAt:r.arrived_at||'',createdById:r.created_by_id||'',createdByName:r.created_by_name||'',canceledAt:r.canceled_at||'',canceledByName:r.canceled_by_name||'',cancelReason:r.cancel_reason||''}}
+function serviceItemDto(r){return {id:r.id,orderId:r.order_id,itemName:r.item_name||'',salePrice:Number(r.sale_price||0),laborFee:r.labor_fee===null?null:Number(r.labor_fee),laborHours:r.labor_hours===null?null:Number(r.labor_hours),description:r.description||'',technicianId:r.technician_id||'',technicianName:r.technician_name||'',sortOrder:Number(r.sort_order||0),createdAt:r.created_at||'',updatedAt:r.updated_at||''}}
+function serviceOrderDto(r){return {id:r.id,vehicleId:r.vehicle_id,branchId:r.branch_id,branchName:r.branch_name||'',status:r.status||'waiting_repair',plate:r.intake_plate||'',mileage:r.mileage===null?null:Number(r.mileage),engineNo:r.engine_no||'',chassisNo:r.chassis_no||'',note:r.customer_note_snapshot||'',arrivedAt:r.arrived_at||'',createdById:r.created_by_id||'',createdByName:r.created_by_name||'',canceledAt:r.canceled_at||'',canceledByName:r.canceled_by_name||'',cancelReason:r.cancel_reason||'',items:Array.isArray(r.items)?r.items:[],itemsTotal:Number(r.items_total||0)}}
+function isServiceTechnicianPosition(position){const p=String(position||'').trim();return p==='技師'||p.includes('維修技師')||p.includes('機車技師')||p.includes('汽車技師')||p.includes('重機技師')}
 async function serviceActor(req,client=pool){return (await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0]||null}
 async function requireServiceActor(req,res,client=pool){const u=await serviceActor(req,client);if(!u||!hasPermission(u,'serviceManage')){res.status(403).json({error:'你的帳號沒有維修管理權限'});return null}return u}
 async function resolveServiceBranch(req,actor,branchId,client=pool){
@@ -4412,8 +4441,13 @@ async function resolveServiceBranch(req,actor,branchId,client=pool){
 }
 async function serviceHistory(companyId,vehicleId,client=pool,limit=100){
   const rows=(await client.query(`SELECT o.*,b.name AS branch_name FROM service_orders o LEFT JOIN branches b ON b.id=o.branch_id WHERE o.company_id=$1 AND o.vehicle_id=$2 ORDER BY o.arrived_at DESC,o.created_at DESC LIMIT $3`,[companyId,vehicleId,Math.max(1,Math.min(300,Number(limit||100)))])).rows;
-  return rows.map(serviceOrderDto);
+  if(!rows.length)return [];
+  const ids=rows.map(x=>x.id),items=(await client.query(`SELECT * FROM service_order_items WHERE company_id=$1 AND order_id=ANY($2::text[]) ORDER BY order_id,sort_order,created_at`,[companyId,ids])).rows;
+  const by=new Map();for(const x of items){if(!by.has(x.order_id))by.set(x.order_id,[]);by.get(x.order_id).push(serviceItemDto(x))}
+  return rows.map(r=>{const its=by.get(r.id)||[];return serviceOrderDto({...r,items:its,items_total:its.reduce((n,x)=>n+Number(x.salePrice||0),0)})});
 }
+async function serviceOrderForWrite(req,res,client,orderId){const actor=await requireServiceActor(req,res,client);if(!actor)return null;const order=(await client.query('SELECT * FROM service_orders WHERE id=$1 AND company_id=$2',[orderId,req.auth.companyId])).rows[0];if(!order){res.status(404).json({error:'找不到維修工單'});return null}if(actor.role!=='admin'&&String(actor.branch_id||'')!==String(order.branch_id||'')){res.status(403).json({error:'只能操作自己分店的維修工單'});return null}return {actor,order}}
+async function serviceTechnician(client,companyId,order,technicianId){const id=String(technicianId||'');if(!id)return null;const u=(await client.query('SELECT id,name,position,branch_id,enabled FROM users WHERE id=$1 AND company_id=$2',[id,companyId])).rows[0];if(!u||!u.enabled||!isServiceTechnicianPosition(u.position))throw Object.assign(new Error('只能選擇人員管理中職務為維修技師的現職人員'),{statusCode:400});if(u.branch_id&&String(u.branch_id)!==String(order.branch_id||''))throw Object.assign(new Error('此技師不屬於本次進廠分店'),{statusCode:400});return u}
 
 app.get('/api/service/lookup',auth,requireActiveCompany,async(req,res,next)=>{try{
   const actor=await requireServiceActor(req,res);if(!actor)return;
@@ -4447,7 +4481,7 @@ app.post('/api/service/intakes',auth,requireActiveCompany,async(req,res,next)=>{
     v=(await client.query(`UPDATE service_vehicles SET plate=$1,engine_no=CASE WHEN $2<>'' THEN $2 ELSE engine_no END,chassis_no=CASE WHEN $3<>'' THEN $3 ELSE chassis_no END,current_mileage=COALESCE($4,current_mileage),last_branch_id=$5,last_visit_at=$6,updated_at=$6 WHERE id=$7 RETURNING *`,[plate,engineNo,chassisNo,mileage,branch.id,ts,v.id])).rows[0];
   }
   const orderId=`so_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
-  const o=(await client.query(`INSERT INTO service_orders(id,company_id,vehicle_id,branch_id,status,intake_plate,mileage,engine_no,chassis_no,customer_note_snapshot,arrived_at,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,'open',$5,$6,$7,$8,$9,$10,$11,$12,$10,$10) RETURNING *`,[orderId,req.auth.companyId,v.id,branch.id,plate,mileage,engineNo||v.engine_no||'',chassisNo||v.chassis_no||'',v.note||'',ts,String(actor.id),actorName])).rows[0];
+  const o=(await client.query(`INSERT INTO service_orders(id,company_id,vehicle_id,branch_id,status,intake_plate,mileage,engine_no,chassis_no,customer_note_snapshot,arrived_at,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,'waiting_repair',$5,$6,$7,$8,$9,$10,$11,$12,$10,$10) RETURNING *`,[orderId,req.auth.companyId,v.id,branch.id,plate,mileage,engineNo||v.engine_no||'',chassisNo||v.chassis_no||'',v.note||'',ts,String(actor.id),actorName])).rows[0];
   if(isNew===false&&b.customerName!==undefined){v=(await client.query(`UPDATE service_vehicles SET customer_name=$1,phone=$2,address=$3,note=$4,updated_at=$5 WHERE id=$6 RETURNING *`,[String(b.customerName||'').trim().slice(0,120),String(b.phone||'').trim().slice(0,80),String(b.address||'').trim().slice(0,500),String(b.note??v.note??'').trim().slice(0,2000),ts,v.id])).rows[0]}
   await client.query('COMMIT');recordSyncEvent(req.auth.companyId,'service_intake',`維修車輛進廠：${plate}`,{actor:actor.username||actor.name});
   const order={...serviceOrderDto({...o,branch_name:branch.name})};res.json({ok:true,isNewVehicle:isNew,vehicle:serviceVehicleDto(v),order,history:await serviceHistory(req.auth.companyId,v.id,pool,100)});
@@ -4460,6 +4494,25 @@ app.get('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,next
 app.patch('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await requireServiceActor(req,res,client);if(!actor)return;await client.query('BEGIN');const old=(await client.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.params.id,req.auth.companyId])).rows[0];if(!old){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車輛資料'});}const b=req.body||{},plate=b.plate===undefined?old.plate:normalizeServicePlate(b.plate);if(!plate||!validServicePlate(plate)){await client.query('ROLLBACK');return res.status(400).json({error:'車牌格式不正確'});}const dup=(await client.query('SELECT id,plate,customer_name FROM service_vehicles WHERE company_id=$1 AND plate=$2 AND id<>$3',[req.auth.companyId,plate,old.id])).rows[0];if(dup){await client.query('ROLLBACK');return res.status(409).json({error:'此車牌已有其他車輛資料，不能直接改成重複車牌',existingVehicle:{id:dup.id,plate:dup.plate,customerName:dup.customer_name||''}});}const mileage=b.currentMileage===undefined?old.current_mileage:(b.currentMileage===''||b.currentMileage===null?null:Number(b.currentMileage));if(mileage!==null&&(!Number.isFinite(mileage)||mileage<0)){await client.query('ROLLBACK');return res.status(400).json({error:'里程格式不正確'});}const v=(await client.query(`UPDATE service_vehicles SET plate=$1,customer_name=$2,phone=$3,address=$4,engine_no=$5,chassis_no=$6,note=$7,current_mileage=$8,updated_at=$9 WHERE id=$10 RETURNING *`,[plate,String(b.customerName===undefined?old.customer_name:b.customerName||'').trim().slice(0,120),String(b.phone===undefined?old.phone:b.phone||'').trim().slice(0,80),String(b.address===undefined?old.address:b.address||'').trim().slice(0,500),b.engineNo===undefined?old.engine_no:normalizeServiceIdentity(b.engineNo),b.chassisNo===undefined?old.chassis_no:normalizeServiceIdentity(b.chassisNo),String(b.note===undefined?old.note:b.note||'').trim().slice(0,2000),mileage,now(),old.id])).rows[0];await client.query('COMMIT');res.json({ok:true,vehicle:serviceVehicleDto(v),history:await serviceHistory(req.auth.companyId,v.id,pool,200)});
 }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
+
+
+app.patch('/api/service/orders/:id/status',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const ctx=await serviceOrderForWrite(req,res,client,req.params.id);if(!ctx)return;const status=String(req.body?.status||'');const allowed=new Set(['waiting_repair','quoting','waiting_parts','ready_delivery']);if(!allowed.has(status))return res.status(400).json({error:'維修狀態不正確'});if(['canceled','completed'].includes(ctx.order.status))return res.status(409).json({error:'已取消或已交車工單不能再修改在廠狀態'});const ts=now();const o=(await client.query('UPDATE service_orders SET status=$1,updated_at=$2 WHERE id=$3 RETURNING *',[status,ts,ctx.order.id])).rows[0];res.json({ok:true,order:serviceOrderDto(o)});
+}catch(e){next(e)}finally{client.release()}});
+
+app.post('/api/service/orders/:id/items',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const ctx=await serviceOrderForWrite(req,res,client,req.params.id);if(!ctx)return;if(['canceled','completed'].includes(ctx.order.status))return res.status(409).json({error:'已取消或已交車工單不能新增項目'});const list=Array.isArray(req.body?.items)?req.body.items:[];if(!list.length)return res.status(400).json({error:'請至少新增一個維修／改裝項目'});if(list.length>30)return res.status(400).json({error:'一次最多新增 30 個項目'});await client.query('BEGIN');const max=Number((await client.query('SELECT COALESCE(MAX(sort_order),0)::int AS n FROM service_order_items WHERE order_id=$1',[ctx.order.id])).rows[0]?.n||0),ts=now(),actorName=String(ctx.actor.name||ctx.actor.username||''),created=[];let idx=0;
+  for(const raw of list){const itemName=String(raw?.itemName||'').trim().slice(0,300);if(!itemName){await client.query('ROLLBACK');return res.status(400).json({error:'項目名稱不能空白'});}const salePrice=Number(raw?.salePrice||0);if(!Number.isFinite(salePrice)||salePrice<0){await client.query('ROLLBACK');return res.status(400).json({error:`${itemName} 的價格不正確`});}const id=`si_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;const r=(await client.query(`INSERT INTO service_order_items(id,company_id,order_id,item_name,sale_price,sort_order,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *`,[id,req.auth.companyId,ctx.order.id,itemName,salePrice,max+(++idx),String(ctx.actor.id),actorName,ts])).rows[0];created.push(serviceItemDto(r));}
+  await client.query('UPDATE service_orders SET updated_at=$1 WHERE id=$2',[ts,ctx.order.id]);await client.query('COMMIT');res.json({ok:true,items:created});
+}catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
+
+app.patch('/api/service/orders/:orderId/items/:itemId',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const ctx=await serviceOrderForWrite(req,res,client,req.params.orderId);if(!ctx)return;if(['canceled','completed'].includes(ctx.order.status))return res.status(409).json({error:'已取消或已交車工單不能修改項目'});const old=(await client.query('SELECT * FROM service_order_items WHERE id=$1 AND order_id=$2 AND company_id=$3',[req.params.itemId,ctx.order.id,req.auth.companyId])).rows[0];if(!old)return res.status(404).json({error:'找不到維修項目'});const b=req.body||{},itemName=b.itemName===undefined?old.item_name:String(b.itemName||'').trim().slice(0,300);if(!itemName)return res.status(400).json({error:'項目名稱不能空白'});const salePrice=b.salePrice===undefined?Number(old.sale_price||0):Number(b.salePrice);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'價格格式不正確'});const parseNullable=(v,oldv)=>v===undefined?(oldv===null?null:Number(oldv)):(v===''||v===null?null:Number(v));const laborFee=parseNullable(b.laborFee,old.labor_fee),laborHours=parseNullable(b.laborHours,old.labor_hours);if(laborFee!==null&&(!Number.isFinite(laborFee)||laborFee<0))return res.status(400).json({error:'工資格式不正確'});if(laborHours!==null&&(!Number.isFinite(laborHours)||laborHours<0))return res.status(400).json({error:'工時格式不正確'});let tech=null;let technicianId='',technicianName='';if(b.technicianId===undefined){technicianId=String(old.technician_id||'');technicianName=String(old.technician_name||'')}else{technicianId=String(b.technicianId||'');if(technicianId)tech=await serviceTechnician(client,req.auth.companyId,ctx.order,technicianId);technicianName=tech?String(tech.name||''):'';}const description=b.description===undefined?old.description:String(b.description||'').trim().slice(0,4000),ts=now();const r=(await client.query(`UPDATE service_order_items SET item_name=$1,sale_price=$2,labor_fee=$3,labor_hours=$4,description=$5,technician_id=$6,technician_name=$7,updated_at=$8 WHERE id=$9 RETURNING *`,[itemName,salePrice,laborFee,laborHours,description,technicianId||null,technicianName,ts,old.id])).rows[0];await client.query('UPDATE service_orders SET updated_at=$1 WHERE id=$2',[ts,ctx.order.id]);res.json({ok:true,item:serviceItemDto(r)});
+}catch(e){if(e?.statusCode)return res.status(e.statusCode).json({error:e.message});next(e)}finally{client.release()}});
+
+app.delete('/api/service/orders/:orderId/items/:itemId',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const ctx=await serviceOrderForWrite(req,res,client,req.params.orderId);if(!ctx)return;if(['canceled','completed'].includes(ctx.order.status))return res.status(409).json({error:'已取消或已交車工單不能刪除項目'});const r=await client.query('DELETE FROM service_order_items WHERE id=$1 AND order_id=$2 AND company_id=$3 RETURNING id',[req.params.itemId,ctx.order.id,req.auth.companyId]);if(!r.rowCount)return res.status(404).json({error:'找不到維修項目'});await client.query('UPDATE service_orders SET updated_at=$1 WHERE id=$2',[now(),ctx.order.id]);res.json({ok:true});
+}catch(e){next(e)}finally{client.release()}});
 
 app.patch('/api/service/orders/:id/cancel',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const actor=await requireServiceActor(req,res,client);if(!actor)return;const o=(await client.query('SELECT * FROM service_orders WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!o)return res.status(404).json({error:'找不到進廠工單'});if(actor.role!=='admin'&&String(actor.branch_id||'')!==String(o.branch_id))return res.status(403).json({error:'只能取消自己分店的進廠工單'});if(o.status==='canceled')return res.json({ok:true});const reason=String(req.body?.reason||'客戶取消／未施工').trim().slice(0,500),ts=now();await client.query(`UPDATE service_orders SET status='canceled',canceled_at=$1,canceled_by_id=$2,canceled_by_name=$3,cancel_reason=$4,updated_at=$1 WHERE id=$5`,[ts,String(actor.id),String(actor.name||actor.username||''),reason,o.id]);res.json({ok:true});
@@ -4478,6 +4531,7 @@ app.use((err,req,res,next)=>{
   const code=String(err?.code||'SERVER_UNHANDLED_001');
   const companyId=req?.auth?.companyId||null;
   recordDiagnostic(companyId,code,'central_api',err?.message||'伺服器發生錯誤',{severity:'error',actor:req?.auth?.username||'',context:{method:req?.method,path:req?.path,httpStatus:500}}).catch(()=>{});
+  if(err?.statusCode)return res.status(err.statusCode).json({error:err.message||'請求失敗'});
   res.status(500).json({error:'伺服器發生錯誤',errorCode:'SERVER_UNHANDLED_001'});
 });
 
