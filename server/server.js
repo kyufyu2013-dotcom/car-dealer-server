@@ -374,10 +374,10 @@ function userDto(u){
 }
 
 const ROLE_PERMISSION_DEFAULTS={
-  admin:{vehicleView:true,vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:true,saleApprove:true,saleReject:true,saleCancel:true,peopleManage:true,viewCosts:true,viewReports:true,operatingCostManage:true},
-  branchManager:{vehicleView:true,vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:true,saleApprove:true,saleReject:true,saleCancel:false,peopleManage:true,viewCosts:true,viewReports:true,operatingCostManage:false},
-  sales:{vehicleView:true,vehicleCreate:false,vehicleEdit:false,vehicleDelete:false,vehicleTransfer:false,saleApprove:false,saleReject:false,saleCancel:false,peopleManage:false,viewCosts:false,viewReports:false,operatingCostManage:false},
-  staff:{vehicleView:false,vehicleCreate:false,vehicleEdit:false,vehicleDelete:false,vehicleTransfer:false,saleApprove:false,saleReject:false,saleCancel:false,peopleManage:false,viewCosts:false,viewReports:false,operatingCostManage:false}
+  admin:{vehicleView:true,vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:true,saleApprove:true,saleReject:true,saleCancel:true,peopleManage:true,viewCosts:true,viewReports:true,operatingCostManage:true,serviceManage:true},
+  branchManager:{vehicleView:true,vehicleCreate:true,vehicleEdit:true,vehicleDelete:true,vehicleTransfer:true,saleApprove:true,saleReject:true,saleCancel:false,peopleManage:true,viewCosts:true,viewReports:true,operatingCostManage:false,serviceManage:true},
+  sales:{vehicleView:true,vehicleCreate:false,vehicleEdit:false,vehicleDelete:false,vehicleTransfer:false,saleApprove:false,saleReject:false,saleCancel:false,peopleManage:false,viewCosts:false,viewReports:false,operatingCostManage:false,serviceManage:false},
+  staff:{vehicleView:false,vehicleCreate:false,vehicleEdit:false,vehicleDelete:false,vehicleTransfer:false,saleApprove:false,saleReject:false,saleCancel:false,peopleManage:false,viewCosts:false,viewReports:false,operatingCostManage:false,serviceManage:true}
 };
 function effectivePermissions(user){return {...(ROLE_PERMISSION_DEFAULTS[user?.role]||{}),...((user?.permissions&&typeof user.permissions==='object')?user.permissions:{})}}
 function hasPermission(user,key){return !!effectivePermissions(user)[key]}
@@ -577,7 +577,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=32;
+const SERVER_SCHEMA_TARGET=33;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1515,6 +1515,64 @@ const SERVER_MIGRATIONS=[
         );
       DELETE FROM security_audit_events WHERE action IN ('super_remote_data_center_access','super_remote_live_snapshot_request');
     `
+  },
+  {
+    version:33,
+    name:'phase15a-service-vehicle-intake-core',
+    sql:`
+      CREATE TABLE IF NOT EXISTS service_vehicles(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        plate TEXT NOT NULL,
+        customer_name TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '',
+        address TEXT NOT NULL DEFAULT '',
+        engine_no TEXT NOT NULL DEFAULT '',
+        chassis_no TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        current_mileage BIGINT,
+        created_branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+        last_branch_id TEXT REFERENCES branches(id) ON DELETE SET NULL,
+        last_visit_at TEXT,
+        created_by_id TEXT NOT NULL DEFAULT '',
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(company_id,plate)
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_vehicles_company_plate ON service_vehicles(company_id,plate);
+      CREATE INDEX IF NOT EXISTS idx_service_vehicles_company_engine ON service_vehicles(company_id,engine_no) WHERE engine_no<>'';
+      CREATE INDEX IF NOT EXISTS idx_service_vehicles_company_chassis ON service_vehicles(company_id,chassis_no) WHERE chassis_no<>'';
+      CREATE INDEX IF NOT EXISTS idx_service_vehicles_company_phone ON service_vehicles(company_id,phone) WHERE phone<>'';
+
+      CREATE TABLE IF NOT EXISTS service_orders(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        vehicle_id TEXT NOT NULL REFERENCES service_vehicles(id) ON DELETE CASCADE,
+        branch_id TEXT NOT NULL REFERENCES branches(id),
+        status TEXT NOT NULL DEFAULT 'open',
+        intake_plate TEXT NOT NULL DEFAULT '',
+        mileage BIGINT,
+        engine_no TEXT NOT NULL DEFAULT '',
+        chassis_no TEXT NOT NULL DEFAULT '',
+        customer_note_snapshot TEXT NOT NULL DEFAULT '',
+        arrived_at TEXT NOT NULL,
+        created_by_id TEXT NOT NULL DEFAULT '',
+        created_by_name TEXT NOT NULL DEFAULT '',
+        canceled_at TEXT,
+        canceled_by_id TEXT NOT NULL DEFAULT '',
+        canceled_by_name TEXT NOT NULL DEFAULT '',
+        cancel_reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_orders_company_vehicle_time ON service_orders(company_id,vehicle_id,arrived_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_service_orders_company_branch_time ON service_orders(company_id,branch_id,arrived_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_service_orders_company_status ON service_orders(company_id,status,arrived_at DESC);
+
+      UPDATE users SET permissions=jsonb_set(COALESCE(permissions,'{}'::jsonb),'{serviceManage}','true'::jsonb,true)
+      WHERE role IN ('admin','branchManager','staff') AND NOT (COALESCE(permissions,'{}'::jsonb) ? 'serviceManage');
+    `
   }];
 
 async function ensureMigrationTable(client=pool){
@@ -1913,14 +1971,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.14',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.15',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.14',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase14d3-payroll-month-six-card-boundary'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.15',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15a-service-vehicle-intake-core'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3660,7 +3718,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings'];
+const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -3694,7 +3752,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings'];
+const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
@@ -4329,6 +4387,91 @@ app.post('/api/super/subscriptions/providers/:id/rotate-secret',superAuth,async(
 app.post('/api/super/subscriptions/webhook-test',superAuth,async(req,res,next)=>{const client=await pool.connect();try{const b=req.body||{},providerId=String(b.providerId||'webhook_generic'),provider=(await client.query('SELECT * FROM payment_providers WHERE id=$1',[providerId])).rows[0];if(!provider)return res.status(404).json({error:'找不到付款通道'});const payload={companyId:String(b.companyId||''),eventType:String(b.eventType||'payment_succeeded'),providerEventId:String(b.providerEventId||`test_evt_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`),providerTransactionId:String(b.providerTransactionId||`test_tx_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`),amountCents:Math.max(0,Number(b.amountCents||0)),currency:'TWD',test:true};await client.query('BEGIN');const r=await applyProviderPayment(client,{provider,eventId:payload.providerEventId,eventType:payload.eventType,companyId:payload.companyId,providerTransactionId:payload.providerTransactionId,amountCents:payload.amountCents,currency:payload.currency,payload,actor:req.auth.username||req.auth.sub||'super_admin_test'});await client.query(`UPDATE payment_providers SET last_test_at=$1,last_test_status='success',updated_at=$1 WHERE id=$2`,[now(),provider.id]);await client.query('COMMIT');res.json({...r,testPayload:payload})}catch(e){try{await client.query('ROLLBACK')}catch{}next(e)}finally{client.release()}});
 app.post('/api/super/subscriptions/auto-renew/run',superAuth,async(req,res,next)=>{try{await cleanupPaymentTechLogs();const r=await runAutoRenewalSweep();await auditSecurityEvent(req,{action:'auto_renewal_sweep',category:'subscription',targetType:'billing_engine',targetId:'phase12g',detail:`自動續費掃描：${r.scanned} 筆，建立 ${r.attempted} 筆`});res.json(r)}catch(e){next(e)}});
 app.post('/api/payments/webhook/:providerId',async(req,res,next)=>{const client=await pool.connect();try{const provider=(await client.query(`SELECT * FROM payment_providers WHERE id=$1`,[req.params.providerId])).rows[0];if(!provider||!provider.enabled||!provider.webhook_enabled)return res.status(503).json({error:'此 Webhook 通道尚未啟用'});const sig=String(req.headers['x-webhook-signature']||'').replace(/^sha256=/,'').trim(),expected=webhookSignature(provider.webhook_secret,req.body||{});if(!safeEqualHex(sig,expected)){const b=req.body||{},eventId=String(b.providerEventId||`rejected_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`);await pool.query(`INSERT INTO payment_webhook_events(provider_id,provider_event_id,event_type,status,transaction_id,payload,error_text,received_at,processed_at) VALUES($1,$2,$3,'rejected_signature',$4,$5::jsonb,'Webhook 簽章驗證失敗',$6,$6) ON CONFLICT(provider_id,provider_event_id) DO NOTHING`,[provider.id,eventId,String(b.eventType||''),String(b.providerTransactionId||''),JSON.stringify({...b,companyId:String(b.companyId||'')}),now()]);return res.status(401).json({error:'Webhook 簽章驗證失敗'});}const b=req.body||{};await client.query('BEGIN');const r=await applyProviderPayment(client,{provider,eventId:b.providerEventId,eventType:b.eventType,companyId:b.companyId,providerTransactionId:b.providerTransactionId,amountCents:b.amountCents,currency:b.currency||'TWD',payload:b,actor:`webhook:${provider.id}`});await client.query('COMMIT');res.json(r)}catch(e){try{await client.query('ROLLBACK')}catch{}next(e)}finally{client.release()}});
+
+
+// -------------------- Phase 15A Service vehicle intake core --------------------
+function normalizeServicePlate(value){
+  const raw=String(value||'').toUpperCase().replace(/[\s\-－—_]/g,'').replace(/[^A-Z0-9]/g,'');
+  const m=raw.match(/^([A-Z]+)([0-9]+)$/);
+  return m?`${m[1]}-${m[2]}`:raw;
+}
+function validServicePlate(value){return /^[A-Z]+-[0-9]+$/.test(normalizeServicePlate(value))}
+function normalizeServiceIdentity(value){return String(value||'').toUpperCase().replace(/[\s\-－—_]/g,'').replace(/[^A-Z0-9]/g,'').slice(0,80)}
+function serviceVehicleDto(r){return {id:r.id,plate:r.plate||'',customerName:r.customer_name||'',phone:r.phone||'',address:r.address||'',engineNo:r.engine_no||'',chassisNo:r.chassis_no||'',note:r.note||'',currentMileage:r.current_mileage===null?null:Number(r.current_mileage),createdBranchId:r.created_branch_id||'',lastBranchId:r.last_branch_id||'',lastVisitAt:r.last_visit_at||'',createdAt:r.created_at||'',updatedAt:r.updated_at||''}}
+function serviceOrderDto(r){return {id:r.id,vehicleId:r.vehicle_id,branchId:r.branch_id,branchName:r.branch_name||'',status:r.status||'open',plate:r.intake_plate||'',mileage:r.mileage===null?null:Number(r.mileage),engineNo:r.engine_no||'',chassisNo:r.chassis_no||'',note:r.customer_note_snapshot||'',arrivedAt:r.arrived_at||'',createdById:r.created_by_id||'',createdByName:r.created_by_name||'',canceledAt:r.canceled_at||'',canceledByName:r.canceled_by_name||'',cancelReason:r.cancel_reason||''}}
+async function serviceActor(req,client=pool){return (await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0]||null}
+async function requireServiceActor(req,res,client=pool){const u=await serviceActor(req,client);if(!u||!hasPermission(u,'serviceManage')){res.status(403).json({error:'你的帳號沒有維修管理權限'});return null}return u}
+async function resolveServiceBranch(req,actor,branchId,client=pool){
+  let id=String(branchId||'');
+  if(actor.role!=='admin')id=String(actor.branch_id||'');
+  if(!id){const b=await getDefaultBranch(req.auth.companyId,client);id=String(b?.id||'')}
+  const row=(await client.query('SELECT * FROM branches WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[id,req.auth.companyId])).rows[0];
+  if(!row)return null;
+  if(actor.role!=='admin'&&String(row.id)!==String(actor.branch_id||''))return null;
+  return row;
+}
+async function serviceHistory(companyId,vehicleId,client=pool,limit=100){
+  const rows=(await client.query(`SELECT o.*,b.name AS branch_name FROM service_orders o LEFT JOIN branches b ON b.id=o.branch_id WHERE o.company_id=$1 AND o.vehicle_id=$2 ORDER BY o.arrived_at DESC,o.created_at DESC LIMIT $3`,[companyId,vehicleId,Math.max(1,Math.min(300,Number(limit||100)))])).rows;
+  return rows.map(serviceOrderDto);
+}
+
+app.get('/api/service/lookup',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requireServiceActor(req,res);if(!actor)return;
+  const plate=normalizeServicePlate(req.query?.plate),engineNo=normalizeServiceIdentity(req.query?.engineNo),chassisNo=normalizeServiceIdentity(req.query?.chassisNo);
+  if(!plate)return res.status(400).json({error:'請輸入車牌號碼'});if(!validServicePlate(plate))return res.status(400).json({error:'車牌格式不正確，請輸入英文字母與數字，例如 QWE123'});
+  let match=null,matchType='not_found';
+  match=(await pool.query('SELECT * FROM service_vehicles WHERE company_id=$1 AND plate=$2 LIMIT 1',[req.auth.companyId,plate])).rows[0]||null;
+  if(match)matchType='plate';
+  if(!match&&chassisNo){match=(await pool.query("SELECT * FROM service_vehicles WHERE company_id=$1 AND chassis_no=$2 AND chassis_no<>'' ORDER BY updated_at DESC LIMIT 1",[req.auth.companyId,chassisNo])).rows[0]||null;if(match)matchType='chassis'}
+  if(!match&&engineNo){match=(await pool.query("SELECT * FROM service_vehicles WHERE company_id=$1 AND engine_no=$2 AND engine_no<>'' ORDER BY updated_at DESC LIMIT 1",[req.auth.companyId,engineNo])).rows[0]||null;if(match)matchType='engine'}
+  if(!match)return res.json({ok:true,normalizedPlate:plate,found:false,matchType:'not_found'});
+  res.json({ok:true,normalizedPlate:plate,found:true,matchType,plateChanged:match.plate!==plate,vehicle:serviceVehicleDto(match),history:await serviceHistory(req.auth.companyId,match.id,pool,100)});
+}catch(e){next(e)}});
+
+app.post('/api/service/intakes',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const actor=await requireServiceActor(req,res,client);if(!actor)return;
+  const b=req.body||{},plate=normalizeServicePlate(b.plate),engineNo=normalizeServiceIdentity(b.engineNo),chassisNo=normalizeServiceIdentity(b.chassisNo),vehicleId=String(b.vehicleId||''),forceNew=!!b.forceNew,mileage=b.mileage===''||b.mileage===null||b.mileage===undefined?null:Number(b.mileage);
+  if(!plate||!validServicePlate(plate))return res.status(400).json({error:'車牌為必填，格式需為英文字母＋數字'});if(mileage!==null&&(!Number.isFinite(mileage)||mileage<0))return res.status(400).json({error:'里程格式不正確'});
+  const branch=await resolveServiceBranch(req,actor,b.branchId,client);if(!branch)return res.status(400).json({error:'進廠分店不存在或你沒有此分店權限'});
+  await client.query('BEGIN');let v=null,isNew=false;
+  if(vehicleId)v=(await client.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2 FOR UPDATE',[vehicleId,req.auth.companyId])).rows[0]||null;
+  if(!v)v=(await client.query('SELECT * FROM service_vehicles WHERE company_id=$1 AND plate=$2 FOR UPDATE',[req.auth.companyId,plate])).rows[0]||null;
+  if(!forceNew&&!v&&chassisNo)v=(await client.query("SELECT * FROM service_vehicles WHERE company_id=$1 AND chassis_no=$2 AND chassis_no<>'' ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",[req.auth.companyId,chassisNo])).rows[0]||null;
+  if(!forceNew&&!v&&engineNo)v=(await client.query("SELECT * FROM service_vehicles WHERE company_id=$1 AND engine_no=$2 AND engine_no<>'' ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",[req.auth.companyId,engineNo])).rows[0]||null;
+  const ts=now(),actorName=String(actor.name||actor.username||'');
+  if(!v){
+    const id=`sv_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;isNew=true;
+    v=(await client.query(`INSERT INTO service_vehicles(id,company_id,plate,customer_name,phone,address,engine_no,chassis_no,note,current_mileage,created_branch_id,last_branch_id,last_visit_at,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,$14,$12,$12) RETURNING *`,[id,req.auth.companyId,plate,String(b.customerName||'').trim().slice(0,120),String(b.phone||'').trim().slice(0,80),String(b.address||'').trim().slice(0,500),engineNo,chassisNo,String(b.note||'').trim().slice(0,2000),mileage,branch.id,ts,String(actor.id),actorName])).rows[0];
+  }else{
+    if(v.plate!==plate){const duplicate=(await client.query('SELECT id FROM service_vehicles WHERE company_id=$1 AND plate=$2 AND id<>$3',[req.auth.companyId,plate,v.id])).rows[0];if(duplicate){await client.query('ROLLBACK');return res.status(409).json({error:'此車牌已屬於另一筆車輛資料，請先確認是否輸入錯誤',existingVehicleId:duplicate.id});}}
+    v=(await client.query(`UPDATE service_vehicles SET plate=$1,engine_no=CASE WHEN $2<>'' THEN $2 ELSE engine_no END,chassis_no=CASE WHEN $3<>'' THEN $3 ELSE chassis_no END,current_mileage=COALESCE($4,current_mileage),last_branch_id=$5,last_visit_at=$6,updated_at=$6 WHERE id=$7 RETURNING *`,[plate,engineNo,chassisNo,mileage,branch.id,ts,v.id])).rows[0];
+  }
+  const orderId=`so_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+  const o=(await client.query(`INSERT INTO service_orders(id,company_id,vehicle_id,branch_id,status,intake_plate,mileage,engine_no,chassis_no,customer_note_snapshot,arrived_at,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,'open',$5,$6,$7,$8,$9,$10,$11,$12,$10,$10) RETURNING *`,[orderId,req.auth.companyId,v.id,branch.id,plate,mileage,engineNo||v.engine_no||'',chassisNo||v.chassis_no||'',v.note||'',ts,String(actor.id),actorName])).rows[0];
+  if(isNew===false&&b.customerName!==undefined){v=(await client.query(`UPDATE service_vehicles SET customer_name=$1,phone=$2,address=$3,note=$4,updated_at=$5 WHERE id=$6 RETURNING *`,[String(b.customerName||'').trim().slice(0,120),String(b.phone||'').trim().slice(0,80),String(b.address||'').trim().slice(0,500),String(b.note??v.note??'').trim().slice(0,2000),ts,v.id])).rows[0]}
+  await client.query('COMMIT');recordSyncEvent(req.auth.companyId,'service_intake',`維修車輛進廠：${plate}`,{actor:actor.username||actor.name});
+  const order={...serviceOrderDto({...o,branch_name:branch.name})};res.json({ok:true,isNewVehicle:isNew,vehicle:serviceVehicleDto(v),order,history:await serviceHistory(req.auth.companyId,v.id,pool,100)});
+}catch(e){try{await client.query('ROLLBACK')}catch{};if(String(e?.code)==='23505')return res.status(409).json({error:'此車牌已存在，請重新搜尋後再進廠'});next(e)}finally{client.release()}});
+
+app.get('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requireServiceActor(req,res);if(!actor)return;const v=(await pool.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!v)return res.status(404).json({error:'找不到車輛資料'});res.json({ok:true,vehicle:serviceVehicleDto(v),history:await serviceHistory(req.auth.companyId,v.id,pool,200)});
+}catch(e){next(e)}});
+
+app.patch('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const actor=await requireServiceActor(req,res,client);if(!actor)return;await client.query('BEGIN');const old=(await client.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.params.id,req.auth.companyId])).rows[0];if(!old){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車輛資料'});}const b=req.body||{},plate=b.plate===undefined?old.plate:normalizeServicePlate(b.plate);if(!plate||!validServicePlate(plate)){await client.query('ROLLBACK');return res.status(400).json({error:'車牌格式不正確'});}const dup=(await client.query('SELECT id,plate,customer_name FROM service_vehicles WHERE company_id=$1 AND plate=$2 AND id<>$3',[req.auth.companyId,plate,old.id])).rows[0];if(dup){await client.query('ROLLBACK');return res.status(409).json({error:'此車牌已有其他車輛資料，不能直接改成重複車牌',existingVehicle:{id:dup.id,plate:dup.plate,customerName:dup.customer_name||''}});}const mileage=b.currentMileage===undefined?old.current_mileage:(b.currentMileage===''||b.currentMileage===null?null:Number(b.currentMileage));if(mileage!==null&&(!Number.isFinite(mileage)||mileage<0)){await client.query('ROLLBACK');return res.status(400).json({error:'里程格式不正確'});}const v=(await client.query(`UPDATE service_vehicles SET plate=$1,customer_name=$2,phone=$3,address=$4,engine_no=$5,chassis_no=$6,note=$7,current_mileage=$8,updated_at=$9 WHERE id=$10 RETURNING *`,[plate,String(b.customerName===undefined?old.customer_name:b.customerName||'').trim().slice(0,120),String(b.phone===undefined?old.phone:b.phone||'').trim().slice(0,80),String(b.address===undefined?old.address:b.address||'').trim().slice(0,500),b.engineNo===undefined?old.engine_no:normalizeServiceIdentity(b.engineNo),b.chassisNo===undefined?old.chassis_no:normalizeServiceIdentity(b.chassisNo),String(b.note===undefined?old.note:b.note||'').trim().slice(0,2000),mileage,now(),old.id])).rows[0];await client.query('COMMIT');res.json({ok:true,vehicle:serviceVehicleDto(v),history:await serviceHistory(req.auth.companyId,v.id,pool,200)});
+}catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
+
+app.patch('/api/service/orders/:id/cancel',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const actor=await requireServiceActor(req,res,client);if(!actor)return;const o=(await client.query('SELECT * FROM service_orders WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!o)return res.status(404).json({error:'找不到進廠工單'});if(actor.role!=='admin'&&String(actor.branch_id||'')!==String(o.branch_id))return res.status(403).json({error:'只能取消自己分店的進廠工單'});if(o.status==='canceled')return res.json({ok:true});const reason=String(req.body?.reason||'客戶取消／未施工').trim().slice(0,500),ts=now();await client.query(`UPDATE service_orders SET status='canceled',canceled_at=$1,canceled_by_id=$2,canceled_by_name=$3,cancel_reason=$4,updated_at=$1 WHERE id=$5`,[ts,String(actor.id),String(actor.name||actor.username||''),reason,o.id]);res.json({ok:true});
+}catch(e){next(e)}finally{client.release()}});
+
+app.delete('/api/service/orders/:id',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const actor=await requireServiceActor(req,res,client);if(!actor)return;await client.query('BEGIN');const o=(await client.query('SELECT * FROM service_orders WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.params.id,req.auth.companyId])).rows[0];if(!o){await client.query('ROLLBACK');return res.status(404).json({error:'找不到進廠工單'});}if(actor.role!=='admin'&&String(actor.branch_id||'')!==String(o.branch_id)){await client.query('ROLLBACK');return res.status(403).json({error:'只能刪除自己分店誤建的工單'});}await client.query('DELETE FROM service_orders WHERE id=$1',[o.id]);const count=Number((await client.query('SELECT COUNT(*)::int AS n FROM service_orders WHERE company_id=$1 AND vehicle_id=$2',[req.auth.companyId,o.vehicle_id])).rows[0]?.n||0);let vehicleDeleted=false;if(count===0){const v=(await client.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2',[o.vehicle_id,req.auth.companyId])).rows[0];if(v&&String(v.created_at||'')===String(o.created_at||'')){await client.query('DELETE FROM service_vehicles WHERE id=$1',[o.vehicle_id]);vehicleDeleted=true;}}await client.query('COMMIT');res.json({ok:true,vehicleDeleted});
+}catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
+
+app.get('/api/service/recent',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requireServiceActor(req,res);if(!actor)return;const branchId=actor.role==='admin'?String(req.query?.branchId||''):String(actor.branch_id||'');const params=[req.auth.companyId],where=['o.company_id=$1'];if(branchId){params.push(branchId);where.push(`o.branch_id=$${params.length}`)}params.push(Math.max(1,Math.min(100,Number(req.query?.limit||30))));const rows=(await pool.query(`SELECT o.*,b.name AS branch_name,v.customer_name,v.phone,v.note AS vehicle_note FROM service_orders o JOIN service_vehicles v ON v.id=o.vehicle_id LEFT JOIN branches b ON b.id=o.branch_id WHERE ${where.join(' AND ')} ORDER BY o.arrived_at DESC LIMIT $${params.length}`,params)).rows;res.json({ok:true,orders:rows.map(r=>({...serviceOrderDto(r),customerName:r.customer_name||'',phone:r.phone||'',vehicleNote:r.vehicle_note||''}))});
+}catch(e){next(e)}});
 
 app.use((err,req,res,next)=>{
   console.error(err);
