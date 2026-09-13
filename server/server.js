@@ -577,7 +577,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=34;
+const SERVER_SCHEMA_TARGET=35;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1600,6 +1600,62 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_service_order_items_company_order ON service_order_items(company_id,order_id);
       CREATE INDEX IF NOT EXISTS idx_service_order_items_technician ON service_order_items(company_id,technician_id) WHERE technician_id IS NOT NULL;
     `
+  },
+  {
+    version:35,
+    name:'phase15c-parts-center-core',
+    sql:`
+      CREATE TABLE IF NOT EXISTS parts(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        nickname TEXT NOT NULL DEFAULT '',
+        brand TEXT NOT NULL DEFAULT '',
+        spec TEXT NOT NULL DEFAULT '',
+        source_supplier TEXT NOT NULL DEFAULT '',
+        sale_price NUMERIC(14,2) NOT NULL DEFAULT 0,
+        part_no TEXT NOT NULL DEFAULT '',
+        barcode TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        avg_cost NUMERIC(14,4) NOT NULL DEFAULT 0,
+        created_by_id TEXT NOT NULL DEFAULT '',
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_parts_company_name ON parts(company_id,name);
+      CREATE INDEX IF NOT EXISTS idx_parts_company_part_no ON parts(company_id,part_no) WHERE part_no<>'';
+      CREATE INDEX IF NOT EXISTS idx_parts_company_barcode ON parts(company_id,barcode) WHERE barcode<>'';
+
+      CREATE TABLE IF NOT EXISTS part_inventory(
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+        branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        quantity NUMERIC(14,3) NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(company_id,part_id,branch_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_part_inventory_company_branch ON part_inventory(company_id,branch_id);
+      CREATE INDEX IF NOT EXISTS idx_part_inventory_part ON part_inventory(company_id,part_id);
+
+      CREATE TABLE IF NOT EXISTS part_purchases(
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+        branch_id TEXT NOT NULL REFERENCES branches(id),
+        quantity NUMERIC(14,3) NOT NULL,
+        unit_cost NUMERIC(14,4) NOT NULL,
+        total_cost NUMERIC(14,2) NOT NULL,
+        avg_cost_after NUMERIC(14,4) NOT NULL,
+        source_supplier TEXT NOT NULL DEFAULT '',
+        created_by_id TEXT NOT NULL DEFAULT '',
+        created_by_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_part_purchases_company_time ON part_purchases(company_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_part_purchases_part_time ON part_purchases(company_id,part_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_part_purchases_branch_time ON part_purchases(company_id,branch_id,created_at DESC);
+    `
   }];
 
 async function ensureMigrationTable(client=pool){
@@ -1998,14 +2054,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.16',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.17',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.16',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15b-service-order-core'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.17',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3745,7 +3801,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items'];
+const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -3779,7 +3835,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items'];
+const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
@@ -4495,6 +4551,49 @@ app.patch('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,ne
   const actor=await requireServiceActor(req,res,client);if(!actor)return;await client.query('BEGIN');const old=(await client.query('SELECT * FROM service_vehicles WHERE id=$1 AND company_id=$2 FOR UPDATE',[req.params.id,req.auth.companyId])).rows[0];if(!old){await client.query('ROLLBACK');return res.status(404).json({error:'找不到車輛資料'});}const b=req.body||{},plate=b.plate===undefined?old.plate:normalizeServicePlate(b.plate);if(!plate||!validServicePlate(plate)){await client.query('ROLLBACK');return res.status(400).json({error:'車牌格式不正確'});}const dup=(await client.query('SELECT id,plate,customer_name FROM service_vehicles WHERE company_id=$1 AND plate=$2 AND id<>$3',[req.auth.companyId,plate,old.id])).rows[0];if(dup){await client.query('ROLLBACK');return res.status(409).json({error:'此車牌已有其他車輛資料，不能直接改成重複車牌',existingVehicle:{id:dup.id,plate:dup.plate,customerName:dup.customer_name||''}});}const mileage=b.currentMileage===undefined?old.current_mileage:(b.currentMileage===''||b.currentMileage===null?null:Number(b.currentMileage));if(mileage!==null&&(!Number.isFinite(mileage)||mileage<0)){await client.query('ROLLBACK');return res.status(400).json({error:'里程格式不正確'});}const v=(await client.query(`UPDATE service_vehicles SET plate=$1,customer_name=$2,phone=$3,address=$4,engine_no=$5,chassis_no=$6,note=$7,current_mileage=$8,updated_at=$9 WHERE id=$10 RETURNING *`,[plate,String(b.customerName===undefined?old.customer_name:b.customerName||'').trim().slice(0,120),String(b.phone===undefined?old.phone:b.phone||'').trim().slice(0,80),String(b.address===undefined?old.address:b.address||'').trim().slice(0,500),b.engineNo===undefined?old.engine_no:normalizeServiceIdentity(b.engineNo),b.chassisNo===undefined?old.chassis_no:normalizeServiceIdentity(b.chassisNo),String(b.note===undefined?old.note:b.note||'').trim().slice(0,2000),mileage,now(),old.id])).rows[0];await client.query('COMMIT');res.json({ok:true,vehicle:serviceVehicleDto(v),history:await serviceHistory(req.auth.companyId,v.id,pool,200)});
 }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
 
+
+
+// -------------------- Phase 15C：零件中心核心 --------------------
+function partDto(r){return {id:r.id,name:r.name||'',nickname:r.nickname||'',brand:r.brand||'',spec:r.spec||'',sourceSupplier:r.source_supplier||'',salePrice:Number(r.sale_price||0),partNo:r.part_no||'',barcode:r.barcode||'',note:r.note||'',avgCost:Number(r.avg_cost||0),quantity:Number(r.quantity||0),totalQuantity:Number(r.total_quantity||r.quantity||0),stockCost:Number(r.stock_cost||0),updatedAt:r.updated_at||''}}
+async function requirePartsActor(req,res,client=pool){
+  const actor=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.userId,req.auth.companyId])).rows[0];
+  if(!actor){res.status(403).json({error:'找不到可用人員帳號'});return null}
+  const perms=(actor.permissions&&typeof actor.permissions==='object')?actor.permissions:{};
+  if(actor.role!=='admin'&&!perms.serviceManage){res.status(403).json({error:'你的帳號沒有零件中心權限'});return null}
+  return actor;
+}
+function partClean(v,max=300){return String(v||'').trim().slice(0,max)}
+function partNumber(v){const n=Number(v);return Number.isFinite(n)?n:NaN}
+
+app.get('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requirePartsActor(req,res);if(!actor)return;
+  const q=partClean(req.query?.q||'',120), branchId=actor.role==='admin'?partClean(req.query?.branchId||'',120):String(actor.branch_id||'');
+  const params=[req.auth.companyId],where=['p.company_id=$1'];
+  if(q){params.push(`%${q}%`);const n=params.length;where.push(`(p.name ILIKE $${n} OR p.nickname ILIKE $${n} OR p.brand ILIKE $${n} OR p.spec ILIKE $${n} OR p.source_supplier ILIKE $${n} OR p.part_no ILIKE $${n} OR p.barcode ILIKE $${n})`)}
+  let qtyExpr='COALESCE(SUM(i.quantity),0)';
+  if(branchId){params.push(branchId);qtyExpr=`COALESCE(SUM(CASE WHEN i.branch_id=$${params.length} THEN i.quantity ELSE 0 END),0)`}
+  const rows=(await pool.query(`SELECT p.*,${qtyExpr} AS quantity,COALESCE(SUM(i.quantity),0) AS total_quantity,(${qtyExpr})*p.avg_cost AS stock_cost FROM parts p LEFT JOIN part_inventory i ON i.company_id=p.company_id AND i.part_id=p.id WHERE ${where.join(' AND ')} GROUP BY p.id ORDER BY p.updated_at DESC,p.name ASC LIMIT 500`,params)).rows;
+  const stats=(await pool.query(`SELECT COUNT(DISTINCT p.id)::int AS part_count,COALESCE(SUM(${branchId?'CASE WHEN i.branch_id=$2 THEN i.quantity ELSE 0 END':'i.quantity'}),0) AS total_qty,COALESCE(SUM(${branchId?'CASE WHEN i.branch_id=$2 THEN i.quantity*p.avg_cost ELSE 0 END':'i.quantity*p.avg_cost'}),0) AS total_cost FROM parts p LEFT JOIN part_inventory i ON i.company_id=p.company_id AND i.part_id=p.id WHERE p.company_id=$1`,branchId?[req.auth.companyId,branchId]:[req.auth.companyId])).rows[0];
+  res.json({ok:true,parts:rows.map(partDto),stats:{partCount:Number(stats?.part_count||0),totalQty:Number(stats?.total_qty||0),totalCost:Number(stats?.total_cost||0)},branchId});
+}catch(e){next(e)}});
+
+app.post('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requirePartsActor(req,res);if(!actor)return;const b=req.body||{},name=partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});
+  const salePrice=partNumber(b.salePrice||0);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});
+  const ts=now(),id=`part_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`,actorName=String(actor.name||actor.username||'');
+  const r=(await pool.query(`INSERT INTO parts(id,company_id,name,nickname,brand,spec,source_supplier,sale_price,part_no,barcode,note,avg_cost,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$14,$14) RETURNING *`,[id,req.auth.companyId,name,partClean(b.nickname),partClean(b.brand),partClean(b.spec),partClean(b.sourceSupplier,500),salePrice,partClean(b.partNo),partClean(b.barcode),partClean(b.note,2000),String(actor.id),actorName,ts])).rows[0];
+  res.json({ok:true,part:partDto(r)});
+}catch(e){next(e)}});
+
+app.patch('/api/parts/:id',auth,requireActiveCompany,async(req,res,next)=>{try{
+  const actor=await requirePartsActor(req,res);if(!actor)return;const old=(await pool.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!old)return res.status(404).json({error:'找不到零件'});const b=req.body||{},name=b.name===undefined?old.name:partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});const salePrice=b.salePrice===undefined?Number(old.sale_price||0):partNumber(b.salePrice);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});const r=(await pool.query(`UPDATE parts SET name=$1,nickname=$2,brand=$3,spec=$4,source_supplier=$5,sale_price=$6,part_no=$7,barcode=$8,note=$9,updated_at=$10 WHERE id=$11 AND company_id=$12 RETURNING *`,[name,b.nickname===undefined?old.nickname:partClean(b.nickname),b.brand===undefined?old.brand:partClean(b.brand),b.spec===undefined?old.spec:partClean(b.spec),b.sourceSupplier===undefined?old.source_supplier:partClean(b.sourceSupplier,500),salePrice,b.partNo===undefined?old.part_no:partClean(b.partNo),b.barcode===undefined?old.barcode:partClean(b.barcode),b.note===undefined?old.note:partClean(b.note,2000),now(),old.id,req.auth.companyId])).rows[0];res.json({ok:true,part:partDto(r)});
+}catch(e){next(e)}});
+
+app.post('/api/parts/purchase',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
+  const actor=await requirePartsActor(req,res,client);if(!actor)return;const b=req.body||{},branchId=actor.role==='admin'?partClean(b.branchId,120):String(actor.branch_id||'');if(!branchId)return res.status(400).json({error:'請選擇進貨分店'});const branch=(await client.query('SELECT id FROM branches WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[branchId,req.auth.companyId])).rows[0];if(!branch)return res.status(400).json({error:'進貨分店不正確'});const items=Array.isArray(b.items)?b.items:[];if(!items.length)return res.status(400).json({error:'請至少加入一個進貨零件'});if(items.length>50)return res.status(400).json({error:'一次最多進貨 50 個品項'});await client.query('BEGIN');const ts=now(),actorName=String(actor.name||actor.username||''),out=[];
+  for(const raw of items){const partId=partClean(raw.partId,160),qty=partNumber(raw.quantity),unit=partNumber(raw.unitCost),source=partClean(raw.sourceSupplier,500);if(!partId||!Number.isFinite(qty)||qty<=0||!Number.isFinite(unit)||unit<0){await client.query('ROLLBACK');return res.status(400).json({error:'進貨品項、數量或單價不正確'});}const part=(await client.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2 FOR UPDATE',[partId,req.auth.companyId])).rows[0];if(!part){await client.query('ROLLBACK');return res.status(404).json({error:'找不到進貨零件'});}const stock=(await client.query('SELECT COALESCE(SUM(quantity),0) AS qty FROM part_inventory WHERE company_id=$1 AND part_id=$2',[req.auth.companyId,part.id])).rows[0];const oldQty=Number(stock?.qty||0),oldAvg=Number(part.avg_cost||0),newQty=oldQty+qty,newAvg=newQty>0?((oldQty*oldAvg)+(qty*unit))/newQty:unit;await client.query(`INSERT INTO part_inventory(company_id,part_id,branch_id,quantity,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id,part_id,branch_id) DO UPDATE SET quantity=part_inventory.quantity+excluded.quantity,updated_at=excluded.updated_at`,[req.auth.companyId,part.id,branchId,qty,ts]);await client.query('UPDATE parts SET avg_cost=$1,source_supplier=CASE WHEN $2<>\'\' THEN $2 ELSE source_supplier END,updated_at=$3 WHERE id=$4',[newAvg,source,ts,part.id]);const purchaseId=`pp_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;await client.query(`INSERT INTO part_purchases(id,company_id,part_id,branch_id,quantity,unit_cost,total_cost,avg_cost_after,source_supplier,created_by_id,created_by_name,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,[purchaseId,req.auth.companyId,part.id,branchId,qty,unit,qty*unit,newAvg,source,String(actor.id),actorName,ts]);out.push({partId:part.id,name:part.name,quantity:qty,unitCost:unit,avgCostAfter:newAvg});}
+  await client.query('COMMIT');res.json({ok:true,items:out});
+}catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
 
 app.patch('/api/service/orders/:id/status',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
   const ctx=await serviceOrderForWrite(req,res,client,req.params.id);if(!ctx)return;const status=String(req.body?.status||'');const allowed=new Set(['waiting_repair','quoting','waiting_parts','ready_delivery']);if(!allowed.has(status))return res.status(400).json({error:'維修狀態不正確'});if(['canceled','completed'].includes(ctx.order.status))return res.status(409).json({error:'已取消或已交車工單不能再修改在廠狀態'});const ts=now();const o=(await client.query('UPDATE service_orders SET status=$1,updated_at=$2 WHERE id=$3 RETURNING *',[status,ts,ctx.order.id])).rows[0];res.json({ok:true,order:serviceOrderDto(o)});
