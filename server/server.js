@@ -2054,14 +2054,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.17',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.18',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.17',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.18',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -4555,19 +4555,13 @@ app.patch('/api/service/vehicles/:id',auth,requireActiveCompany,async(req,res,ne
 
 // -------------------- Phase 15C：零件中心核心 --------------------
 function partDto(r){return {id:r.id,name:r.name||'',nickname:r.nickname||'',brand:r.brand||'',spec:r.spec||'',sourceSupplier:r.source_supplier||'',salePrice:Number(r.sale_price||0),partNo:r.part_no||'',barcode:r.barcode||'',note:r.note||'',avgCost:Number(r.avg_cost||0),quantity:Number(r.quantity||0),totalQuantity:Number(r.total_quantity||r.quantity||0),stockCost:Number(r.stock_cost||0),updatedAt:r.updated_at||''}}
-async function requirePartsActor(req,res,client=pool){
-  const actor=(await client.query('SELECT * FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.userId,req.auth.companyId])).rows[0];
-  if(!actor){res.status(403).json({error:'找不到可用人員帳號'});return null}
-  const perms=(actor.permissions&&typeof actor.permissions==='object')?actor.permissions:{};
-  if(actor.role!=='admin'&&!perms.serviceManage){res.status(403).json({error:'你的帳號沒有零件中心權限'});return null}
-  return actor;
-}
+// Phase 15C：零件中心不做人員帳號／角色檢查，也不記錄操作人員。
+// 只要已登入且車行授權有效即可使用；分店由畫面傳入 branchId 決定。
 function partClean(v,max=300){return String(v||'').trim().slice(0,max)}
 function partNumber(v){const n=Number(v);return Number.isFinite(n)?n:NaN}
 
 app.get('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
-  const actor=await requirePartsActor(req,res);if(!actor)return;
-  const q=partClean(req.query?.q||'',120), branchId=actor.role==='admin'?partClean(req.query?.branchId||'',120):String(actor.branch_id||'');
+  const q=partClean(req.query?.q||'',120), branchId=partClean(req.query?.branchId||'',120);
   const params=[req.auth.companyId],where=['p.company_id=$1'];
   if(q){params.push(`%${q}%`);const n=params.length;where.push(`(p.name ILIKE $${n} OR p.nickname ILIKE $${n} OR p.brand ILIKE $${n} OR p.spec ILIKE $${n} OR p.source_supplier ILIKE $${n} OR p.part_no ILIKE $${n} OR p.barcode ILIKE $${n})`)}
   let qtyExpr='COALESCE(SUM(i.quantity),0)';
@@ -4578,20 +4572,20 @@ app.get('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
 }catch(e){next(e)}});
 
 app.post('/api/parts',auth,requireActiveCompany,async(req,res,next)=>{try{
-  const actor=await requirePartsActor(req,res);if(!actor)return;const b=req.body||{},name=partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});
+  const b=req.body||{},name=partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});
   const salePrice=partNumber(b.salePrice||0);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});
-  const ts=now(),id=`part_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`,actorName=String(actor.name||actor.username||'');
-  const r=(await pool.query(`INSERT INTO parts(id,company_id,name,nickname,brand,spec,source_supplier,sale_price,part_no,barcode,note,avg_cost,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$14,$14) RETURNING *`,[id,req.auth.companyId,name,partClean(b.nickname),partClean(b.brand),partClean(b.spec),partClean(b.sourceSupplier,500),salePrice,partClean(b.partNo),partClean(b.barcode),partClean(b.note,2000),String(actor.id),actorName,ts])).rows[0];
+  const ts=now(),id=`part_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+  const r=(await pool.query(`INSERT INTO parts(id,company_id,name,nickname,brand,spec,source_supplier,sale_price,part_no,barcode,note,avg_cost,created_by_id,created_by_name,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,NULL,'',$12,$12) RETURNING *`,[id,req.auth.companyId,name,partClean(b.nickname),partClean(b.brand),partClean(b.spec),partClean(b.sourceSupplier,500),salePrice,partClean(b.partNo),partClean(b.barcode),partClean(b.note,2000),ts])).rows[0];
   res.json({ok:true,part:partDto(r)});
 }catch(e){next(e)}});
 
 app.patch('/api/parts/:id',auth,requireActiveCompany,async(req,res,next)=>{try{
-  const actor=await requirePartsActor(req,res);if(!actor)return;const old=(await pool.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!old)return res.status(404).json({error:'找不到零件'});const b=req.body||{},name=b.name===undefined?old.name:partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});const salePrice=b.salePrice===undefined?Number(old.sale_price||0):partNumber(b.salePrice);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});const r=(await pool.query(`UPDATE parts SET name=$1,nickname=$2,brand=$3,spec=$4,source_supplier=$5,sale_price=$6,part_no=$7,barcode=$8,note=$9,updated_at=$10 WHERE id=$11 AND company_id=$12 RETURNING *`,[name,b.nickname===undefined?old.nickname:partClean(b.nickname),b.brand===undefined?old.brand:partClean(b.brand),b.spec===undefined?old.spec:partClean(b.spec),b.sourceSupplier===undefined?old.source_supplier:partClean(b.sourceSupplier,500),salePrice,b.partNo===undefined?old.part_no:partClean(b.partNo),b.barcode===undefined?old.barcode:partClean(b.barcode),b.note===undefined?old.note:partClean(b.note,2000),now(),old.id,req.auth.companyId])).rows[0];res.json({ok:true,part:partDto(r)});
+  const old=(await pool.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId])).rows[0];if(!old)return res.status(404).json({error:'找不到零件'});const b=req.body||{},name=b.name===undefined?old.name:partClean(b.name,300);if(!name)return res.status(400).json({error:'零件名稱為必填'});const salePrice=b.salePrice===undefined?Number(old.sale_price||0):partNumber(b.salePrice);if(!Number.isFinite(salePrice)||salePrice<0)return res.status(400).json({error:'售價格式不正確'});const r=(await pool.query(`UPDATE parts SET name=$1,nickname=$2,brand=$3,spec=$4,source_supplier=$5,sale_price=$6,part_no=$7,barcode=$8,note=$9,updated_at=$10 WHERE id=$11 AND company_id=$12 RETURNING *`,[name,b.nickname===undefined?old.nickname:partClean(b.nickname),b.brand===undefined?old.brand:partClean(b.brand),b.spec===undefined?old.spec:partClean(b.spec),b.sourceSupplier===undefined?old.source_supplier:partClean(b.sourceSupplier,500),salePrice,b.partNo===undefined?old.part_no:partClean(b.partNo),b.barcode===undefined?old.barcode:partClean(b.barcode),b.note===undefined?old.note:partClean(b.note,2000),now(),old.id,req.auth.companyId])).rows[0];res.json({ok:true,part:partDto(r)});
 }catch(e){next(e)}});
 
 app.post('/api/parts/purchase',auth,requireActiveCompany,async(req,res,next)=>{const client=await pool.connect();try{
-  const actor=await requirePartsActor(req,res,client);if(!actor)return;const b=req.body||{},branchId=actor.role==='admin'?partClean(b.branchId,120):String(actor.branch_id||'');if(!branchId)return res.status(400).json({error:'請選擇進貨分店'});const branch=(await client.query('SELECT id FROM branches WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[branchId,req.auth.companyId])).rows[0];if(!branch)return res.status(400).json({error:'進貨分店不正確'});const items=Array.isArray(b.items)?b.items:[];if(!items.length)return res.status(400).json({error:'請至少加入一個進貨零件'});if(items.length>50)return res.status(400).json({error:'一次最多進貨 50 個品項'});await client.query('BEGIN');const ts=now(),actorName=String(actor.name||actor.username||''),out=[];
-  for(const raw of items){const partId=partClean(raw.partId,160),qty=partNumber(raw.quantity),unit=partNumber(raw.unitCost),source=partClean(raw.sourceSupplier,500);if(!partId||!Number.isFinite(qty)||qty<=0||!Number.isFinite(unit)||unit<0){await client.query('ROLLBACK');return res.status(400).json({error:'進貨品項、數量或單價不正確'});}const part=(await client.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2 FOR UPDATE',[partId,req.auth.companyId])).rows[0];if(!part){await client.query('ROLLBACK');return res.status(404).json({error:'找不到進貨零件'});}const stock=(await client.query('SELECT COALESCE(SUM(quantity),0) AS qty FROM part_inventory WHERE company_id=$1 AND part_id=$2',[req.auth.companyId,part.id])).rows[0];const oldQty=Number(stock?.qty||0),oldAvg=Number(part.avg_cost||0),newQty=oldQty+qty,newAvg=newQty>0?((oldQty*oldAvg)+(qty*unit))/newQty:unit;await client.query(`INSERT INTO part_inventory(company_id,part_id,branch_id,quantity,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id,part_id,branch_id) DO UPDATE SET quantity=part_inventory.quantity+excluded.quantity,updated_at=excluded.updated_at`,[req.auth.companyId,part.id,branchId,qty,ts]);await client.query('UPDATE parts SET avg_cost=$1,source_supplier=CASE WHEN $2<>\'\' THEN $2 ELSE source_supplier END,updated_at=$3 WHERE id=$4',[newAvg,source,ts,part.id]);const purchaseId=`pp_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;await client.query(`INSERT INTO part_purchases(id,company_id,part_id,branch_id,quantity,unit_cost,total_cost,avg_cost_after,source_supplier,created_by_id,created_by_name,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,[purchaseId,req.auth.companyId,part.id,branchId,qty,unit,qty*unit,newAvg,source,String(actor.id),actorName,ts]);out.push({partId:part.id,name:part.name,quantity:qty,unitCost:unit,avgCostAfter:newAvg});}
+  const b=req.body||{},branchId=partClean(b.branchId,120);if(!branchId)return res.status(400).json({error:'請選擇進貨分店'});const branch=(await client.query('SELECT id FROM branches WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[branchId,req.auth.companyId])).rows[0];if(!branch)return res.status(400).json({error:'進貨分店不正確'});const items=Array.isArray(b.items)?b.items:[];if(!items.length)return res.status(400).json({error:'請至少加入一個進貨零件'});if(items.length>50)return res.status(400).json({error:'一次最多進貨 50 個品項'});await client.query('BEGIN');const ts=now(),out=[];
+  for(const raw of items){const partId=partClean(raw.partId,160),qty=partNumber(raw.quantity),unit=partNumber(raw.unitCost),source=partClean(raw.sourceSupplier,500);if(!partId||!Number.isFinite(qty)||qty<=0||!Number.isFinite(unit)||unit<0){await client.query('ROLLBACK');return res.status(400).json({error:'進貨品項、數量或單價不正確'});}const part=(await client.query('SELECT * FROM parts WHERE id=$1 AND company_id=$2 FOR UPDATE',[partId,req.auth.companyId])).rows[0];if(!part){await client.query('ROLLBACK');return res.status(404).json({error:'找不到進貨零件'});}const stock=(await client.query('SELECT COALESCE(SUM(quantity),0) AS qty FROM part_inventory WHERE company_id=$1 AND part_id=$2',[req.auth.companyId,part.id])).rows[0];const oldQty=Number(stock?.qty||0),oldAvg=Number(part.avg_cost||0),newQty=oldQty+qty,newAvg=newQty>0?((oldQty*oldAvg)+(qty*unit))/newQty:unit;await client.query(`INSERT INTO part_inventory(company_id,part_id,branch_id,quantity,updated_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(company_id,part_id,branch_id) DO UPDATE SET quantity=part_inventory.quantity+excluded.quantity,updated_at=excluded.updated_at`,[req.auth.companyId,part.id,branchId,qty,ts]);await client.query('UPDATE parts SET avg_cost=$1,source_supplier=CASE WHEN $2<>\'\' THEN $2 ELSE source_supplier END,updated_at=$3 WHERE id=$4',[newAvg,source,ts,part.id]);const purchaseId=`pp_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;await client.query(`INSERT INTO part_purchases(id,company_id,part_id,branch_id,quantity,unit_cost,total_cost,avg_cost_after,source_supplier,created_by_id,created_by_name,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,[purchaseId,req.auth.companyId,part.id,branchId,qty,unit,qty*unit,newAvg,source,null,'',ts]);out.push({partId:part.id,name:part.name,quantity:qty,unitCost:unit,avgCostAfter:newAvg});}
   await client.query('COMMIT');res.json({ok:true,items:out});
 }catch(e){try{await client.query('ROLLBACK')}catch{};next(e)}finally{client.release()}});
 
