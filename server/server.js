@@ -577,7 +577,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=35;
+const SERVER_SCHEMA_TARGET=36;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1656,7 +1656,28 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_part_purchases_part_time ON part_purchases(company_id,part_id,created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_part_purchases_branch_time ON part_purchases(company_id,branch_id,created_at DESC);
     `
-  }];
+  },
+  {
+    version:36,
+    name:'multi-branch-live-dealer-nodes',
+    sql:`
+      CREATE TABLE IF NOT EXISTS dealer_branch_nodes(
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        device_name TEXT,
+        app_version TEXT,
+        last_seen_at TEXT NOT NULL,
+        local_data_bytes BIGINT NOT NULL DEFAULT 0,
+        capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+        PRIMARY KEY(company_id,branch_id),
+        UNIQUE(company_id,node_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_branch_nodes_last_seen ON dealer_branch_nodes(last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_branch_nodes_company_node ON dealer_branch_nodes(company_id,node_id);
+    `
+  }
+];
 
 async function ensureMigrationTable(client=pool){
   await client.query(`
@@ -2054,14 +2075,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.19',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.20',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.19',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'phase15c-parts-center-core'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.20',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3403,44 +3424,50 @@ app.get('/api/super/companies',superAuth,async(req,res,next)=>{
 // Phase 3: after a v5.3 Local-first node proves its local SQLite exists, the cloud snapshot is reduced to an operational shadow.
 app.post('/api/node/heartbeat',auth,requireActiveCompany,async(req,res,next)=>{
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可註冊節點'});
-    const b=req.body||{};
-    const nodeId=String(b.nodeId||'').trim();
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'僅公司管理員或分店主管可註冊分店節點'});
+    const b=req.body||{},nodeId=String(b.nodeId||'').trim();
     if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
-    await pool.query(`INSERT INTO dealer_nodes(company_id,node_id,device_name,app_version,last_seen_at,local_data_bytes,capabilities)
+    const actor=(await pool.query('SELECT id,role,branch_id FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(!actor)return res.status(403).json({error:'找不到目前登入人員'});
+    let branchId=String(b.branchId||actor.branch_id||'').trim();
+    if(actor.role==='branchManager')branchId=String(actor.branch_id||'');
+    if(!branchId){const h=(await pool.query('SELECT id FROM branches WHERE company_id=$1 AND enabled=TRUE ORDER BY is_head_office DESC,created_at ASC LIMIT 1',[req.auth.companyId])).rows[0];branchId=String(h?.id||'')}
+    const branch=(await pool.query('SELECT id,name,is_head_office FROM branches WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[branchId,req.auth.companyId])).rows[0];
+    if(!branch)return res.status(400).json({error:'分店識別不正確'});
+    if(actor.role==='branchManager'&&String(actor.branch_id||'')!==String(branch.id))return res.status(403).json({error:'分店主管只能註冊自己的分店主機'});
+    const caps={...b.capabilities,online:true,branchId:branch.id,branchName:branch.name};
+    await pool.query(`INSERT INTO dealer_branch_nodes(company_id,branch_id,node_id,device_name,app_version,last_seen_at,local_data_bytes,capabilities)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+      ON CONFLICT(company_id,branch_id) DO UPDATE SET node_id=EXCLUDED.node_id,device_name=EXCLUDED.device_name,app_version=EXCLUDED.app_version,last_seen_at=EXCLUDED.last_seen_at,local_data_bytes=EXCLUDED.local_data_bytes,capabilities=EXCLUDED.capabilities`,
+      [req.auth.companyId,branch.id,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify(caps)]);
+    // 保留舊 company-level Dealer Node 給 SuperAdmin/舊功能；只有公司管理員主機更新，不讓分店覆蓋它。
+    if(actor.role==='admin')await pool.query(`INSERT INTO dealer_nodes(company_id,node_id,device_name,app_version,last_seen_at,local_data_bytes,capabilities)
       VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
       ON CONFLICT(company_id) DO UPDATE SET node_id=EXCLUDED.node_id,device_name=EXCLUDED.device_name,app_version=EXCLUDED.app_version,last_seen_at=EXCLUDED.last_seen_at,local_data_bytes=EXCLUDED.local_data_bytes,capabilities=EXCLUDED.capabilities`,
-      [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify({...b.capabilities,online:true})]);
+      [req.auth.companyId,nodeId,String(b.deviceName||''),String(b.appVersion||''),now(),Math.max(0,Number(b.localDataBytes||0)),JSON.stringify(caps)]);
     let localFirstActivated=false;
-    if(b.capabilities?.localFirst===true && Number(b.localDataBytes||0)>0){
+    if(b.capabilities?.localFirst===true && Number(b.localDataBytes||0)>0 && actor.role==='admin'){
       const sr=await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId]);
-      if(sr.rows[0]){
-        const reduced=cloudOperationalSnapshot(sr.rows[0].json||{});
-        await pool.query('UPDATE snapshots SET json=$1::jsonb,updated_at=$2 WHERE company_id=$3',[JSON.stringify(reduced),now(),req.auth.companyId]);
-        localFirstActivated=true;
-      }
+      if(sr.rows[0]){const reduced=cloudOperationalSnapshot(sr.rows[0].json||{});await pool.query('UPDATE snapshots SET json=$1::jsonb,updated_at=$2 WHERE company_id=$3',[JSON.stringify(reduced),now(),req.auth.companyId]);localFirstActivated=true}
     }
     const salesUsers=(await pool.query("SELECT id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,token_version,branch_id FROM users WHERE company_id=$1 AND role='sales' AND enabled=TRUE ORDER BY updated_at ASC",[req.auth.companyId])).rows;
     const offlineTest=(await pool.query('SELECT * FROM offline_license_tests WHERE company_id=$1',[req.auth.companyId])).rows[0];
-    const lanSeconds=offlineTest?.enabled?Number(offlineTest.duration_seconds||60):OFFLINE_GRACE_SECONDS;
-    const companyRow=await getCompany(req.auth.companyId);
-    const salesLanAuthBundle=offlineTest?.enabled&&offlineTest?.simulate_outage?null:issueSalesLanAuthBundle(companyRow,salesUsers,lanSeconds);
-    const updatePolicy=await getDesktopUpdatePolicy();
-    res.json({ok:true,nodeId,serverTime:now(),localFirstActivated,salesLanAuthBundle,lanAuthExpiresInSeconds:salesLanAuthBundle?Math.max(5,Math.min(lanSeconds,OFFLINE_GRACE_SECONDS)):0,updatePolicy:{enabled:updatePolicy.enabled,latestVersion:updatePolicy.latestVersion,minimumVersion:updatePolicy.minimumVersion,channel:updatePolicy.channel}});
+    const lanSeconds=offlineTest?.enabled?Number(offlineTest.duration_seconds||60):OFFLINE_GRACE_SECONDS,companyRow=await getCompany(req.auth.companyId);
+    const salesLanAuthBundle=offlineTest?.enabled&&offlineTest?.simulate_outage?null:issueSalesLanAuthBundle(companyRow,salesUsers,lanSeconds),updatePolicy=await getDesktopUpdatePolicy();
+    res.json({ok:true,nodeId,branchId:branch.id,branchName:branch.name,serverTime:now(),localFirstActivated,salesLanAuthBundle,lanAuthExpiresInSeconds:salesLanAuthBundle?Math.max(5,Math.min(lanSeconds,OFFLINE_GRACE_SECONDS)):0,updatePolicy:{enabled:updatePolicy.enabled,latestVersion:updatePolicy.latestVersion,minimumVersion:updatePolicy.minimumVersion,channel:updatePolicy.channel}});
   }catch(e){next(e)}
 });
 
 // Dealer Node explicit offline signal.
 app.post('/api/node/offline',auth,requireActiveCompany,async(req,res,next)=>{
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端可變更節點狀態'});
-    const nodeId=String(req.body?.nodeId||'').trim();
-    if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'僅公司管理員或分店主管可變更節點狀態'});
+    const nodeId=String(req.body?.nodeId||'').trim();if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
     const offlineAt=now();
-    const r=await pool.query(`UPDATE dealer_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{\"online\":false}'::jsonb WHERE company_id=$2 AND node_id=$3 RETURNING company_id,node_id`,[offlineAt,req.auth.companyId,nodeId]);
+    const r=await pool.query(`UPDATE dealer_branch_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{"online":false}'::jsonb WHERE company_id=$2 AND node_id=$3 RETURNING company_id,node_id,branch_id`,[offlineAt,req.auth.companyId,nodeId]);
+    if(req.auth.role==='admin')await pool.query(`UPDATE dealer_nodes SET last_seen_at=$1, capabilities=COALESCE(capabilities,'{}'::jsonb) || '{"online":false}'::jsonb WHERE company_id=$2 AND node_id=$3`,[offlineAt,req.auth.companyId,nodeId]);
     await pool.query(`UPDATE dealer_node_requests SET status='failed',error_text='Dealer Node 已登出或離線',completed_at=$1 WHERE company_id=$2 AND node_id=$3 AND status IN ('queued','claimed')`,[now(),req.auth.companyId,nodeId]);
-    recordSyncEvent(req.auth.companyId,'node_offline','車行主機已離線',{actor:req.auth.username||req.auth.sub,status:'warn'});
-    res.json({ok:true,offline:true,nodeId,updated:r.rowCount>0});
+    recordSyncEvent(req.auth.companyId,'node_offline','分店主機已離線',{actor:req.auth.username||req.auth.sub,status:'warn'});res.json({ok:true,offline:true,nodeId,updated:r.rowCount>0});
   }catch(e){next(e)}
 });
 
@@ -3450,7 +3477,7 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 
 // Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
-const NODE_RESOURCES=new Set(['companyData','fullCompanyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle','salesInventory','backupStatus','createBackup']);
+const NODE_RESOURCES=new Set(['companyData','fullCompanyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle','salesInventory','backupStatus','createBackup','branchDashboardSummary']);
 function nodeOnline(row,maxAgeMs=45000){
   if(row?.capabilities?.online===false)return false;
   const t=Date.parse(row?.last_seen_at||'');
@@ -3671,8 +3698,9 @@ app.post('/api/sales/node-inventory/request',auth,requireActiveCompany,async(req
     if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
     const me=(await pool.query('SELECT branch_id FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
     if(!me?.branch_id)return res.status(403).json({error:'業務帳號尚未指定所屬分店'});
-    const n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
-    if(!n||!nodeOnline(n))return res.status(409).json({error:'車行主機目前離線'});
+    let n=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND branch_id=$2',[req.auth.companyId,me.branch_id])).rows[0];
+    if(!n||!nodeOnline(n))n=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+    if(!n||!nodeOnline(n))return res.status(409).json({error:'所屬分店主機目前離線'});
     const id=`sinv_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
     const requestedAt=now(),expiresAt=new Date(Date.now()+60000).toISOString();
     const payload={requesterSalesId:String(req.auth.sub),requesterBranchId:String(me.branch_id)};
@@ -3708,14 +3736,49 @@ app.get('/api/sales/node-inventory-requests/:id',auth,requireActiveCompany,async
   }catch(e){next(e)}
 });
 
+app.get('/api/company/live-nodes',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'沒有分店即時狀態權限'});
+    const actor=(await pool.query('SELECT role,branch_id FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];
+    const params=[req.auth.companyId],where=["b.company_id=$1","b.enabled=TRUE"];
+    if(actor?.role==='branchManager'){params.push(actor.branch_id);where.push(`b.id=$${params.length}`)}
+    const rows=(await pool.query(`SELECT b.id AS branch_id,b.name AS branch_name,b.is_head_office,n.node_id,n.last_seen_at,n.app_version,n.capabilities FROM branches b LEFT JOIN dealer_branch_nodes n ON n.company_id=b.company_id AND n.branch_id=b.id WHERE ${where.join(' AND ')} ORDER BY b.is_head_office DESC,b.created_at ASC`,params)).rows;
+    res.json({ok:true,branches:rows.map(x=>({branchId:x.branch_id,branchName:x.branch_name,isHeadOffice:!!x.is_head_office,online:!!(x.node_id&&nodeOnline(x)),lastSeenAt:x.last_seen_at||null,appVersion:x.app_version||''}))});
+  }catch(e){next(e)}
+});
+
+app.post('/api/company/live-dashboard',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    await cleanupNodeRequests();
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'沒有即時經營資料權限'});
+    const actor=(await pool.query('SELECT role,branch_id FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];if(!actor)return res.status(403).json({error:'找不到登入人員'});
+    const month=/^\d{4}-\d{2}$/.test(String(req.body?.month||''))?String(req.body.month):new Date().toISOString().slice(0,7);
+    let branchIds=Array.isArray(req.body?.branchIds)?[...new Set(req.body.branchIds.map(x=>String(x||'').trim()).filter(Boolean))]:[];
+    if(actor.role==='branchManager')branchIds=[String(actor.branch_id||'')];
+    if(!branchIds.length)branchIds=(await pool.query('SELECT id FROM branches WHERE company_id=$1 AND enabled=TRUE ORDER BY is_head_office DESC,created_at ASC',[req.auth.companyId])).rows.map(x=>String(x.id));
+    if(branchIds.length>50)return res.status(400).json({error:'一次最多即時調閱 50 間分店'});
+    const br=(await pool.query('SELECT id,name,is_head_office FROM branches WHERE company_id=$1 AND enabled=TRUE AND id=ANY($2::text[])',[req.auth.companyId,branchIds])).rows;
+    const byId=new Map(br.map(x=>[String(x.id),x]));branchIds=branchIds.filter(id=>byId.has(id));
+    const nodes=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND branch_id=ANY($2::text[])',[req.auth.companyId,branchIds])).rows,nodeBy=new Map(nodes.map(x=>[String(x.branch_id),x]));
+    const requests=[],out=[];
+    for(const branchId of branchIds){const b=byId.get(branchId),n=nodeBy.get(branchId);if(!n||!nodeOnline(n)){out.push({branchId,branchName:b?.name||'',status:'offline',lastSeenAt:n?.last_seen_at||null});continue}const id=`live_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`,requestedAt=now(),expiresAt=new Date(Date.now()+9000).toISOString(),payload={branchId,month,requesterId:String(req.auth.sub||''),requesterRole:String(req.auth.role||'')};await pool.query(`INSERT INTO dealer_node_requests(id,company_id,node_id,resource,payload,status,requested_at,expires_at) VALUES($1,$2,$3,'branchDashboardSummary',$4::jsonb,'queued',$5,$6)`,[id,req.auth.companyId,n.node_id,JSON.stringify(payload),requestedAt,expiresAt]);requests.push({id,branchId,branchName:b?.name||'',node:n})}
+    const deadline=Date.now()+7000,pending=new Set(requests.map(x=>x.id)),completed=new Map();
+    while(pending.size&&Date.now()<deadline){const ids=[...pending],rows=(await pool.query('SELECT id,status,result_json,error_text FROM dealer_node_requests WHERE company_id=$1 AND id=ANY($2::text[])',[req.auth.companyId,ids])).rows;for(const r of rows){if(['completed','failed','expired'].includes(r.status)){completed.set(r.id,r);pending.delete(r.id)}}if(pending.size)await new Promise(resolve=>setTimeout(resolve,250))}
+    for(const q of requests){const r=completed.get(q.id);if(r?.status==='completed')out.push({branchId:q.branchId,branchName:q.branchName,status:'online',lastSeenAt:q.node.last_seen_at,result:r.result_json});else if(r?.status==='failed')out.push({branchId:q.branchId,branchName:q.branchName,status:'error',lastSeenAt:q.node.last_seen_at,error:r.error_text||'分店主機讀取失敗'});else out.push({branchId:q.branchId,branchName:q.branchName,status:'timeout',lastSeenAt:q.node.last_seen_at,error:'分店主機回應逾時'})}
+    if(requests.length){const ids=requests.map(x=>x.id);await pool.query("UPDATE dealer_node_requests SET status='expired',error_text=COALESCE(error_text,'Live dashboard timeout') WHERE company_id=$1 AND id=ANY($2::text[]) AND status IN ('queued','claimed')",[req.auth.companyId,ids]);await pool.query('DELETE FROM dealer_node_requests WHERE company_id=$1 AND id=ANY($2::text[]) AND status IN (\'completed\',\'failed\',\'expired\')',[req.auth.companyId,ids])}
+    const order=new Map(branchIds.map((id,i)=>[id,i]));out.sort((a,b)=>(order.get(a.branchId)||0)-(order.get(b.branchId)||0));res.json({ok:true,month,generatedAt:now(),branches:out});
+  }catch(e){next(e)}
+});
+
 app.get('/api/node/commands',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端 Dealer Node 可接收命令'});
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'僅公司管理員或分店主管 Dealer Node 可接收命令'});
     const nodeId=String(req.query.nodeId||'').trim();
     if(!nodeId)return res.status(400).json({error:'缺少 nodeId'});
-    const n=(await client.query('SELECT * FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
-    if(!n||n.node_id!==nodeId)return res.status(403).json({error:'Dealer Node 身分不符'});
+    const n=(await client.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND node_id=$2',[req.auth.companyId,nodeId])).rows[0];
+    if(!n)return res.status(403).json({error:'Dealer Node 身分不符'});
+    if(req.auth.role==='branchManager'){const actor=(await client.query('SELECT branch_id FROM users WHERE id=$1 AND company_id=$2',[req.auth.sub,req.auth.companyId])).rows[0];if(String(actor?.branch_id||'')!==String(n.branch_id||''))return res.status(403).json({error:'不能接收其他分店的 Node 命令'})}
     await client.query('BEGIN');
     await client.query("UPDATE dealer_node_requests SET status='expired',error_text='Node request timeout' WHERE company_id=$1 AND node_id=$2 AND status IN ('queued','claimed') AND expires_at < $3",[req.auth.companyId,nodeId,now()]);
     await client.query("UPDATE dealer_node_requests SET status='queued',claimed_at=NULL WHERE company_id=$1 AND node_id=$2 AND status='claimed' AND claimed_at < $3",[req.auth.companyId,nodeId,new Date(Date.now()-10000).toISOString()]);
@@ -3733,7 +3796,7 @@ app.get('/api/node/commands',auth,requireActiveCompany,async(req,res,next)=>{
 
 app.post('/api/node/commands/:id/result',auth,requireActiveCompany,async(req,res,next)=>{
   try{
-    if(req.auth.role!=='admin')return res.status(403).json({error:'僅車行管理端 Dealer Node 可回傳資料'});
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'僅公司管理員或分店主管 Dealer Node 可回傳資料'});
     const nodeId=String(req.body?.nodeId||'').trim();
     const ok=req.body?.ok!==false;
     const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
@@ -3801,7 +3864,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
+const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -3835,7 +3898,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
+const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');
