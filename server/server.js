@@ -577,7 +577,7 @@ async function recordDiagnostic(companyId,errorCode,module,message='',opts={}){
   }catch(e){console.warn('diagnostic log failed:',e?.message||e)}
 }
 
-const SERVER_SCHEMA_TARGET=36;
+const SERVER_SCHEMA_TARGET=37;
 const SERVER_MIGRATIONS=[
   {
     version:1,
@@ -1676,6 +1676,37 @@ const SERVER_MIGRATIONS=[
       CREATE INDEX IF NOT EXISTS idx_branch_nodes_last_seen ON dealer_branch_nodes(last_seen_at);
       CREATE INDEX IF NOT EXISTS idx_branch_nodes_company_node ON dealer_branch_nodes(company_id,node_id);
     `
+  },
+  {
+    version:37,
+    name:'vehicle-photo-peer-sync-index',
+    sql:`
+      CREATE TABLE IF NOT EXISTS vehicle_photo_index(
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        car_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        photo_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        ext TEXT NOT NULL DEFAULT 'jpg',
+        bytes BIGINT NOT NULL DEFAULT 0,
+        owner_branch_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(company_id,car_id,kind,photo_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_vehicle_photo_index_company_car ON vehicle_photo_index(company_id,car_id);
+      CREATE TABLE IF NOT EXISTS vehicle_photo_presence(
+        company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        car_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        photo_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        branch_id TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        PRIMARY KEY(company_id,car_id,kind,photo_id,node_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_vehicle_photo_presence_node ON vehicle_photo_presence(company_id,node_id,last_seen_at);
+      DELETE FROM dealer_node_requests WHERE resource IN ('vehiclePhoto','vehiclePhotoBundle');
+    `
   }
 ];
 
@@ -2075,14 +2106,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.20',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.21',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.20',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.21',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3477,7 +3508,80 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 
 // Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
-const NODE_RESOURCES=new Set(['companyData','fullCompanyData','vehicleDetail','vehiclePhoto','vehiclePhotoBundle','salesInventory','backupStatus','createBackup','branchDashboardSummary']);
+const NODE_RESOURCES=new Set(['companyData','fullCompanyData','vehicleDetail','salesInventory','backupStatus','createBackup','branchDashboardSummary']);
+
+// Vehicle photo peer sync (Phase 16A): Central is signaling/index coordinator only.
+// Photo bytes are NEVER accepted by these endpoints; WebRTC DataChannel carries bytes directly node-to-node.
+const photoPeerSignals=new Map(),photoSalesClients=new Map();
+const PHOTO_SIGNAL_TTL_MS=90*1000;
+let PHOTO_SYNC_ICE_SERVERS=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
+try{if(process.env.PHOTO_SYNC_ICE_SERVERS_JSON){const x=JSON.parse(process.env.PHOTO_SYNC_ICE_SERVERS_JSON);if(Array.isArray(x)&&x.length)PHOTO_SYNC_ICE_SERVERS=x}}catch(e){console.warn('PHOTO_SYNC_ICE_SERVERS_JSON 格式錯誤，使用預設 STUN')}
+function cleanPhotoSignals(){const cutoff=Date.now()-PHOTO_SIGNAL_TTL_MS;for(const [k,a] of photoPeerSignals){const next=(a||[]).filter(x=>Number(x.createdMs||0)>=cutoff);if(next.length)photoPeerSignals.set(k,next);else photoPeerSignals.delete(k)}for(const [k,v] of photoSalesClients){if(Number(v.expiresMs||0)<Date.now())photoSalesClients.delete(k)}}
+async function photoSyncFindNode(companyId,nodeId){const id=String(nodeId||'').trim();if(!id)return null;let n=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND node_id=$2',[companyId,id])).rows[0];if(n)return n;const c=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1 AND node_id=$2',[companyId,id])).rows[0];if(!c)return null;return {...c,branch_id:String(c.capabilities?.branchId||'')};}
+async function photoSyncNodeForAuth(req,nodeId){
+  const n=await photoSyncFindNode(req.auth.companyId,nodeId);if(!n)return null;
+  if(req.auth.role==='branchManager'){
+    const u=(await pool.query('SELECT branch_id FROM users WHERE id=$1 AND company_id=$2',[req.auth.sub,req.auth.companyId])).rows[0];
+    if(String(u?.branch_id||'')!==String(n.branch_id||''))return null;
+  }
+  return n;
+}
+app.get('/api/photo-sync/plan',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
+  const node=await photoSyncNodeForAuth(req,req.query.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});
+  const branchCount=Number((await pool.query('SELECT COUNT(*)::int n FROM branches WHERE company_id=$1 AND enabled=TRUE',[req.auth.companyId])).rows[0]?.n||0);
+  const snap=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0]?.json||{};
+  const activeCarIds=(Array.isArray(snap.cars)?snap.cars:[]).filter(c=>String(c?.status||'')==='在庫').map(c=>String(c.id||'')).filter(Boolean);
+  const branchNodes=(await pool.query('SELECT node_id,branch_id,device_name,last_seen_at,capabilities FROM dealer_branch_nodes WHERE company_id=$1',[req.auth.companyId])).rows;const companyNode=(await pool.query('SELECT node_id,device_name,last_seen_at,capabilities FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];const peerMap=new Map();for(const x of [...branchNodes,...(companyNode?[{...companyNode,branch_id:String(companyNode.capabilities?.branchId||'')}]:[])]){if(String(x.node_id)===String(node.node_id)||!nodeOnline(x))continue;peerMap.set(String(x.node_id),{nodeId:x.node_id,branchId:x.branch_id||'',deviceName:x.device_name||'',lastSeenAt:x.last_seen_at})}const peers=[...peerMap.values()];
+  const photoIndex=(await pool.query('SELECT car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at FROM vehicle_photo_index WHERE company_id=$1 AND car_id = ANY($2::text[]) ORDER BY car_id,kind,photo_id',[req.auth.companyId,activeCarIds.length?activeCarIds:['__none__']])).rows.map(x=>({carId:x.car_id,kind:x.kind,photoId:x.photo_id,sha256:x.sha256,ext:x.ext,bytes:Number(x.bytes||0),ownerBranchId:x.owner_branch_id,updatedAt:x.updated_at}));
+  res.json({ok:true,enabled:branchCount>1,branchCount,activeCarIds,photoIndex,peers,iceServers:PHOTO_SYNC_ICE_SERVERS,policy:'active-vehicles-only',transport:'webrtc-p2p',centralStoresPhotoBytes:false});
+}catch(e){next(e)}});
+app.post('/api/photo-sync/manifest',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
+  const b=req.body||{},node=await photoSyncNodeForAuth(req,b.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});
+  const entries=Array.isArray(b.entries)?b.entries.slice(0,5000):[];const nowTs=now();
+  const snap=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0]?.json||{};const cars=Array.isArray(snap.cars)?snap.cars:[];const active=new Map(cars.filter(c=>String(c?.status||'')==='在庫').map(c=>[String(c.id||''),c]));
+  await pool.query('DELETE FROM vehicle_photo_presence WHERE company_id=$1 AND node_id=$2',[req.auth.companyId,node.node_id]);
+  for(const e of entries){const carId=String(e?.carId||''),kind=String(e?.kind||'');const photoId=String(e?.photoId||''),sha=String(e?.sha256||'');if(!active.has(carId)||!['intake','inspection'].includes(kind)||!photoId||!sha)continue;await pool.query(`INSERT INTO vehicle_photo_presence(company_id,car_id,kind,photo_id,node_id,branch_id,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(company_id,car_id,kind,photo_id,node_id) DO UPDATE SET branch_id=EXCLUDED.branch_id,last_seen_at=EXCLUDED.last_seen_at`,[req.auth.companyId,carId,kind,photoId,node.node_id,node.branch_id,nowTs]);}
+  const ownedCars=cars.filter(c=>String(c?.status||'')==='在庫'&&String(c.branchId||'')===String(node.branch_id||''));
+  for(const car of ownedCars){const carId=String(car.id||'');if(!carId)continue;const list=entries.filter(e=>String(e?.carId||'')===carId&&e?.current===true);const expected=Math.max(0,Number(car.intakePhotoCount||0))+Math.max(0,Number(car.inspectionPhotoCount||0));if(list.length!==expected)continue;await pool.query('DELETE FROM vehicle_photo_index WHERE company_id=$1 AND car_id=$2',[req.auth.companyId,carId]);for(const e of list){const kind=String(e.kind||''),photoId=String(e.photoId||''),sha=String(e.sha256||'');if(!['intake','inspection'].includes(kind)||!photoId||!sha)continue;await pool.query(`INSERT INTO vehicle_photo_index(company_id,car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,car_id,kind,photo_id) DO UPDATE SET sha256=EXCLUDED.sha256,ext=EXCLUDED.ext,bytes=EXCLUDED.bytes,owner_branch_id=EXCLUDED.owner_branch_id,updated_at=EXCLUDED.updated_at`,[req.auth.companyId,carId,kind,photoId,sha,String(e.ext||'jpg'),Math.max(0,Number(e.bytes||0)),node.branch_id,nowTs]);}}
+  const activeIds=[...active.keys()];await pool.query('DELETE FROM vehicle_photo_index WHERE company_id=$1 AND NOT (car_id = ANY($2::text[]))',[req.auth.companyId,activeIds.length?activeIds:['__none__']]);await pool.query('DELETE FROM vehicle_photo_presence WHERE company_id=$1 AND NOT (car_id = ANY($2::text[]))',[req.auth.companyId,activeIds.length?activeIds:['__none__']]);
+  const photoIndex=(await pool.query('SELECT car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at FROM vehicle_photo_index WHERE company_id=$1 AND car_id = ANY($2::text[]) ORDER BY car_id,kind,photo_id',[req.auth.companyId,activeIds.length?activeIds:['__none__']])).rows.map(x=>({carId:x.car_id,kind:x.kind,photoId:x.photo_id,sha256:x.sha256,ext:x.ext,bytes:Number(x.bytes||0),ownerBranchId:x.owner_branch_id,updatedAt:x.updated_at}));res.json({ok:true,photoIndex,activeCarIds:activeIds});
+}catch(e){next(e)}});
+app.post('/api/photo-sync/signal',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
+  cleanPhotoSignals();const b=req.body||{},fromNodeId=String(b.fromNodeId||''),toNodeId=String(b.toNodeId||''),toClientId=String(b.toClientId||''),signalId=String(b.signalId||''),type=String(b.type||''),sdp=b.sdp;
+  if(!fromNodeId||(!toNodeId&&!toClientId)||!signalId||!['offer','answer'].includes(type)||!sdp||typeof sdp!=='object')return res.status(400).json({error:'P2P 訊號資料不完整'});
+  const from=await photoSyncNodeForAuth(req,fromNodeId);if(!from)return res.status(403).json({error:'來源主機驗證失敗'});
+  if(toClientId){const ckey=req.auth.companyId+'|'+toClientId,client=photoSalesClients.get(ckey);if(!client)return res.status(410).json({error:'業務 P2P 工作階段已失效'});const key=req.auth.companyId+'|sales:'+toClientId,a=photoPeerSignals.get(key)||[];a.push({signalId,type,fromNodeId,toClientId,sdp,peerType:'dealerNode',scopeCarId:client.carId,createdAt:now(),createdMs:Date.now()});photoPeerSignals.set(key,a.slice(-30));return res.json({ok:true});}
+  const to=await photoSyncFindNode(req.auth.companyId,toNodeId);if(!to||!nodeOnline(to))return res.status(409).json({error:'目的分店主機目前離線'});
+  const key=req.auth.companyId+'|'+toNodeId,a=photoPeerSignals.get(key)||[];
+  a.push({signalId,type,fromNodeId,toNodeId,sdp,createdAt:now(),createdMs:Date.now()});photoPeerSignals.set(key,a.slice(-100));
+  res.json({ok:true});
+}catch(e){next(e)}});
+
+app.get('/api/sales/photo-p2p/plan',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});const carId=String(req.query.carId||''),clientId=String(req.query.clientId||'');if(!carId||!clientId)return res.status(400).json({error:'照片 P2P 參數不完整'});
+  const snap=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0]?.json||{},car=(Array.isArray(snap.cars)?snap.cars:[]).find(c=>String(c?.id||'')===carId&&String(c?.status||'')==='在庫');if(!car)return res.status(404).json({error:'找不到在庫車輛'});
+  const me=(await pool.query('SELECT branch_id FROM users WHERE id=$1 AND company_id=$2 AND enabled=TRUE',[req.auth.sub,req.auth.companyId])).rows[0];if(!me?.branch_id||String(me.branch_id)!==String(car.branchId||''))return res.status(403).json({error:'業務只能查看自己分店的車輛照片'});
+  const node=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND branch_id=$2',[req.auth.companyId,me.branch_id])).rows[0];if(!node||!nodeOnline(node))return res.status(409).json({error:'分店主機目前離線，暫時無法讀取照片'});
+  const expected=Math.max(0,Number(car.intakePhotoCount||0))+Math.max(0,Number(car.inspectionPhotoCount||0));photoSalesClients.set(req.auth.companyId+'|'+clientId,{userId:String(req.auth.sub),carId,branchId:String(me.branch_id),expiresMs:Date.now()+PHOTO_SIGNAL_TTL_MS});res.json({ok:true,clientId,carId,nodeId:node.node_id,expected,iceServers:PHOTO_SYNC_ICE_SERVERS,transport:'webrtc-p2p',centralStoresPhotoBytes:false});
+}catch(e){next(e)}});
+app.post('/api/sales/photo-p2p/signal',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});cleanPhotoSignals();const b=req.body||{},clientId=String(b.clientId||''),carId=String(b.carId||''),toNodeId=String(b.toNodeId||''),signalId=String(b.signalId||''),sdp=b.sdp;if(!clientId||!carId||!toNodeId||!signalId||!sdp||typeof sdp!=='object')return res.status(400).json({error:'照片 P2P 訊號不完整'});
+  const planKey=req.auth.companyId+'|'+clientId,client=photoSalesClients.get(planKey);if(!client||client.userId!==String(req.auth.sub)||client.carId!==carId)return res.status(410).json({error:'請重新建立照片連線'});const node=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND branch_id=$2 AND node_id=$3',[req.auth.companyId,client.branchId,toNodeId])).rows[0];if(!node||!nodeOnline(node))return res.status(409).json({error:'分店主機目前離線'});
+  const key=req.auth.companyId+'|'+toNodeId,a=photoPeerSignals.get(key)||[];a.push({signalId,type:'offer',fromNodeId:'sales:'+clientId,toNodeId,sdp,peerType:'sales',salesClientId:clientId,scopeCarId:carId,createdAt:now(),createdMs:Date.now()});photoPeerSignals.set(key,a.slice(-100));res.json({ok:true});
+}catch(e){next(e)}});
+app.get('/api/sales/photo-p2p/signals',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});cleanPhotoSignals();const clientId=String(req.query.clientId||''),client=photoSalesClients.get(req.auth.companyId+'|'+clientId);if(!client||client.userId!==String(req.auth.sub))return res.status(410).json({error:'照片 P2P 工作階段已失效'});const key=req.auth.companyId+'|sales:'+clientId,a=photoPeerSignals.get(key)||[];photoPeerSignals.delete(key);res.json({ok:true,signals:a.map(({createdMs,...x})=>x)});
+}catch(e){next(e)}});
+
+app.get('/api/photo-sync/signals',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
+  cleanPhotoSignals();const node=await photoSyncNodeForAuth(req,req.query.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});
+  const key=req.auth.companyId+'|'+node.node_id,a=photoPeerSignals.get(key)||[];photoPeerSignals.delete(key);res.json({ok:true,signals:a.map(({createdMs,...x})=>x)});
+}catch(e){next(e)}});
+
 function nodeOnline(row,maxAgeMs=45000){
   if(row?.capabilities?.online===false)return false;
   const t=Date.parse(row?.last_seen_at||'');
@@ -3597,6 +3701,7 @@ app.get('/api/super/node-requests/:id',superAuth,async(req,res,next)=>{
 // Sales automatic photo strip: one Node command returns up to 8 photos for one in-stock vehicle.
 app.post('/api/sales/node-photos/request',auth,requireActiveCompany,async(req,res,next)=>{
   try{
+    return res.status(410).json({error:'車輛照片已改用端對端 P2P，不再經過中央伺服器'});
     await cleanupNodeRequests();
     if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
     const carId=String(req.body?.carId||'').trim();
@@ -3621,6 +3726,7 @@ app.post('/api/sales/node-photos/request',auth,requireActiveCompany,async(req,re
 
 app.get('/api/sales/node-photo-bundles/:id',auth,requireActiveCompany,async(req,res,next)=>{
   try{
+    return res.status(410).json({error:'車輛照片已改用端對端 P2P，不再經過中央伺服器'});
     if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
     const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
     const r=rows[0];
@@ -3637,6 +3743,7 @@ app.get('/api/sales/node-photo-bundles/:id',auth,requireActiveCompany,async(req,
 
 app.post('/api/sales/node-photo/request',auth,requireActiveCompany,async(req,res,next)=>{
   try{
+    return res.status(410).json({error:'車輛照片已改用端對端 P2P，不再經過中央伺服器'});
     await cleanupNodeRequests();
     if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
     const carId=String(req.body?.carId||'').trim();
@@ -3668,6 +3775,7 @@ app.post('/api/sales/node-photo/request',auth,requireActiveCompany,async(req,res
 
 app.get('/api/sales/node-photo-requests/:id',auth,requireActiveCompany,async(req,res,next)=>{
   try{
+    return res.status(410).json({error:'車輛照片已改用端對端 P2P，不再經過中央伺服器'});
     if(req.auth.role!=='sales')return res.status(403).json({error:'僅業務帳號可使用此入口'});
     const {rows}=await pool.query('SELECT * FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[req.params.id,req.auth.companyId]);
     const r=rows[0];
@@ -3864,7 +3972,7 @@ app.post('/api/node/diagnostics',auth,requireActiveCompany,async(req,res,next)=>
 });
 
 
-const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
+const CENTRAL_BACKUP_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','schema_migrations','migration_safety_events','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','vehicle_photo_index','vehicle_photo_presence','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 let centralBackupRunning=false;
 function backupKeyBytes(){return crypto.createHash('sha256').update(String(BACKUP_ENCRYPTION_KEY)).digest()}
 function backupStorageStatus(){return {localDir:POSTGRES_BACKUP_DIR,encryption:'AES-256-GCM',productionKeyConfigured:!BACKUP_ENCRYPTION_KEY.startsWith('DEV_ONLY_'),s3Configured:!!BACKUP_S3_BUCKET,s3Bucket:BACKUP_S3_BUCKET||'',s3Region:BACKUP_S3_REGION,s3Endpoint:BACKUP_S3_ENDPOINT||'',s3Prefix:BACKUP_S3_PREFIX}}
@@ -3898,7 +4006,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
   }catch(e){if(eventCreated)try{await pool.query(`UPDATE central_backup_events SET status='failed',completed_at=$1,error_text=$2 WHERE backup_id=$3`,[now(),String(e?.message||e).slice(0,2000),backupId])}catch{};if(!e?.skipDiagnostic)await recordDiagnostic('','BACKUP_CREATE_001','central_backup',e?.message||'中央備份失敗',{severity:'error',actor,context:{backupId}});throw e}finally{if(lockClient){if(hasDbLock)try{await lockClient.query('SELECT pg_advisory_unlock(73919001)')}catch{};lockClient.release()}centralBackupRunning=false}
 }
 
-const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
+const CENTRAL_RESTORE_TABLES=['companies','branches','users','snapshots','dealer_nodes','dealer_branch_nodes','offline_license_tests','sync_events','dealer_node_requests','diagnostic_events','desktop_update_policy','desktop_update_events','central_backup_policy','central_ha_events','load_test_runs','security_audit_events','idempotency_keys','release_control_events','subscription_plans','payment_providers','dealer_subscriptions','payment_transactions','payment_webhook_events','subscription_events','payment_renewal_attempts','dealer_notification_reads','dealer_renewal_requests','payroll_settlements','payroll_month_periods','payroll_month_events','company_setting_events','staff_change_events','vehicle_transfers','vehicle_photo_index','vehicle_photo_presence','operating_cost_rules','operating_cost_entries','super_data_center_settings','service_vehicles','service_orders','service_order_items','parts','part_inventory','part_purchases'];
 function qIdent(v){return '"'+String(v).replaceAll('"','""')+'"'}
 function decryptBackupBuffer(buf){
   const magic=Buffer.from('CDBAK1\n');if(!Buffer.isBuffer(buf)||buf.length<magic.length+10||!buf.subarray(0,magic.length).equals(magic))throw new Error('備份格式錯誤');

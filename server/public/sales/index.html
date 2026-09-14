@@ -110,12 +110,30 @@ function addPhotoHistory(item,state,message=''){let h=loadPhotoHistory();h.unshi
 function photoOperationId(){try{return 'photo_'+crypto.randomUUID()}catch{return 'photo_'+Date.now()+'_'+Math.random().toString(36).slice(2,12)}}
 function schedulePhotoQueue(ms=1200){clearTimeout(photoQueueTimer);photoQueueTimer=setTimeout(()=>processPhotoQueue(false),ms)}
 function ensurePhotoQueued(car){if(!car||salesPhotoCache[String(car.id)]?.length)return;let q=loadPhotoQueue();if(q.some(x=>String(x.carId)===String(car.id)&&x.state!=='failed'))return;let total=Number(car.intakePhotoCount||0)+Number(car.inspectionPhotoCount||0);if(!total)return;q.push({operationId:photoOperationId(),type:'photoFetch',carId:car.id,plate:car.plate||'',model:car.model||'',createdAt:new Date().toISOString(),attempts:0,nextTryAt:0,state:'pending',lastError:''});savePhotoQueue(q);schedulePhotoQueue(80)}
+function salesWaitIce(pc,timeout=8000){return new Promise(resolve=>{if(pc.iceGatheringState==='complete')return resolve();let done=false;const finish=()=>{if(done)return;done=true;pc.removeEventListener('icegatheringstatechange',h);resolve()},h=()=>{if(pc.iceGatheringState==='complete')finish()};pc.addEventListener('icegatheringstatechange',h);setTimeout(finish,timeout)})}
+async function fetchPhotoBundleP2P(carId){
+ if(!window.RTCPeerConnection)throw new Error('目前瀏覽器不支援端對端照片連線');
+ const clientId='sales_'+crypto.randomUUID(),plan=await api('/sales/photo-p2p/plan?carId='+encodeURIComponent(carId)+'&clientId='+encodeURIComponent(clientId));
+ if(!plan?.nodeId)throw new Error('分店主機目前無法提供照片');
+ const pc=new RTCPeerConnection({iceServers:Array.isArray(plan.iceServers)?plan.iceServers:[]}),dc=pc.createDataChannel('vehicle-photo-sync',{ordered:true});
+ let manifestParts=[],manifestExpected=0,requested=0,received=0,photos=[],incoming=new Map(),done=false;
+ const result=new Promise((resolve,reject)=>{const timer=setTimeout(()=>{if(done)return;done=true;try{pc.close()}catch{};reject(new Error('端對端照片連線逾時'))},45000);
+   const finish=()=>{if(done)return;done=true;clearTimeout(timer);try{pc.close()}catch{};resolve(photos.slice(0,8))};
+   dc.onmessage=ev=>{let m;try{m=JSON.parse(ev.data)}catch{return}
+     if(m.t==='manifest'){manifestExpected=Math.max(manifestExpected,Number(m.total||1));manifestParts[Number(m.i||0)]=Array.isArray(m.entries)?m.entries:[];if(manifestParts.filter(Boolean).length>=manifestExpected){const rows=manifestParts.flat().filter(x=>String(x.carId)===String(carId)).slice(0,8);requested=rows.length;if(!requested)return finish();dc.send(JSON.stringify({t:'request',items:rows}));}return}
+     if(m.t==='photoStart'){incoming.set(String(m.meta?.photoId||''),{chunks:[],len:Number(m.len||0)});return}
+     if(m.t==='photoChunk'){const x=incoming.get(String(m.id||''));if(x)x.chunks.push(String(m.d||''));return}
+     if(m.t==='photoEnd'){const id=String(m.id||''),x=incoming.get(id);if(!x)return;incoming.delete(id);const src=x.chunks.join('');if(!x.len||src.length===x.len)photos.push(src);received++;if(received>=requested)finish();return}
+   };dc.onerror=()=>{};pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed'&&!done){done=true;clearTimeout(timer);reject(new Error('無法與分店主機建立端對端照片連線'))}};
+ });
+ const offer=await pc.createOffer();await pc.setLocalDescription(offer);await salesWaitIce(pc);const signalId='spsig_'+Date.now()+'_'+crypto.randomUUID();await api('/sales/photo-p2p/signal',{method:'POST',body:JSON.stringify({clientId,carId,toNodeId:plan.nodeId,signalId,sdp:pc.localDescription})});
+ const deadline=Date.now()+15000;let answered=false;while(Date.now()<deadline&&!answered){await new Promise(r=>setTimeout(r,350));const s=await api('/sales/photo-p2p/signals?clientId='+encodeURIComponent(clientId));for(const sig of (s.signals||[])){if(sig.signalId===signalId&&sig.type==='answer'){await pc.setRemoteDescription(sig.sdp);answered=true;break}}}
+ if(!answered){try{pc.close()}catch{};throw new Error('分店主機沒有回應照片連線')}
+ return result;
+}
 async function fetchPhotoBundleOnce(carId){
  if(LAN_MODE){const rr=await api('/lan/photos/'+encodeURIComponent(carId));return (rr.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8)}
- const q=await api('/sales/node-photos/request',{method:'POST',body:JSON.stringify({carId})});
- const deadline=Date.now()+65000;
- while(Date.now()<deadline){await new Promise(r=>setTimeout(r,550));const rr=await api('/sales/node-photo-bundles/'+encodeURIComponent(q.requestId));if(rr.status==='completed')return (rr.result?.photos||[]).map(x=>x?.src).filter(Boolean).slice(0,8);if(rr.status==='failed'||rr.status==='expired'){let e=new Error(rr.error||'照片讀取失敗');throw e}}
- throw new Error('照片讀取逾時')
+ return fetchPhotoBundleP2P(carId)
 }
 async function processPhotoQueue(force=false){
  if(!token||photoQueueBusy||!navigator.onLine||!nodeIsOnline)return;
