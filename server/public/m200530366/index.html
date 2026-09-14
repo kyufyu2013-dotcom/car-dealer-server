@@ -59,11 +59,13 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <aside class="sidebar">
       <div class="brand">🚘 Super Admin</div>
       <div class="subbrand">全車行資料中心</div>
+      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.24</div>
       <div class="nav">
         <button id="navOverview" class="active" onclick="showPage('overview')">📊 平台總覽</button>
         <button id="navCompanies" onclick="showPage('companies')">🏢 公司／分店</button>
         <button id="navDatacenter" onclick="showPage('datacenter')">🛰️ 超級資料中心</button>
         <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
+        <button id="navSubscriptions" onclick="showPage('subscriptions')">💳 方案／訂閱管理</button>
 
         <div class="nav-divider"></div>
         <div class="nav-group open" data-nav-group="system">
@@ -94,7 +96,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <main class="content">
       <div class="top">
         <div><h1 id="pageTitle">平台總覽</h1><div class="muted">最高權限：以「公司 → 總店 → 分店」管理所有據點、授權、車輛與人員資料</div></div>
-        <div style="display:flex;align-items:center;gap:8px"><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.24</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
       </div>
       <div id="main"></div>
     </main>
@@ -104,10 +106,12 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
 <div id="modalBg" class="modal-bg"><div id="modal" class="modal"></div></div>
 
 <script>
+const SUPERADMIN_UI_VERSION="14.9.24";
 const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
 const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
 const AUTO_REFRESH_MS=3000;
-let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,performanceData=null,resilienceData=null,resilienceSuiteData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0,lastPerformanceAt=0,lastResilienceAt=0;
+let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,performanceData=null,resilienceData=null,resilienceSuiteData=null,subscriptionData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0,lastPerformanceAt=0,lastResilienceAt=0,lastSubscriptionsAt=0;
+let subscriptionState={planPage:1,planSearch:"",planStatus:"",subscriptionPage:1,subscriptionSearch:"",subscriptionStatus:""};
 const nodeCompanyCache=new Map(),nodeVehicleCache=new Map(),liveDataCenterCache=new Map();
 let liveDcState={companyId:"",tab:"summary",search:"",page:1,pageSize:10,month:new Date().toISOString().slice(0,7),history:[]};
 let dcAuditToken="",dcAuditState={page:1,pageSize:10,q:""};
@@ -212,11 +216,11 @@ function showPage(p){
   if(p==="sales"||p==="users")p="overview";
   currentPage=p;saveSession();
   ensureNavGroupForPage(p);
-  ["overview","companies","datacenter","vehicles","sales","health","diagnostics","updates","backups","ha","loadtest","performance","resilience"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1))?.classList.toggle("active",x===p));
-  const titles={overview:"平台總覽",companies:"公司／分店管理",datacenter:"超級資料中心",vehicles:"全部車輛",health:"系統健康",diagnostics:"錯誤診斷",updates:"版本更新",backups:"中央伺服器資料備份",ha:"中央伺服器容災備援",loadtest:"壓力測試",performance:"效能監控",resilience:"故障演練"};pageTitle.textContent=titles[p]||"Super Admin";
-  if(p==="diagnostics"&&Date.now()-lastDiagnosticsAt>5000)refreshDiagnostics(false);else if(p==="backups"&&Date.now()-lastBackupsAt>5000)refreshBackups(false);else if(p==="ha"&&Date.now()-lastHaAt>5000)refreshHa(false);else if(p==="loadtest"&&Date.now()-lastLoadTestAt>5000)refreshLoadTests(false);else if(p==="performance"&&Date.now()-lastPerformanceAt>3000)refreshPerformance(false);else if(p==="resilience"&&Date.now()-lastResilienceAt>3000)refreshResilience(false);else renderCurrent();
+  ["overview","companies","datacenter","vehicles","subscriptions","sales","health","diagnostics","updates","backups","ha","loadtest","performance","resilience"].forEach(x=>document.getElementById("nav"+x[0].toUpperCase()+x.slice(1))?.classList.toggle("active",x===p));
+  const titles={overview:"平台總覽",companies:"公司／分店管理",datacenter:"超級資料中心",vehicles:"全部車輛",subscriptions:"方案／訂閱管理",health:"系統健康",diagnostics:"錯誤診斷",updates:"版本更新",backups:"中央伺服器資料備份",ha:"中央伺服器容災備援",loadtest:"壓力測試",performance:"效能監控",resilience:"故障演練"};pageTitle.textContent=titles[p]||"Super Admin";
+  if(p==="subscriptions"&&Date.now()-lastSubscriptionsAt>1500)refreshSubscriptions(false);else if(p==="diagnostics"&&Date.now()-lastDiagnosticsAt>5000)refreshDiagnostics(false);else if(p==="backups"&&Date.now()-lastBackupsAt>5000)refreshBackups(false);else if(p==="ha"&&Date.now()-lastHaAt>5000)refreshHa(false);else if(p==="loadtest"&&Date.now()-lastLoadTestAt>5000)refreshLoadTests(false);else if(p==="performance"&&Date.now()-lastPerformanceAt>3000)refreshPerformance(false);else if(p==="resilience"&&Date.now()-lastResilienceAt>3000)refreshResilience(false);else renderCurrent();
 }
-function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="companies")renderCompanies();else if(currentPage==="datacenter"){if(liveDcState.companyId&&liveDataCenterCache.has(liveDcState.companyId))renderLiveDcPage();else renderDataCenter();}else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers();else if(currentPage==="health")renderHealth();else if(currentPage==="diagnostics")renderDiagnostics();else if(currentPage==="updates")renderUpdates();else if(currentPage==="backups")renderBackups();else if(currentPage==="ha")renderHa();else if(currentPage==="loadtest")renderLoadTests();else if(currentPage==="performance")renderPerformance();else if(currentPage==="resilience")renderResilience()}
+function renderCurrent(){if(currentPage==="overview")renderOverview();else if(currentPage==="companies")renderCompanies();else if(currentPage==="datacenter"){if(liveDcState.companyId&&liveDataCenterCache.has(liveDcState.companyId))renderLiveDcPage();else renderDataCenter();}else if(currentPage==="vehicles")renderVehicles();else if(currentPage==="subscriptions")renderSubscriptions();else if(currentPage==="sales")renderSales();else if(currentPage==="users")renderUsers();else if(currentPage==="health")renderHealth();else if(currentPage==="diagnostics")renderDiagnostics();else if(currentPage==="updates")renderUpdates();else if(currentPage==="backups")renderBackups();else if(currentPage==="ha")renderHa();else if(currentPage==="loadtest")renderLoadTests();else if(currentPage==="performance")renderPerformance();else if(currentPage==="resilience")renderResilience()}
 function userIsEditing(){const a=document.activeElement;return !!(a&&(a.tagName==="INPUT"||a.tagName==="SELECT"||a.tagName==="TEXTAREA"||a.isContentEditable))}
 function modalIsOpen(){return modalBg.classList.contains("show")}
 
@@ -429,6 +433,83 @@ function renderUpdates(){
 }
 async function hashUpdateFile(file){if(!file)return;const st=document.getElementById('updHashState');try{st.textContent='正在計算檔案驗證碼…';const buf=await file.arrayBuffer();const digest=await crypto.subtle.digest('SHA-256',buf);const hex=[...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join('');document.getElementById('updSha').value=hex;st.textContent='✓ 已完成驗證碼計算：'+file.name}catch(e){st.textContent='計算失敗：'+(e.message||e)}}
 async function saveUpdatePolicy(){const b={enabled:!!document.getElementById('updEnabled')?.checked,channel:document.getElementById('updChannel')?.value||'stable',latestVersion:document.getElementById('updLatest')?.value||'0.9.6',minimumVersion:document.getElementById('updMinimum')?.value||'0.0.0',downloadUrl:document.getElementById('updUrl')?.value||'',releaseNotes:document.getElementById('updNotes')?.value||'',packageSha256:document.getElementById('updSha')?.value||'',packageSignature:''};try{const r=await api('/super/update-policy',{method:'PATCH',body:JSON.stringify(b)});updatePolicy=r.policy;alert('更新政策已儲存');renderCurrentPreservingScroll();}catch(e){alert(e.message||'更新政策儲存失敗')}}
+
+
+function billingIntervalLabel(p){const n=Math.max(1,Number(p?.billing_interval_count||1)),u=p?.billing_interval||"month";const t=u==="year"?"年":u==="day"?"天":"月";return n===1?`每${t}`:`每 ${n} ${t}`}
+function subscriptionStatusLabel(st){return ({active:"正常",trialing:"試用",grace_period:"寬限期",past_due:"逾期",suspended:"停權",cancelled:"已取消"})[st]||st||"-"}
+function subscriptionStatusBadge(st){return `<span class="badge ${st==="active"||st==="trialing"?"ok":st==="grace_period"||st==="past_due"?"warn":"bad"}">${esc(subscriptionStatusLabel(st))}</span>`}
+function planMoney(p){return `NT$ ${Math.round(Number(p?.price_cents||0)/100).toLocaleString("zh-TW")}`}
+async function refreshSubscriptions(manual=false){
+  if(!superToken)return;
+  try{
+    const q=new URLSearchParams({planPage:String(subscriptionState.planPage),planSearch:subscriptionState.planSearch,planStatus:subscriptionState.planStatus,subscriptionPage:String(subscriptionState.subscriptionPage),subscriptionSearch:subscriptionState.subscriptionSearch,subscriptionStatus:subscriptionState.subscriptionStatus});
+    subscriptionData=await api("/super/subscriptions?"+q.toString());lastSubscriptionsAt=Date.now();
+    if(currentPage==="subscriptions")renderSubscriptions();
+  }catch(e){if(manual)alert(e.message);else main.innerHTML=`<div class="notice" style="background:#fee2e2;border-color:#fecaca;color:#991b1b">方案／訂閱資料讀取失敗：${esc(e.message)}</div>`}
+}
+function renderSubscriptions(){
+  const d=subscriptionData;
+  if(!d){main.innerHTML='<div class="node-loading"><span class="spinner"></span><div><b>讀取中央方案資料中…</b><div class="muted">資料直接來自 Server PostgreSQL。</div></div></div>';return}
+  const plans=Array.isArray(d.plans)?d.plans:[],subs=Array.isArray(d.subscriptions)?d.subscriptions:[],pp=d.planPagination||{},sp=d.subscriptionPagination||{};
+  main.innerHTML=`
+  <div class="cards">
+    <div class="card"><div class="muted">方案數</div><div class="num">${Number(pp.total||plans.length)}</div></div>
+    <div class="card"><div class="muted">正常訂閱</div><div class="num">${Number(d.activeSubscriptionCount||0)}</div></div>
+    <div class="card"><div class="muted">需注意訂閱</div><div class="num">${Number(d.attentionSubscriptionCount||0)}</div></div>
+    <div class="card"><div class="muted">待確認付款</div><div class="num">${Number(d.pendingPaymentCount||0)}</div></div>
+  </div>
+  <div class="notice"><b>中央方案商城來源</b><br>車行端方案商城讀取中央啟用中的方案。新增或修改後，車行端下次同步即會看到更新；方案停用後不再出現在商城。仍有車行使用中的方案受 Server 保護，不能直接永久刪除。</div>
+  <div class="panel">
+    <div class="panel-head"><div><h2 style="margin:0">💳 方案商品管理</h2><div class="muted">新增、修改、上下架與刪除方案</div></div><button class="btn" onclick="openPlanEditor()">＋新增方案</button></div>
+    <div class="tools" style="margin-bottom:12px"><input id="planSearchBox" value="${esc(subscriptionState.planSearch)}" placeholder="搜尋方案名稱／說明"><select id="planStatusBox"><option value="">全部狀態</option><option value="active" ${subscriptionState.planStatus==='active'?'selected':''}>啟用中</option><option value="inactive" ${subscriptionState.planStatus==='inactive'?'selected':''}>已停用</option></select><button class="btn2" onclick="applyPlanFilter()">搜尋</button><button class="btn2" onclick="clearPlanFilter()">清除</button><button class="btn2" onclick="refreshSubscriptions(true)">重新整理</button></div>
+    <div class="table-wrap"><table><thead><tr><th>排序</th><th>方案</th><th>價格</th><th>計費</th><th>試用</th><th>寬限</th><th>商城狀態</th><th>操作</th></tr></thead><tbody>${plans.map(p=>`<tr><td>${Number(p.sort_order||0)}</td><td><b>${esc(p.name)}</b><div class="muted" style="white-space:normal;max-width:360px">${esc(p.description||'')}</div><div class="muted"><code>${esc(p.id)}</code></div></td><td><b>${planMoney(p)}</b> ${esc(p.currency||'TWD')}</td><td>${esc(billingIntervalLabel(p))}</td><td>${Number(p.trial_days||0)} 天</td><td>${Number(p.grace_days||0)} 天</td><td><span class="badge ${p.active?'ok':'bad'}">${p.active?'啟用／商城顯示':'停用／商城隱藏'}</span></td><td><button class="btn2" onclick="openPlanEditor('${esc(p.id)}')">編輯</button> <button class="btn2" onclick="togglePlanActive('${esc(p.id)}')">${p.active?'停用':'啟用'}</button> <button class="btn-danger" onclick="deletePlan('${esc(p.id)}')">刪除</button></td></tr>`).join('')||'<tr><td colspan="8">目前沒有方案</td></tr>'}</tbody></table></div>
+    <div class="actions"><span class="muted" style="margin-right:auto">共 ${Number(pp.total||0)} 筆｜第 ${Number(pp.page||1)}/${Math.max(1,Number(pp.totalPages||1))} 頁</span><button class="btn2" ${Number(pp.page||1)<=1?'disabled':''} onclick="changePlanPage(${Number(pp.page||1)-1})">上一頁</button><button class="btn2" ${Number(pp.page||1)>=Number(pp.totalPages||1)?'disabled':''} onclick="changePlanPage(${Number(pp.page||1)+1})">下一頁</button></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><div><h2 style="margin:0">🏢 車行訂閱</h2><div class="muted">查看目前車行使用方案，或直接指定／更換方案</div></div><button class="btn" onclick="openAssignPlan()">指定車行方案</button></div>
+    <div class="tools" style="margin-bottom:12px"><input id="subSearchBox" value="${esc(subscriptionState.subscriptionSearch)}" placeholder="搜尋車行／方案"><select id="subStatusBox"><option value="">全部狀態</option><option value="active" ${subscriptionState.subscriptionStatus==='active'?'selected':''}>正常</option><option value="grace_period" ${subscriptionState.subscriptionStatus==='grace_period'?'selected':''}>寬限期</option><option value="past_due" ${subscriptionState.subscriptionStatus==='past_due'?'selected':''}>逾期</option><option value="suspended" ${subscriptionState.subscriptionStatus==='suspended'?'selected':''}>停權</option><option value="cancelled" ${subscriptionState.subscriptionStatus==='cancelled'?'selected':''}>已取消</option></select><button class="btn2" onclick="applySubscriptionFilter()">搜尋</button><button class="btn2" onclick="clearSubscriptionFilter()">清除</button></div>
+    <div class="table-wrap"><table><thead><tr><th>車行</th><th>方案</th><th>狀態</th><th>付費期限</th><th>寬限至</th><th>車行授權</th><th>操作</th></tr></thead><tbody>${subs.map(x=>`<tr><td><b>${esc(x.company_name||x.company_id)}</b><div class="muted"><code>${esc(x.company_id)}</code></div></td><td>${esc(x.plan_name||'-')}</td><td>${subscriptionStatusBadge(x.status)}</td><td>${esc((x.current_period_end||'').slice(0,10)||'-')}</td><td>${esc((x.grace_until||'').slice(0,10)||'-')}</td><td><span class="badge ${x.enabled?'ok':'bad'}">${x.enabled?'啟用':'停用'}</span></td><td><button class="btn2" onclick="openAssignPlan('${esc(x.company_id)}')">更換方案</button></td></tr>`).join('')||'<tr><td colspan="7">目前沒有訂閱資料</td></tr>'}</tbody></table></div>
+    <div class="actions"><span class="muted" style="margin-right:auto">共 ${Number(sp.total||0)} 筆｜第 ${Number(sp.page||1)}/${Math.max(1,Number(sp.totalPages||1))} 頁</span><button class="btn2" ${Number(sp.page||1)<=1?'disabled':''} onclick="changeSubscriptionPage(${Number(sp.page||1)-1})">上一頁</button><button class="btn2" ${Number(sp.page||1)>=Number(sp.totalPages||1)?'disabled':''} onclick="changeSubscriptionPage(${Number(sp.page||1)+1})">下一頁</button></div>
+  </div>`;
+}
+function applyPlanFilter(){subscriptionState.planSearch=(document.getElementById('planSearchBox')?.value||'').trim();subscriptionState.planStatus=document.getElementById('planStatusBox')?.value||'';subscriptionState.planPage=1;refreshSubscriptions(true)}
+function clearPlanFilter(){subscriptionState.planSearch='';subscriptionState.planStatus='';subscriptionState.planPage=1;refreshSubscriptions(true)}
+function changePlanPage(p){subscriptionState.planPage=Math.max(1,Number(p)||1);refreshSubscriptions(true)}
+function applySubscriptionFilter(){subscriptionState.subscriptionSearch=(document.getElementById('subSearchBox')?.value||'').trim();subscriptionState.subscriptionStatus=document.getElementById('subStatusBox')?.value||'';subscriptionState.subscriptionPage=1;refreshSubscriptions(true)}
+function clearSubscriptionFilter(){subscriptionState.subscriptionSearch='';subscriptionState.subscriptionStatus='';subscriptionState.subscriptionPage=1;refreshSubscriptions(true)}
+function changeSubscriptionPage(p){subscriptionState.subscriptionPage=Math.max(1,Number(p)||1);refreshSubscriptions(true)}
+function findPlan(id){return (subscriptionData?.plans||[]).find(x=>String(x.id)===String(id))||(subscriptionData?.planOptions||[]).find(x=>String(x.id)===String(id))}
+function openPlanEditor(id=''){
+  const p=id?findPlan(id):null;
+  modal.innerHTML=`<h2>${p?'編輯方案':'新增方案'}</h2><div class="notice">儲存後直接寫入中央 PostgreSQL。啟用中的方案會提供給車行端商城同步讀取。</div><div class="grid">
+    <label>方案名稱<input id="planName" value="${esc(p?.name||'')}"></label>
+    <label>方案代碼<input id="planId" ${p?'disabled':''} value="${esc(p?.id||'') }" placeholder="留空可自動產生"></label>
+    <label>價格（元）<input id="planPrice" type="number" min="0" step="1" value="${p?Math.round(Number(p.price_cents||0)/100):0}"></label>
+    <label>幣別<input id="planCurrency" value="${esc(p?.currency||'TWD')}"></label>
+    <label>計費週期<select id="planInterval" style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px"><option value="month" ${p?.billing_interval==='month'||!p?'selected':''}>月</option><option value="year" ${p?.billing_interval==='year'?'selected':''}>年</option><option value="day" ${p?.billing_interval==='day'?'selected':''}>天</option></select></label>
+    <label>週期數<input id="planIntervalCount" type="number" min="1" value="${Number(p?.billing_interval_count||1)}"></label>
+    <label>試用天數<input id="planTrialDays" type="number" min="0" value="${Number(p?.trial_days||0)}"></label>
+    <label>寬限天數<input id="planGraceDays" type="number" min="0" value="${Number(p?.grace_days||0)}"></label>
+    <label>商城排序<input id="planSort" type="number" value="${Number(p?.sort_order||0)}"></label>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:26px"><input id="planActive" style="width:auto" type="checkbox" ${p?.active!==false?'checked':''}> 啟用並顯示於商城</label>
+  </div><label style="display:block;font-weight:700;font-size:14px;margin-top:12px">方案說明<textarea id="planDescription" style="width:100%;min-height:100px;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px">${esc(p?.description||'')}</textarea></label><div class="actions"><button class="btn2" onclick="closeModal()">取消</button><button class="btn" onclick="savePlan('${esc(id)}')">儲存方案</button></div>`;
+  modalBg.classList.add('show');
+}
+async function savePlan(id=''){
+  const name=planName.value.trim();if(!name)return alert('請輸入方案名稱');
+  const payload={name,description:planDescription.value.trim(),active:planActive.checked,price:Number(planPrice.value||0),currency:planCurrency.value.trim()||'TWD',billingInterval:planInterval.value,billingIntervalCount:Math.max(1,Number(planIntervalCount.value||1)),trialDays:Math.max(0,Number(planTrialDays.value||0)),graceDays:Math.max(0,Number(planGraceDays.value||0)),sortOrder:Number(planSort.value||0)};
+  if(!id&&planId.value.trim())payload.id=planId.value.trim();
+  try{if(id)await api('/super/subscriptions/plans/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify(payload)});else await api('/super/subscriptions/plans',{method:'POST',body:JSON.stringify(payload)});closeModal();await refreshSubscriptions(true)}catch(e){alert(e.message)}
+}
+async function togglePlanActive(id){const p=findPlan(id);if(!p)return;const next=!p.active;if(!confirm(`確定要${next?'啟用':'停用'}「${p.name}」？\n\n${next?'啟用後車行端商城同步後會顯示。':'停用後車行端商城同步後會隱藏，但既有車行訂閱不會被刪除。'}`))return;try{await api('/super/subscriptions/plans/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({active:next})});await refreshSubscriptions(true)}catch(e){alert(e.message)}}
+async function deletePlan(id){const p=findPlan(id);if(!p)return;if(!confirm(`確定永久刪除方案「${p.name}」？\n\n若目前仍有車行使用，Server 會自動阻止刪除。`))return;try{await api('/super/subscriptions/plans/'+encodeURIComponent(id),{method:'DELETE'});await refreshSubscriptions(true)}catch(e){alert(e.message)}}
+function openAssignPlan(companyId=''){
+  const companies=Array.isArray(subscriptionData?.companies)?subscriptionData.companies:[],plans=Array.isArray(subscriptionData?.planOptions)?subscriptionData.planOptions:[];
+  const current=(subscriptionData?.subscriptions||[]).find(x=>String(x.company_id)===String(companyId));
+  modal.innerHTML=`<h2>指定／更換車行方案</h2><div class="notice">指定後會直接更新中央訂閱資料。只有「啟用中」的方案可以被指定。</div><div class="grid"><label>車行<select id="assignCompany" style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px">${companies.map(c=>`<option value="${esc(c.id)}" ${String(c.id)===String(companyId)?'selected':''}>${esc(c.name)}（${esc(c.id)}）</option>`).join('')}</select></label><label>方案<select id="assignPlan" style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:8px;margin-top:5px">${plans.map(p=>`<option value="${esc(p.id)}" ${current&&String(current.plan_id)===String(p.id)?'selected':''}>${esc(p.name)}｜${planMoney(p)}｜${esc(billingIntervalLabel(p))}</option>`).join('')}</select></label></div><div class="actions"><button class="btn2" onclick="closeModal()">取消</button><button class="btn" ${!companies.length||!plans.length?'disabled':''} onclick="saveAssignPlan()">確認指定</button></div>`;
+  modalBg.classList.add('show');
+}
+async function saveAssignPlan(){const companyId=assignCompany.value,planId=assignPlan.value;if(!companyId||!planId)return alert('請選擇車行與方案');try{await api('/super/subscriptions/assign',{method:'POST',body:JSON.stringify({companyId,planId})});closeModal();await refreshSubscriptions(true);await refreshCloud(false)}catch(e){alert(e.message)}}
 
 function renderOverview(){
   const cars=allCars(),stock=cars.filter(c=>c.status!=="已售"),allBranches=cloudRows.flatMap(x=>companyBranches(x)),activeBranches=allBranches.filter(b=>b.enabled!==false),online=cloudRows.filter(x=>nodeIsOnline(x));

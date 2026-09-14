@@ -2081,9 +2081,18 @@ app.use(['/api/auth/login','/api/super/login'],(req,res,next)=>{const started=Da
 app.use('/api',(req,res,next)=>{if(!['POST','PUT','PATCH','DELETE'].includes(req.method)||req.path==='/auth/login'||req.path==='/super/login')return next();const started=Date.now();res.on('finish',()=>{if(!req.auth)return;const auditPath=String(req.originalUrl||req.url||req.path||'').split('?')[0];let category='dealer';if(auditPath.startsWith('/api/super/security/release-snapshot'))category='release';else if(auditPath.startsWith('/api/super/security/integrity-check'))category='data_integrity';else if(auditPath.startsWith('/api/super/security/'))category='security';else if(auditPath.startsWith('/api/super/'))category='super_admin';else if(auditPath.startsWith('/api/admin/'))category='dealer_admin';auditSecurityEvent(req,{action:`${req.method} ${auditPath}`,category,status:res.statusCode<400?'success':'rejected',detail:`HTTP ${res.statusCode} / ${Date.now()-started}ms`,metadata:{body:safeAuditPayload(req.body)}})});next()});
 app.use((req,res,next)=>{const started=process.hrtime.bigint();res.on('finish',()=>{const ms=Number(process.hrtime.bigint()-started)/1e6;recordApiPerf(ms,res.statusCode)});next()});
 app.use('/sales', express.static(path.join(__dirname,'public','sales'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
-app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');}}));
+// SuperAdmin UI is served explicitly first so API/server updates cannot silently coexist with a stale static index.
+app.get('/m200530366/',(req,res)=>{
+  res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+  res.setHeader('Pragma','no-cache');
+  res.setHeader('Expires','0');
+  res.setHeader('Surrogate-Control','no-store');
+  res.setHeader('X-SuperAdmin-UI-Version','14.9.24');
+  res.sendFile(path.join(__dirname,'public','m200530366','index.html'));
+});
+app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.24');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
-app.get('/m200530366',(req,res)=>res.redirect('/m200530366/'));
+app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.24'));
 
 // A physical PostgreSQL standby must never accept mutations. After promotion,
 // refreshHaRuntime automatically flips writeReady and normal traffic resumes.
@@ -2106,14 +2115,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.23',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.24',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.23',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.24',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.24'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
