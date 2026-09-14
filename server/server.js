@@ -2106,14 +2106,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.21',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.23',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.21',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.23',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
