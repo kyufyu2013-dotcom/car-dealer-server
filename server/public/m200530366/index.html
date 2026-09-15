@@ -38,6 +38,8 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
 .detail-item{background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:11px}.detail-item b{display:block;font-size:12px;color:#6b7280;margin-bottom:4px}
 .company-tree{display:grid;gap:14px}.branch-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.branch-chip{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border-radius:999px;background:#f3f4f6;border:1px solid #e5e7eb;font-size:12px}.branch-chip.head{background:#eff6ff;border-color:#bfdbfe;color:#1e40af}
 .notice{padding:11px 13px;border-radius:9px;background:#eff6ff;border:1px solid #bfdbfe;margin-bottom:14px;line-height:1.6}
+.nav-count{float:right;min-width:22px;height:22px;padding:2px 7px;border-radius:999px;background:#ef4444;color:#fff;font-size:12px;font-weight:700;text-align:center;line-height:18px}
+#renewalToastHost{position:fixed;top:18px;right:18px;z-index:120;display:grid;gap:10px;width:min(390px,calc(100vw - 36px));pointer-events:none}.renewal-toast{pointer-events:auto;background:#fff;border:1px solid #bfdbfe;border-left:5px solid #2563eb;border-radius:12px;padding:13px 14px;box-shadow:0 14px 45px #0003;animation:toastIn .18s ease-out}.renewal-toast .t-title{font-weight:800;margin-bottom:4px}.renewal-toast .t-msg{font-size:13px;line-height:1.55;color:#374151}.renewal-toast .t-actions{margin-top:9px;display:flex;gap:8px;justify-content:flex-end}@keyframes toastIn{from{transform:translateY(-8px);opacity:0}to{transform:translateY(0);opacity:1}}
 .thumb{width:110px;height:82px;object-fit:cover;border-radius:8px;border:1px solid #ddd;cursor:pointer;margin:4px}.node-live{box-shadow:0 0 0 2px #bbf7d0 inset}.node-loading{display:flex;align-items:center;gap:10px;padding:18px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;margin:14px 0}.spinner{width:18px;height:18px;border:3px solid #bfdbfe;border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:760px){.layout{display:block}.sidebar{width:100%}.nav{display:block}.content{padding:12px}.grid{grid-template-columns:1fr}}
 </style>
@@ -59,13 +61,13 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <aside class="sidebar">
       <div class="brand">🚘 Super Admin</div>
       <div class="subbrand">全車行資料中心</div>
-      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.24</div>
+      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.25</div>
       <div class="nav">
         <button id="navOverview" class="active" onclick="showPage('overview')">📊 平台總覽</button>
         <button id="navCompanies" onclick="showPage('companies')">🏢 公司／分店</button>
         <button id="navDatacenter" onclick="showPage('datacenter')">🛰️ 超級資料中心</button>
         <button id="navVehicles" onclick="showPage('vehicles')">🚗 全部車輛</button>
-        <button id="navSubscriptions" onclick="showPage('subscriptions')">💳 方案／訂閱管理</button>
+        <button id="navSubscriptions" onclick="showPage('subscriptions')">💳 方案／訂閱管理 <span id="renewalNavBadge" class="nav-count" style="display:none">0</span></button>
 
         <div class="nav-divider"></div>
         <div class="nav-group open" data-nav-group="system">
@@ -96,7 +98,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <main class="content">
       <div class="top">
         <div><h1 id="pageTitle">平台總覽</h1><div class="muted">最高權限：以「公司 → 總店 → 分店」管理所有據點、授權、車輛與人員資料</div></div>
-        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.24</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.25</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
       </div>
       <div id="main"></div>
     </main>
@@ -104,13 +106,15 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
 </div>
 
 <div id="modalBg" class="modal-bg"><div id="modal" class="modal"></div></div>
+<div id="renewalToastHost"></div>
 
 <script>
-const SUPERADMIN_UI_VERSION="14.9.24";
+const SUPERADMIN_UI_VERSION="14.9.25";
 const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
 const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
 const AUTO_REFRESH_MS=3000;
 let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,performanceData=null,resilienceData=null,resilienceSuiteData=null,subscriptionData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0,lastPerformanceAt=0,lastResilienceAt=0,lastSubscriptionsAt=0;
+let renewalRequestData={requests:[],counts:{pending:0,contacted:0,open:0},pagination:{}},renewalPollBusy=false,renewalBaselineReady=false,lastRenewalRequestId=Number(localStorage.getItem("superLastRenewalRequestId")||0);
 let subscriptionState={planPage:1,planSearch:"",planStatus:"",subscriptionPage:1,subscriptionSearch:"",subscriptionStatus:""};
 const nodeCompanyCache=new Map(),nodeVehicleCache=new Map(),liveDataCenterCache=new Map();
 let liveDcState={companyId:"",tab:"summary",search:"",page:1,pageSize:10,month:new Date().toISOString().slice(0,7),history:[]};
@@ -190,12 +194,13 @@ async function doLogin(){
     loginPass.value="";
     loginPage.style.display="none";app.style.display="block";
     await refreshCloud(false);
+    await refreshRenewalRequests(false);
     showPage("overview");
   }catch(e){alert(e.message)}finally{setLoginBusy(false)}
 }
 function setLoginBusy(v){const b=document.querySelector("#loginPage .btn");if(b){b.disabled=v;b.textContent=v?"連線登入中…":"登入超級管理後台"}}
 function logout(reason=""){
-  superToken="";cloudRows=[];localStorage.removeItem(SUPER_SESSION_KEY);
+  superToken="";cloudRows=[];renewalRequestData={requests:[],counts:{pending:0,contacted:0,open:0},pagination:{}};renewalBaselineReady=false;localStorage.removeItem(SUPER_SESSION_KEY);
   app.style.display="none";loginPage.style.display="flex";loginPass.value="";setCloudState("尚未連線","warn");
   if(reason)alert(reason);
 }
@@ -203,7 +208,7 @@ async function restoreSession(){
   const s=getSession();if(!s?.token)return false;
   superToken=s.token;currentPage=s.page||"overview";
   loginPage.style.display="none";app.style.display="block";
-  try{await refreshCloud(false);showPage(currentPage);return true}catch(e){logout();return false}
+  try{await refreshCloud(false);await refreshRenewalRequests(false);showPage(currentPage);return true}catch(e){logout();return false}
 }
 loginPass.addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 
@@ -211,6 +216,15 @@ function navGroupForPage(p){if(["health","updates","diagnostics"].includes(p))re
 function applyNavGroupState(){document.querySelectorAll(".nav-group").forEach(g=>{const key=g.dataset.navGroup;const saved=localStorage.getItem("superNavGroup_"+key);if(saved!==null)g.classList.toggle("open",saved==="1")})}
 function toggleNavGroup(key){const g=document.querySelector(`.nav-group[data-nav-group="${key}"]`);if(!g)return;g.classList.toggle("open");localStorage.setItem("superNavGroup_"+key,g.classList.contains("open")?"1":"0")}
 function ensureNavGroupForPage(p){const key=navGroupForPage(p);if(!key)return;const g=document.querySelector(`.nav-group[data-nav-group="${key}"]`);if(g&&!g.classList.contains("open")){g.classList.add("open");localStorage.setItem("superNavGroup_"+key,"1")}}
+
+function renewalRequestStatusLabel(st){return ({pending:"待處理",contacted:"已聯絡",closed:"已完成"})[st]||st||"-"}
+function renewalRequestStatusBadge(st){return `<span class="badge ${st==="pending"?"warn":st==="contacted"?"info":"ok"}">${esc(renewalRequestStatusLabel(st))}</span>`}
+function renewalRequestType(x){const note=String(x?.note||'');return note.includes('選擇方案')?'換方案':'續費'}
+function updateRenewalNavBadge(){const el=document.getElementById("renewalNavBadge"),n=Number(renewalRequestData?.counts?.pending||0);if(el){el.style.display=n>0?"inline-block":"none";el.textContent=String(n)}document.title=(n>0?`(${n}) `:"")+"庫車掌盤｜Super Admin 資料中心"}
+function showRenewalToast(title,message,autoClose=10000){const host=document.getElementById("renewalToastHost");if(!host)return;const el=document.createElement("div");el.className="renewal-toast";el.innerHTML=`<div class="t-title">${esc(title)}</div><div class="t-msg">${esc(message)}</div><div class="t-actions"><button class="btn2" onclick="this.closest('.renewal-toast').remove()">稍後</button><button class="btn" onclick="showPage('subscriptions');this.closest('.renewal-toast').remove()">查看申請</button></div>`;host.prepend(el);if(autoClose>0)setTimeout(()=>el.remove(),autoClose)}
+async function refreshRenewalRequests(notify=true){if(!superToken||renewalPollBusy)return;renewalPollBusy=true;try{const d=await api('/super/subscriptions/renewal-requests?page=1');renewalRequestData=d||{requests:[],counts:{pending:0,contacted:0,open:0},pagination:{}};updateRenewalNavBadge();const rows=Array.isArray(renewalRequestData.requests)?renewalRequestData.requests:[],maxId=rows.reduce((m,x)=>Math.max(m,Number(x.id||0)),0);if(!renewalBaselineReady){renewalBaselineReady=true;lastRenewalRequestId=Math.max(lastRenewalRequestId,maxId);localStorage.setItem('superLastRenewalRequestId',String(lastRenewalRequestId));if(Number(renewalRequestData?.counts?.pending||0)>0)showRenewalToast('📩 有待處理的方案申請',`目前有 ${renewalRequestData.counts.pending} 筆車行方案／續費申請等待處理。`,8000)}else if(notify){const fresh=rows.filter(x=>x.status==='pending'&&Number(x.id||0)>lastRenewalRequestId).sort((a,b)=>Number(a.id)-Number(b.id));for(const x of fresh){showRenewalToast(`📩 ${x.company_name||x.company_id}｜${renewalRequestType(x)}申請`,`申請方案：${x.plan_name||'-'}${x.note?`｜${x.note}`:''}`,12000)}if(fresh.length){lastRenewalRequestId=Math.max(lastRenewalRequestId,...fresh.map(x=>Number(x.id||0)));localStorage.setItem('superLastRenewalRequestId',String(lastRenewalRequestId))}}if(currentPage==='subscriptions'&&!userIsEditing()&&!modalIsOpen())renderSubscriptions()}catch(e){/* 通知輪詢失敗不影響其他功能 */}finally{renewalPollBusy=false}}
+async function updateRenewalRequest(id,action){const label={contact:'標記已聯絡',close:'完成處理',reopen:'重新開啟'}[action]||action;if(!confirm(`確定要「${label}」這筆申請？`))return;let note='';if(action==='close')note=prompt('完成備註（可留空）')||'';try{await api('/super/subscriptions/renewal-requests/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({action,note})});await refreshRenewalRequests(false)}catch(e){alert(e.message||'更新申請狀態失敗')}}
+function renewalRequestsPanel(){const rows=Array.isArray(renewalRequestData?.requests)?renewalRequestData.requests:[],counts=renewalRequestData?.counts||{},pending=Number(counts.pending||0),contacted=Number(counts.contacted||0);return `<div class="panel" style="border:1px solid ${pending?'#f59e0b':'#e5e7eb'}"><div class="panel-head"><div><h2 style="margin:0">📩 車行方案／續費申請 ${pending?`<span class="badge warn">${pending} 筆待處理</span>`:''}</h2><div class="muted">車行送出申請後會自動出現在這裡；左側選單與瀏覽器分頁也會顯示待處理數量。</div></div><button class="btn2" onclick="refreshRenewalRequests(false)">重新整理申請</button></div><div class="cards" style="margin-bottom:12px"><div class="card"><div class="muted">待處理</div><div class="num">${pending}</div></div><div class="card"><div class="muted">已聯絡</div><div class="num">${contacted}</div></div></div><div class="table-wrap"><table><thead><tr><th>狀態</th><th>車行</th><th>類型</th><th>申請方案</th><th>申請時間</th><th>申請人</th><th>備註</th><th>操作</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${renewalRequestStatusBadge(x.status)}</td><td><b>${esc(x.company_name||x.company_id)}</b><div class="muted"><code>${esc(x.company_id)}</code></div></td><td>${renewalRequestType(x)==='換方案'?'<span class="badge info">換方案</span>':'<span class="badge">續費</span>'}</td><td><b>${esc(x.plan_name||'-')}</b></td><td>${esc(fmtDateTime(x.requested_at))}</td><td>${esc(x.requested_by||'-')}</td><td style="white-space:normal;min-width:220px;max-width:360px">${esc(x.note||'-')}</td><td>${x.status==='pending'?`<button class="btn2" onclick="updateRenewalRequest('${x.id}','contact')">標記已聯絡</button> <button class="btn" onclick="updateRenewalRequest('${x.id}','close')">完成處理</button>`:x.status==='contacted'?`<button class="btn" onclick="updateRenewalRequest('${x.id}','close')">完成處理</button>`:`<button class="btn2" onclick="updateRenewalRequest('${x.id}','reopen')">重新開啟</button>`}</td></tr>`).join('')||'<tr><td colspan="8">目前沒有方案／續費申請</td></tr>'}</tbody></table></div></div>`}
 
 function showPage(p){
   if(p==="sales"||p==="users")p="overview";
@@ -449,9 +463,9 @@ async function refreshSubscriptions(manual=false){
 }
 function renderSubscriptions(){
   const d=subscriptionData;
-  if(!d){main.innerHTML='<div class="node-loading"><span class="spinner"></span><div><b>讀取中央方案資料中…</b><div class="muted">資料直接來自 Server PostgreSQL。</div></div></div>';return}
+  if(!d){main.innerHTML=renewalRequestsPanel()+'<div class="node-loading"><span class="spinner"></span><div><b>讀取中央方案資料中…</b><div class="muted">資料直接來自 Server PostgreSQL。</div></div></div>';return}
   const plans=Array.isArray(d.plans)?d.plans:[],subs=Array.isArray(d.subscriptions)?d.subscriptions:[],pp=d.planPagination||{},sp=d.subscriptionPagination||{};
-  main.innerHTML=`
+  main.innerHTML=`${renewalRequestsPanel()}
   <div class="cards">
     <div class="card"><div class="muted">方案數</div><div class="num">${Number(pp.total||plans.length)}</div></div>
     <div class="card"><div class="muted">正常訂閱</div><div class="num">${Number(d.activeSubscriptionCount||0)}</div></div>
@@ -722,6 +736,7 @@ modalBg.addEventListener("click",e=>{if(e.target===modalBg)closeModal()});docume
 (async function init(){
   const ok=await restoreSession();if(!ok){loginPage.style.display="flex";app.style.display="none"}
   setInterval(()=>{if(superToken)refreshCloud(false).catch(()=>{})},AUTO_REFRESH_MS);
+  setInterval(()=>{if(superToken)refreshRenewalRequests(true).catch(()=>{})},3000);
 })();
 </script>
 </body>
