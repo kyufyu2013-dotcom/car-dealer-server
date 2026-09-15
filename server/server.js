@@ -434,29 +434,16 @@ function salesSafeSnapshot(snapshot,user){
 }
 function cloudOperationalSnapshot(snapshot){
   const d=JSON.parse(JSON.stringify(snapshot||{}));
-  d.cars=(Array.isArray(d.cars)?d.cars:[]).map(c=>{
-    const x={...c};
-    x.inspectionPhotoCount=Array.isArray(c.inspectionCertPhotos)?c.inspectionCertPhotos.length:Number(c.inspectionPhotoCount||0);
-    x.intakePhotoCount=Array.isArray(c.intakePhotos)?c.intakePhotos.length:Number(c.intakePhotoCount||0);
-    // Phase 14D.3 hotfix: Central keeps a minimal financial summary for every vehicle
-    // so Super Admin can show purchase price / total cost even while the Dealer Node is offline.
-    // Detailed cost lines, source notes and photos remain Dealer Node local-only.
-    const sold=String(c.status||'')==='已售'||Number(c.sellPrice||0)>0;
-    x.purchasePrice=Math.max(0,Number(c.purchasePrice||0));
-    x.totalCost=Math.max(0,Number(c.totalCost??((Number(c.purchasePrice)||0)+(Array.isArray(c.costs)?c.costs.reduce((a,b)=>a+Number(b.amount||0),0):0))));
-    for(const k of ['costs','source','sourceNote','salesNote','inspectionCertPhotos','intakePhotos']) delete x[k];
-    if(!sold){for(const k of ['companyProfit','saleTransferFee','saleFuelFee','saleLicenseTax','saleOtherFee','saleOtherFeeName','saleExtraCost']) delete x[k];}
-    else{
-      x.companyProfit=Number(c.companyProfit||0);
-      x.saleExtraCost=Math.max(0,Number(c.saleExtraCost||0));
-    }
-    return x;
-  });
-  // Detailed operation/salary history is authoritative on the Dealer Node.
-  delete d.operationLogs;
-  delete d.salaryHistory;
+  // Central keeps only the minimum cross-branch coordination shadow.
+  // Detailed costs, HR/payroll, service/parts, notes and photo bytes remain on dealership nodes.
+  d.settings={companyName:d.settings?.companyName||'',defaultBranchId:d.settings?.defaultBranchId||''};
+  d.users=(Array.isArray(d.users)?d.users:[]).map(u=>({id:u.id,username:u.username||'',name:u.name||'',role:u.role||'staff',branchId:u.branchId||'',enabled:u.enabled!==false,loginEnabled:u.loginEnabled!==false,permissions:u.permissions||{},commissionRate:Number(u.commissionRate||0)}));
+  d.cars=(Array.isArray(d.cars)?d.cars:[]).map(c=>({id:c.id,branchId:c.branchId||'',plate:c.plate||'',model:c.model||'',year:c.year||'',mileage:Number(c.mileage||0),inDate:c.inDate||'',floorPrice:Number(c.floorPrice||0),status:c.status||'在庫',sellPrice:Number(c.sellPrice||0),saleDate:c.saleDate||'',salesId:c.salesId||'',salesName:c.salesName||'',commissionMode:c.commissionMode==='fixed'?'fixed':'percentage',fixedCommissionAmount:Math.max(0,Number(c.fixedCommissionAmount||0)),inspectionPhotoCount:Number(c.inspectionPhotoCount||0),intakePhotoCount:Number(c.intakePhotoCount||0)}));
+  d.saleRequests=Array.isArray(d.saleRequests)?d.saleRequests:[];
+  for(const k of ['operationLogs','salaryHistory','payrollLocal','operatingCostLocal','serviceVehicles','serviceOrders','partsCatalog','partsInventory','partsPurchases','partsMovements'])delete d[k];
   return d;
 }
+
 function branchManagerSafeSnapshot(snapshot,user){
   const d=JSON.parse(JSON.stringify(snapshot&&typeof snapshot==='object'?snapshot:{}));
   const branchId=String(user?.branch_id||'');
@@ -1939,7 +1926,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.28',apiVersion:'6.9.28',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.29',apiVersion:'6.9.29',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -2057,7 +2044,7 @@ async function phase12Summary(options={}){
     pool.query(`SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,COUNT(*) FILTER (WHERE status IN ('grace_period','past_due','suspended'))::int AS attention FROM dealer_subscriptions`)
   ]);
   return {
-    serverVersion:'14.9.28',apiVersion:'6.9.28',
+    serverVersion:'14.9.29',apiVersion:'6.9.29',
     plans:plans.rows,planOptions:planOptions.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,
     planPagination:{page:planSafePage,pageSize,total:planTotal,totalPages:planTotalPages,search:planSearch,status:planStatus},
     subscriptionPagination:{page:subSafePage,pageSize,total:subTotal,totalPages:subTotalPages,search:subscriptionSearch,status:subscriptionStatus},
@@ -2087,12 +2074,12 @@ app.get('/m200530366/',(req,res)=>{
   res.setHeader('Pragma','no-cache');
   res.setHeader('Expires','0');
   res.setHeader('Surrogate-Control','no-store');
-  res.setHeader('X-SuperAdmin-UI-Version','14.9.28');
+  res.setHeader('X-SuperAdmin-UI-Version','14.9.29');
   res.sendFile(path.join(__dirname,'public','m200530366','index.html'));
 });
-app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.28');}}));
+app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.29');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
-app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.28'));
+app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.29'));
 
 // A physical PostgreSQL standby must never accept mutations. After promotion,
 // refreshHaRuntime automatically flips writeReady and normal traffic resumes.
@@ -2115,14 +2102,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.28',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.29',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.28',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.28'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.29',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.29'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3517,7 +3504,7 @@ app.get('/api/super/nodes',superAuth,async(req,res,next)=>{
 
 // Phase 2: Super Admin requests data from a live Dealer Node only when it is viewed.
 // The desktop polls for commands over its authenticated outbound connection; no inbound port is exposed.
-const NODE_RESOURCES=new Set(['companyData','fullCompanyData','vehicleDetail','salesInventory','backupStatus','createBackup','branchDashboardSummary']);
+const NODE_RESOURCES=new Set(['companyData','fullCompanyData','companySyncManifest','vehicleDetail','salesInventory','backupStatus','createBackup','branchDashboardSummary']);
 
 // Vehicle photo peer sync (Phase 16A): Central is signaling/index coordinator only.
 // Photo bytes are NEVER accepted by these endpoints; WebRTC DataChannel carries bytes directly node-to-node.
@@ -3539,8 +3526,7 @@ app.get('/api/photo-sync/plan',auth,requireActiveCompany,async(req,res,next)=>{t
   if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
   const node=await photoSyncNodeForAuth(req,req.query.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});
   const branchCount=Number((await pool.query('SELECT COUNT(*)::int n FROM branches WHERE company_id=$1 AND enabled=TRUE',[req.auth.companyId])).rows[0]?.n||0);
-  const snap=(await pool.query('SELECT json FROM snapshots WHERE company_id=$1',[req.auth.companyId])).rows[0]?.json||{};
-  const activeCarIds=(Array.isArray(snap.cars)?snap.cars:[]).filter(c=>String(c?.status||'')==='在庫').map(c=>String(c.id||'')).filter(Boolean);
+  const activeCarIds=(await pool.query('SELECT DISTINCT car_id FROM vehicle_photo_index WHERE company_id=$1 ORDER BY car_id',[req.auth.companyId])).rows.map(x=>String(x.car_id||'')).filter(Boolean);
   const branchNodes=(await pool.query('SELECT node_id,branch_id,device_name,last_seen_at,capabilities FROM dealer_branch_nodes WHERE company_id=$1',[req.auth.companyId])).rows;const companyNode=(await pool.query('SELECT node_id,device_name,last_seen_at,capabilities FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];const peerMap=new Map();for(const x of [...branchNodes,...(companyNode?[{...companyNode,branch_id:String(companyNode.capabilities?.branchId||'')}]:[])]){if(String(x.node_id)===String(node.node_id)||!nodeOnline(x))continue;peerMap.set(String(x.node_id),{nodeId:x.node_id,branchId:x.branch_id||'',deviceName:x.device_name||'',lastSeenAt:x.last_seen_at})}const peers=[...peerMap.values()];
   const photoIndex=(await pool.query('SELECT car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at FROM vehicle_photo_index WHERE company_id=$1 AND car_id = ANY($2::text[]) ORDER BY car_id,kind,photo_id',[req.auth.companyId,activeCarIds.length?activeCarIds:['__none__']])).rows.map(x=>({carId:x.car_id,kind:x.kind,photoId:x.photo_id,sha256:x.sha256,ext:x.ext,bytes:Number(x.bytes||0),ownerBranchId:x.owner_branch_id,updatedAt:x.updated_at}));
   res.json({ok:true,enabled:branchCount>1,branchCount,activeCarIds,photoIndex,peers,iceServers:PHOTO_SYNC_ICE_SERVERS,policy:'active-vehicles-only',transport:'webrtc-p2p',centralStoresPhotoBytes:false});
@@ -3887,6 +3873,51 @@ app.post('/api/company/live-dashboard',auth,requireActiveCompany,async(req,res,n
   }catch(e){next(e)}
 });
 
+
+async function requestDealerNodeResource(companyId,node,resource,payload={},waitMs=8000){
+  await cleanupNodeRequests();
+  if(!node||!nodeOnline(node))return {status:'offline',nodeId:node?.node_id||'',branchId:node?.branch_id||'',lastSeenAt:node?.last_seen_at||null};
+  if(!NODE_RESOURCES.has(resource))return {status:'error',nodeId:node.node_id,branchId:node.branch_id||'',error:'不支援的節點同步資源'};
+  const id=`csync_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`,requestedAt=now(),expiresAt=new Date(Date.now()+waitMs+3000).toISOString();
+  await pool.query(`INSERT INTO dealer_node_requests(id,company_id,node_id,resource,payload,status,requested_at,expires_at) VALUES($1,$2,$3,$4,$5::jsonb,'queued',$6,$7)`,[id,companyId,node.node_id,resource,JSON.stringify(payload||{}),requestedAt,expiresAt]);
+  const deadline=Date.now()+waitMs;let row=null;
+  while(Date.now()<deadline){row=(await pool.query('SELECT status,result_json,error_text FROM dealer_node_requests WHERE id=$1 AND company_id=$2',[id,companyId])).rows[0];if(row&&['completed','failed','expired'].includes(row.status))break;await new Promise(r=>setTimeout(r,220))}
+  if(!row||!['completed','failed','expired'].includes(row.status)){await pool.query("UPDATE dealer_node_requests SET status='expired',error_text='Node sync timeout' WHERE id=$1 AND status IN ('queued','claimed')",[id]);row={status:'expired',error_text:'公司主機回應逾時'}}
+  const out=row.status==='completed'?{status:'online',nodeId:node.node_id,branchId:node.branch_id||'',lastSeenAt:node.last_seen_at,result:row.result_json}:{status:row.status==='failed'?'error':'timeout',nodeId:node.node_id,branchId:node.branch_id||'',lastSeenAt:node.last_seen_at,error:row.error_text||'節點同步失敗'};
+  await pool.query('DELETE FROM dealer_node_requests WHERE id=$1',[id]).catch(()=>{});
+  return out;
+}
+
+// Company-internal node synchronization coordinator.
+// Central only routes a short-lived request/result; it does not retain the returned operational dataset.
+app.post('/api/company/node-sync',auth,requireActiveCompany,async(req,res,next)=>{
+  try{
+    if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'只有公司管理員或分店主管可以使用公司節點同步'});
+    const mode=String(req.body?.mode||''),resource=String(req.body?.resource||'companySyncManifest'),requesterNodeId=String(req.body?.requesterNodeId||'');
+    if(!['companySyncManifest','fullCompanyData'].includes(resource))return res.status(400).json({error:'節點同步資源不正確'});
+    if(req.auth.role==='branchManager'){
+      if(mode!=='owner')return res.status(403).json({error:'分店主管只能向公司老闆主機補資料'});
+      const node=(await pool.query('SELECT *, COALESCE(capabilities->>\'branchId\',\'\') AS branch_id FROM dealer_nodes WHERE company_id=$1',[req.auth.companyId])).rows[0];
+      if(!node||String(node.node_id||'')===requesterNodeId)return res.json({ok:true,status:'offline',reason:'owner_node_unavailable'});
+      const out=await requestDealerNodeResource(req.auth.companyId,node,resource,{syncRequesterNodeId:requesterNodeId,syncRole:'branchManager'});
+      return res.json({ok:true,...out});
+    }
+    if(mode==='branch'){
+      const branchId=String(req.body?.branchId||'');if(!branchId)return res.status(400).json({error:'缺少分店識別'});
+      const node=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND branch_id=$2',[req.auth.companyId,branchId])).rows[0];
+      if(!node||String(node.node_id||'')===requesterNodeId)return res.json({ok:true,status:'offline',branchId,reason:'branch_node_unavailable'});
+      const out=await requestDealerNodeResource(req.auth.companyId,node,resource,{syncRequesterNodeId:requesterNodeId,syncRole:'admin',branchId});
+      return res.json({ok:true,...out});
+    }
+    if(mode==='branches'){
+      const rows=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 ORDER BY branch_id',[req.auth.companyId])).rows.filter(x=>String(x.node_id||'')!==requesterNodeId);
+      const branches=[];for(const node of rows){branches.push(await requestDealerNodeResource(req.auth.companyId,node,resource,{syncRequesterNodeId:requesterNodeId,syncRole:'admin',branchId:node.branch_id},resource==='companySyncManifest'?3500:8000))}
+      return res.json({ok:true,branches});
+    }
+    return res.status(400).json({error:'公司節點同步模式不正確'});
+  }catch(e){next(e)}
+});
+
 app.get('/api/node/commands',auth,requireActiveCompany,async(req,res,next)=>{
   const client=await pool.connect();
   try{
@@ -4002,7 +4033,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.28',apiVersion:'6.9.28',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.29',apiVersion:'6.9.29',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -4555,7 +4586,7 @@ app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.28',apiVersion:'6.9.28',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.29',apiVersion:'6.9.29',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.9.10',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
