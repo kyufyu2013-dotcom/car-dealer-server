@@ -61,7 +61,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <aside class="sidebar">
       <div class="brand">🚘 Super Admin</div>
       <div class="subbrand">全車行資料中心</div>
-      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.39</div>
+      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.40</div>
       <div class="nav">
         <button id="navOverview" class="active" onclick="showPage('overview')">📊 平台總覽</button>
         <button id="navCompanies" onclick="showPage('companies')">🏢 公司／分店</button>
@@ -98,7 +98,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <main class="content">
       <div class="top">
         <div><h1 id="pageTitle">平台總覽</h1><div class="muted">最高權限：以「公司 → 總店 → 分店」管理所有據點、授權、車輛與人員資料</div></div>
-        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.39</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.40</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
       </div>
       <div id="main"></div>
     </main>
@@ -113,7 +113,7 @@ const SUPERADMIN_UI_VERSION="14.9.26";
 const API_BASE=(localStorage.getItem("carShopApiBase")||"/api").replace(/\/$/,"");
 const SUPER_SESSION_KEY="carDealerSuperCloudSession_v1";
 const AUTO_REFRESH_MS=3000;
-let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,performanceData=null,resilienceData=null,resilienceSuiteData=null,subscriptionData=null,refreshing=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0,lastPerformanceAt=0,lastResilienceAt=0,lastSubscriptionsAt=0;
+let superToken="",currentPage="overview",cloudRows=[],healthRows=[],diagnosticRows=[],globalSchema=null,updatePolicy=null,updateEventRows=[],backupData=null,haData=null,loadTestData=null,performanceData=null,resilienceData=null,resilienceSuiteData=null,subscriptionData=null,refreshing=false,vehicleReconcileDone=false,lastCloudAt=0,lastDiagnosticsAt=0,lastBackupsAt=0,lastHaAt=0,lastLoadTestAt=0,lastPerformanceAt=0,lastResilienceAt=0,lastSubscriptionsAt=0;
 let renewalRequestData={requests:[],counts:{pending:0,contacted:0,open:0},pagination:{}},renewalRequestPage=1,renewalPollBusy=false,renewalBaselineReady=false,lastRenewalRequestId=Number(localStorage.getItem("superLastRenewalRequestId")||0);
 let subscriptionState={planPage:1,planSearch:"",planStatus:"",subscriptionPage:1,subscriptionSearch:"",subscriptionStatus:""};
 const nodeCompanyCache=new Map(),nodeVehicleCache=new Map(),liveDataCenterCache=new Map();
@@ -280,6 +280,9 @@ async function refreshCloud(manual=false){
   if(!superToken||refreshing)return;
   refreshing=true;
   try{
+    if(manual||!vehicleReconcileDone){
+      try{setCloudState("車輛即時對帳中…","warn");await api("/super/vehicles/reconcile",{method:"POST",body:"{}"});vehicleReconcileDone=true}catch(e){if(manual)console.warn("車輛即時對帳略過",e)}
+    }
     const [r,h,u,ue]=await Promise.all([api("/super/data"),api("/super/health"),api("/super/update-policy"),api("/super/update-events?limit=300")]);cloudRows=Array.isArray(r.companies)?r.companies:[];healthRows=Array.isArray(h.health)?h.health:[];globalSchema=h.schema||null;updatePolicy=u.policy||h.updatePolicy||null;updateEventRows=Array.isArray(ue.events)?ue.events:[];lastCloudAt=Date.now();setCloudState("雲端已同步","ok");saveSession();
     if(currentPage==="diagnostics"){try{const dg=await api('/super/diagnostics?limit=300');diagnosticRows=Array.isArray(dg.events)?dg.events:[];lastDiagnosticsAt=Date.now()}catch{}}
     // Data can keep refreshing in the background, but never redraw while the user is dragging/scrolling.
