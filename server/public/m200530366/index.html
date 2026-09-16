@@ -61,7 +61,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <aside class="sidebar">
       <div class="brand">🚘 Super Admin</div>
       <div class="subbrand">全車行資料中心</div>
-      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.36</div>
+      <div style="margin:8px 0 12px;font-size:12px;color:#93c5fd">SuperAdmin UI v14.9.39</div>
       <div class="nav">
         <button id="navOverview" class="active" onclick="showPage('overview')">📊 平台總覽</button>
         <button id="navCompanies" onclick="showPage('companies')">🏢 公司／分店</button>
@@ -98,7 +98,7 @@ th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:n
     <main class="content">
       <div class="top">
         <div><h1 id="pageTitle">平台總覽</h1><div class="muted">最高權限：以「公司 → 總店 → 分店」管理所有據點、授權、車輛與人員資料</div></div>
-        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.36</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="badge info">UI v14.9.39</span><span id="cloudState" class="badge warn">尚未連線</span><button class="btn2" onclick="refreshCloud(true)">立即同步</button><button class="btn2" onclick="logout()">登出</button></div>
       </div>
       <div id="main"></div>
     </main>
@@ -146,7 +146,8 @@ function companyDataRow(id){return cloudRows.find(x=>x.company?.id===id)||null}
 function companyBranches(x){return Array.isArray(x?.branches)?x.branches:[]}
 function companyHeadOffice(x){const bs=companyBranches(x);return bs.find(b=>b.isHeadOffice)||bs[0]||null}
 function companyBranchName(x,id){const bs=companyBranches(x),fallback=companyHeadOffice(x);return bs.find(b=>String(b.id)===String(id))?.name||fallback?.name||"總店"}
-function allCars(){const arr=[];for(const x of cloudRows){const cars=Array.isArray(x.snapshot?.cars)?x.snapshot.cars:[];for(const car of cars)arr.push({...car,_companyId:x.company.id,_companyName:x.company.name,_branchName:companyBranchName(x,car.branchId)})}return arr}
+function visibleCarsForRow(x){const s=x?.snapshot||{},cars=Array.isArray(s.cars)?s.cars:[],tombs=Array.isArray(s.vehicleTombstones)?s.vehicleTombstones:[],tb=new Map(tombs.map(t=>[String(t.id||''),Date.parse(t.deletedAt||'')||0]));return cars.filter(c=>{const dt=tb.get(String(c.id||''));return !dt||(Date.parse(c.updatedAt||c.updated_at||'')||0)>dt})}
+function allCars(){const arr=[];for(const x of cloudRows){for(const car of visibleCarsForRow(x))arr.push({...car,_companyId:x.company.id,_companyName:x.company.name,_branchName:companyBranchName(x,car.branchId)})}return arr}
 function allUsers(){const arr=[];for(const x of cloudRows){const users=Array.isArray(x.users)&&x.users.length?x.users:(Array.isArray(x.snapshot?.users)?x.snapshot.users:[]);for(const u of users)arr.push({...u,_companyId:x.company.id,_companyName:x.company.name,_branchName:companyBranchName(x,u.branchId)})}return arr}
 function soldCars(){return allCars().filter(c=>c.status==="已售"||Number(c.sellPrice)>0)}
 const listUi={
@@ -532,7 +533,7 @@ function renderOverview(){
   const lastUpdate=[...cloudRows].map(x=>x.node?.last_seen_at||x.snapshot?.updatedAt||x.snapshot?.updated_at||'').filter(Boolean).sort().pop()||'';
   main.innerHTML=`<div class="cards"><div class="card"><div class="muted">公司數量</div><div class="num">${cloudRows.length}</div></div><div class="card"><div class="muted">啟用據點</div><div class="num">${activeBranches.length}</div></div><div class="card"><div class="muted">全台庫存車輛數</div><div class="num">${stock.length} 台</div><div class="muted" style="margin-top:6px">在線更新；離線保留最後同步摘要</div></div><div class="card"><div class="muted">在線 Dealer Node</div><div class="num">${online.length} / ${cloudRows.length}</div></div></div>
   <div class="notice">平台總覽只呈現 SaaS 規模與營運狀態，不再把所有車行的成本、利潤加總。單一車行的財務與營運數字請至「超級資料中心」按月份查看。${lastUpdate?`　最後平台資料更新：${fmtDateTime(lastUpdate)}`:''}</div>
-  <div class="panel"><div class="panel-head"><div><h2 style="margin:0">🏢 公司概況</h2><div class="muted">快速查看公司、據點、Node 與庫存規模</div></div><button class="btn" onclick="openCompany()">＋新增公司</button></div><div class="table-wrap"><table><thead><tr><th>公司</th><th>公司代碼</th><th>總店</th><th>據點</th><th>主帳號</th><th>授權</th><th>Dealer Node</th><th>健康度</th><th>庫存</th><th>已售</th><th>操作</th></tr></thead><tbody>${cloudRows.map(x=>{const c=x.company,d=x.snapshot||{},cc=Array.isArray(d.cars)?d.cars:[],st=cc.filter(v=>v.status!=="已售"),so=cc.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),head=companyHeadOffice(x),branches=companyBranches(x);return `<tr><td><b>${esc(c.name)}</b>${c.trial?` <span class="badge info">試用</span>`:""}</td><td><code>${esc(c.id)}</code></td><td>${head?`🏢 ${esc(head.name)}`:"-"}</td><td><b>${branches.filter(b=>b.enabled!==false).length}</b> / ${branches.length}</td><td>${esc(c.mainUsername||((x.users||[]).find(u=>u.role==="admin")?.username)||"-")}</td><td><span class="badge ${badgeFor(c.status)}">${esc(c.status)}</span></td><td>${nodeStatusHtml(x)}</td><td>${healthBadge(healthFor(c.id))}</td><td>${st.length}</td><td>${so.length}</td><td><button class="btn" onclick="showPage('datacenter');setTimeout(()=>openLiveDataCenter('${esc(c.id)}'),0)">資料中心</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權</button></td></tr>`}).join("")||`<tr><td colspan="11">目前 PostgreSQL 尚無公司</td></tr>`}</tbody></table></div></div>`;
+  <div class="panel"><div class="panel-head"><div><h2 style="margin:0">🏢 公司概況</h2><div class="muted">快速查看公司、據點、Node 與庫存規模</div></div><button class="btn" onclick="openCompany()">＋新增公司</button></div><div class="table-wrap"><table><thead><tr><th>公司</th><th>公司代碼</th><th>總店</th><th>據點</th><th>主帳號</th><th>授權</th><th>Dealer Node</th><th>健康度</th><th>庫存</th><th>已售</th><th>操作</th></tr></thead><tbody>${cloudRows.map(x=>{const c=x.company,d=x.snapshot||{},cc=visibleCarsForRow(x),st=cc.filter(v=>v.status!=="已售"),so=cc.filter(v=>v.status==="已售"||Number(v.sellPrice)>0),head=companyHeadOffice(x),branches=companyBranches(x);return `<tr><td><b>${esc(c.name)}</b>${c.trial?` <span class="badge info">試用</span>`:""}</td><td><code>${esc(c.id)}</code></td><td>${head?`🏢 ${esc(head.name)}`:"-"}</td><td><b>${branches.filter(b=>b.enabled!==false).length}</b> / ${branches.length}</td><td>${esc(c.mainUsername||((x.users||[]).find(u=>u.role==="admin")?.username)||"-")}</td><td><span class="badge ${badgeFor(c.status)}">${esc(c.status)}</span></td><td>${nodeStatusHtml(x)}</td><td>${healthBadge(healthFor(c.id))}</td><td>${st.length}</td><td>${so.length}</td><td><button class="btn" onclick="showPage('datacenter');setTimeout(()=>openLiveDataCenter('${esc(c.id)}'),0)">資料中心</button> <button class="btn2" onclick="openCompany('${esc(c.id)}')">授權</button></td></tr>`}).join("")||`<tr><td colspan="11">目前 PostgreSQL 尚無公司</td></tr>`}</tbody></table></div></div>`;
 }
 function renderCompanies(){
   const allBranches=cloudRows.flatMap(x=>companyBranches(x)),activeBranches=allBranches.filter(b=>b.enabled!==false),heads=allBranches.filter(b=>b.isHeadOffice);
