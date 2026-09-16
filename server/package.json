@@ -1,6 +1,6 @@
 {
   "name": "car-dealer-central-server",
-  "version": "6.9.32",
+  "version": "6.9.33",
   "private": true,
   "type": "module",
   "scripts": {
