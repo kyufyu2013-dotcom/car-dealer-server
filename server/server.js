@@ -1926,7 +1926,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.31',apiVersion:'6.9.31',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.32',apiVersion:'6.9.32',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -2044,7 +2044,7 @@ async function phase12Summary(options={}){
     pool.query(`SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,COUNT(*) FILTER (WHERE status IN ('grace_period','past_due','suspended'))::int AS attention FROM dealer_subscriptions`)
   ]);
   return {
-    serverVersion:'14.9.31',apiVersion:'6.9.31',
+    serverVersion:'14.9.32',apiVersion:'6.9.32',
     plans:plans.rows,planOptions:planOptions.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,
     planPagination:{page:planSafePage,pageSize,total:planTotal,totalPages:planTotalPages,search:planSearch,status:planStatus},
     subscriptionPagination:{page:subSafePage,pageSize,total:subTotal,totalPages:subTotalPages,search:subscriptionSearch,status:subscriptionStatus},
@@ -2074,12 +2074,12 @@ app.get('/m200530366/',(req,res)=>{
   res.setHeader('Pragma','no-cache');
   res.setHeader('Expires','0');
   res.setHeader('Surrogate-Control','no-store');
-  res.setHeader('X-SuperAdmin-UI-Version','14.9.31');
+  res.setHeader('X-SuperAdmin-UI-Version','14.9.32');
   res.sendFile(path.join(__dirname,'public','m200530366','index.html'));
 });
-app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.31');}}));
+app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.32');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
-app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.31'));
+app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.32'));
 
 // A physical PostgreSQL standby must never accept mutations. After promotion,
 // refreshHaRuntime automatically flips writeReady and normal traffic resumes.
@@ -2102,14 +2102,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.31',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.32',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.31',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.31'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.32',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.32'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -3509,10 +3509,15 @@ const NODE_RESOURCES=new Set(['companyData','fullCompanyData','companySyncManife
 // Vehicle photo peer sync (Phase 16A): Central is signaling/index coordinator only.
 // Photo bytes are NEVER accepted by these endpoints; WebRTC DataChannel carries bytes directly node-to-node.
 const photoPeerSignals=new Map(),photoSalesClients=new Map();
+// P2P remains the primary path. If WebRTC cannot establish (NAT / firewall),
+// these RAM-only relay queues provide a short-lived HTTPS fallback. Photo bytes
+// are never written to PostgreSQL, disk, backup files, or the company snapshot.
+const photoRelayRequests=new Map(),photoRelayPayloads=new Map();
+const PHOTO_RELAY_TTL_MS=120*1000,PHOTO_RELAY_MAX_DATA_URL=8*1024*1024;
 const PHOTO_SIGNAL_TTL_MS=90*1000;
 let PHOTO_SYNC_ICE_SERVERS=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
 try{if(process.env.PHOTO_SYNC_ICE_SERVERS_JSON){const x=JSON.parse(process.env.PHOTO_SYNC_ICE_SERVERS_JSON);if(Array.isArray(x)&&x.length)PHOTO_SYNC_ICE_SERVERS=x}}catch(e){console.warn('PHOTO_SYNC_ICE_SERVERS_JSON 格式錯誤，使用預設 STUN')}
-function cleanPhotoSignals(){const cutoff=Date.now()-PHOTO_SIGNAL_TTL_MS;for(const [k,a] of photoPeerSignals){const next=(a||[]).filter(x=>Number(x.createdMs||0)>=cutoff);if(next.length)photoPeerSignals.set(k,next);else photoPeerSignals.delete(k)}for(const [k,v] of photoSalesClients){if(Number(v.expiresMs||0)<Date.now())photoSalesClients.delete(k)}}
+function cleanPhotoSignals(){const cutoff=Date.now()-PHOTO_SIGNAL_TTL_MS;for(const [k,a] of photoPeerSignals){const next=(a||[]).filter(x=>Number(x.createdMs||0)>=cutoff);if(next.length)photoPeerSignals.set(k,next);else photoPeerSignals.delete(k)}for(const [k,v] of photoSalesClients){if(Number(v.expiresMs||0)<Date.now())photoSalesClients.delete(k)}const relayCutoff=Date.now()-PHOTO_RELAY_TTL_MS;for(const [k,a] of photoRelayRequests){const next=(a||[]).filter(x=>Number(x.createdMs||0)>=relayCutoff);if(next.length)photoRelayRequests.set(k,next);else photoRelayRequests.delete(k)}for(const [k,a] of photoRelayPayloads){const next=(a||[]).filter(x=>Number(x.createdMs||0)>=relayCutoff);if(next.length)photoRelayPayloads.set(k,next);else photoRelayPayloads.delete(k)}}
 async function photoSyncFindNode(companyId,nodeId){const id=String(nodeId||'').trim();if(!id)return null;let n=(await pool.query('SELECT * FROM dealer_branch_nodes WHERE company_id=$1 AND node_id=$2',[companyId,id])).rows[0];if(n)return n;const c=(await pool.query('SELECT * FROM dealer_nodes WHERE company_id=$1 AND node_id=$2',[companyId,id])).rows[0];if(!c)return null;return {...c,branch_id:String(c.capabilities?.branchId||'')};}
 async function photoSyncNodeForAuth(req,nodeId){
   const n=await photoSyncFindNode(req.auth.companyId,nodeId);if(!n)return null;
@@ -3539,10 +3544,35 @@ app.post('/api/photo-sync/manifest',auth,requireActiveCompany,async(req,res,next
   await pool.query('DELETE FROM vehicle_photo_presence WHERE company_id=$1 AND node_id=$2',[req.auth.companyId,node.node_id]);
   for(const e of entries){const carId=String(e?.carId||''),kind=String(e?.kind||'');const photoId=String(e?.photoId||''),sha=String(e?.sha256||'');if(!active.has(carId)||!['intake','inspection'].includes(kind)||!photoId||!sha)continue;await pool.query(`INSERT INTO vehicle_photo_presence(company_id,car_id,kind,photo_id,node_id,branch_id,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(company_id,car_id,kind,photo_id,node_id) DO UPDATE SET branch_id=EXCLUDED.branch_id,last_seen_at=EXCLUDED.last_seen_at`,[req.auth.companyId,carId,kind,photoId,node.node_id,node.branch_id,nowTs]);}
   const ownedCars=cars.filter(c=>String(c?.status||'')==='在庫'&&String(c.branchId||'')===String(node.branch_id||''));
-  for(const car of ownedCars){const carId=String(car.id||'');if(!carId)continue;const list=entries.filter(e=>String(e?.carId||'')===carId&&e?.current===true);const expected=Math.max(0,Number(car.intakePhotoCount||0))+Math.max(0,Number(car.inspectionPhotoCount||0));if(list.length!==expected)continue;await pool.query('DELETE FROM vehicle_photo_index WHERE company_id=$1 AND car_id=$2',[req.auth.companyId,carId]);for(const e of list){const kind=String(e.kind||''),photoId=String(e.photoId||''),sha=String(e.sha256||'');if(!['intake','inspection'].includes(kind)||!photoId||!sha)continue;await pool.query(`INSERT INTO vehicle_photo_index(company_id,car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,car_id,kind,photo_id) DO UPDATE SET sha256=EXCLUDED.sha256,ext=EXCLUDED.ext,bytes=EXCLUDED.bytes,owner_branch_id=EXCLUDED.owner_branch_id,updated_at=EXCLUDED.updated_at`,[req.auth.companyId,carId,kind,photoId,sha,String(e.ext||'jpg'),Math.max(0,Number(e.bytes||0)),node.branch_id,nowTs]);}}
+  // The owning Dealer Node is authoritative for the current photo manifest.
+  // Do not wait for central snapshot photo counts to catch up; that race caused
+  // newly edited photos to be invisible to other nodes even though the car data had synced.
+  for(const car of ownedCars){const carId=String(car.id||'');if(!carId)continue;const list=entries.filter(e=>String(e?.carId||'')===carId&&e?.current===true);await pool.query('DELETE FROM vehicle_photo_index WHERE company_id=$1 AND car_id=$2',[req.auth.companyId,carId]);for(const e of list){const kind=String(e.kind||''),photoId=String(e.photoId||''),sha=String(e.sha256||'');if(!['intake','inspection'].includes(kind)||!photoId||!sha)continue;await pool.query(`INSERT INTO vehicle_photo_index(company_id,car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,car_id,kind,photo_id) DO UPDATE SET sha256=EXCLUDED.sha256,ext=EXCLUDED.ext,bytes=EXCLUDED.bytes,owner_branch_id=EXCLUDED.owner_branch_id,updated_at=EXCLUDED.updated_at`,[req.auth.companyId,carId,kind,photoId,sha,String(e.ext||'jpg'),Math.max(0,Number(e.bytes||0)),node.branch_id,nowTs]);}}
   const activeIds=[...active.keys()];await pool.query('DELETE FROM vehicle_photo_index WHERE company_id=$1 AND NOT (car_id = ANY($2::text[]))',[req.auth.companyId,activeIds.length?activeIds:['__none__']]);await pool.query('DELETE FROM vehicle_photo_presence WHERE company_id=$1 AND NOT (car_id = ANY($2::text[]))',[req.auth.companyId,activeIds.length?activeIds:['__none__']]);
   const photoIndex=(await pool.query('SELECT car_id,kind,photo_id,sha256,ext,bytes,owner_branch_id,updated_at FROM vehicle_photo_index WHERE company_id=$1 AND car_id = ANY($2::text[]) ORDER BY car_id,kind,photo_id',[req.auth.companyId,activeIds.length?activeIds:['__none__']])).rows.map(x=>({carId:x.car_id,kind:x.kind,photoId:x.photo_id,sha256:x.sha256,ext:x.ext,bytes:Number(x.bytes||0),ownerBranchId:x.owner_branch_id,updatedAt:x.updated_at}));res.json({ok:true,photoIndex,activeCarIds:activeIds});
 }catch(e){next(e)}});
+// RAM-only photo relay fallback. This is used only when direct WebRTC does not deliver.
+app.post('/api/photo-sync/relay/request',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
+  cleanPhotoSignals();const b=req.body||{},requester=await photoSyncNodeForAuth(req,b.nodeId);if(!requester)return res.status(403).json({error:'照片同步主機識別失敗'});
+  const items=Array.isArray(b.items)?b.items.slice(0,40):[];let queued=0;
+  for(const x of items){const carId=String(x?.carId||''),kind=String(x?.kind||''),photoId=String(x?.photoId||''),sha256=String(x?.sha256||'');if(!carId||!['intake','inspection'].includes(kind)||!photoId||!sha256)continue;
+    const {rows}=await pool.query(`SELECT p.node_id,p.branch_id FROM vehicle_photo_presence p LEFT JOIN dealer_branch_nodes n ON n.company_id=p.company_id AND n.node_id=p.node_id WHERE p.company_id=$1 AND p.car_id=$2 AND p.kind=$3 AND p.photo_id=$4 AND p.node_id<>$5 ORDER BY p.last_seen_at DESC LIMIT 5`,[req.auth.companyId,carId,kind,photoId,requester.node_id]);
+    const src=rows.find(r=>String(r.node_id||'')&&String(r.node_id)!==String(requester.node_id));if(!src)continue;
+    const requestId=crypto.randomUUID(),key=req.auth.companyId+'|'+src.node_id,a=photoRelayRequests.get(key)||[];a.push({requestId,toNodeId:requester.node_id,carId,kind,photoId,sha256,ext:String(x?.ext||'jpg'),createdAt:now(),createdMs:Date.now()});photoRelayRequests.set(key,a.slice(-100));queued++;
+  }
+  res.json({ok:true,queued,transport:'https-memory-relay',persistent:false});
+}catch(e){next(e)}});
+app.get('/api/photo-sync/relay/requests',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});cleanPhotoSignals();const node=await photoSyncNodeForAuth(req,req.query.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});const key=req.auth.companyId+'|'+node.node_id,a=photoRelayRequests.get(key)||[];photoRelayRequests.delete(key);res.json({ok:true,requests:a.map(({createdMs,...x})=>x)});
+}catch(e){next(e)}});
+app.post('/api/photo-sync/relay/payload',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});cleanPhotoSignals();const b=req.body||{},node=await photoSyncNodeForAuth(req,b.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});const toNodeId=String(b.toNodeId||''),dataUrl=String(b.dataUrl||'');if(!toNodeId||!dataUrl.startsWith('data:image/'))return res.status(400).json({error:'照片轉送資料不完整'});if(dataUrl.length>PHOTO_RELAY_MAX_DATA_URL)return res.status(413).json({error:'單張照片超過暫時轉送上限'});const to=await photoSyncFindNode(req.auth.companyId,toNodeId);if(!to)return res.status(404).json({error:'目的主機不存在'});const payload={requestId:String(b.requestId||''),fromNodeId:node.node_id,carId:String(b.carId||''),kind:String(b.kind||''),photoId:String(b.photoId||''),sha256:String(b.sha256||''),ext:String(b.ext||'jpg'),dataUrl,createdAt:now(),createdMs:Date.now()};if(!payload.carId||!['intake','inspection'].includes(payload.kind)||!payload.photoId||!payload.sha256)return res.status(400).json({error:'照片中繼 metadata 不完整'});const key=req.auth.companyId+'|'+toNodeId,a=photoRelayPayloads.get(key)||[];a.push(payload);photoRelayPayloads.set(key,a.slice(-20));res.json({ok:true,transport:'https-memory-relay',persistent:false});
+}catch(e){next(e)}});
+app.get('/api/photo-sync/relay/payloads',auth,requireActiveCompany,async(req,res,next)=>{try{
+  if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});cleanPhotoSignals();const node=await photoSyncNodeForAuth(req,req.query.nodeId);if(!node)return res.status(403).json({error:'照片同步主機識別失敗'});const key=req.auth.companyId+'|'+node.node_id,a=photoRelayPayloads.get(key)||[];photoRelayPayloads.delete(key);res.json({ok:true,payloads:a.map(({createdMs,...x})=>x),transport:'https-memory-relay',persistent:false});
+}catch(e){next(e)}});
+
 app.post('/api/photo-sync/signal',auth,requireActiveCompany,async(req,res,next)=>{try{
   if(!['admin','branchManager'].includes(String(req.auth.role||'')))return res.status(403).json({error:'此帳號不提供主機照片同步'});
   cleanPhotoSignals();const b=req.body||{},fromNodeId=String(b.fromNodeId||''),toNodeId=String(b.toNodeId||''),toClientId=String(b.toClientId||''),signalId=String(b.signalId||''),type=String(b.type||''),sdp=b.sdp;
@@ -4033,7 +4063,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.31',apiVersion:'6.9.31',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.32',apiVersion:'6.9.32',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -4586,7 +4616,7 @@ app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.31',apiVersion:'6.9.31',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.32',apiVersion:'6.9.32',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.9.10',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
