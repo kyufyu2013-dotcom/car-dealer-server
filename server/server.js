@@ -1996,7 +1996,7 @@ function securityHeaders(req,res,next){res.setHeader('X-Content-Type-Options','n
 function generalRateLimit(req,res,next){if(req.path.startsWith('/super/')||req.path==='/health'||req.path==='/ready')return next();const b=bucketCheck(rateWindows,remoteIp(req)||'unknown',SECURITY_RATE_WINDOW_MS,SECURITY_API_MAX);res.setHeader('X-RateLimit-Limit',String(SECURITY_API_MAX));res.setHeader('X-RateLimit-Remaining',String(b.remaining));if(!b.allowed){res.setHeader('Retry-After',String(Math.ceil((Date.parse(b.resetAt)-Date.now())/1000)));return res.status(429).json({error:'請求過於頻繁，請稍後再試',errorCode:'RATE_LIMITED'})}next()}
 function loginGuard(kind='dealer'){return (req,res,next)=>{const key=`${kind}:${remoteIp(req)}:${String(req.body?.username||'').toLowerCase()}`;const b=bucketCheck(loginWindows,key,SECURITY_LOGIN_WINDOW_MS,SECURITY_LOGIN_MAX);if(!b.allowed){auditSecurityEvent(req,{action:`${kind}_login_blocked`,category:'authentication',status:'blocked',detail:'Too many login attempts'});return res.status(429).json({error:'登入嘗試過於頻繁，請稍後再試',errorCode:'LOGIN_RATE_LIMITED',retryAfterSeconds:Math.max(1,Math.ceil((Date.parse(b.resetAt)-Date.now())/1000))})}req.securityLoginKey=key;next()}}
 async function phase10DataIntegritySummary(){const issues=[];let duplicateUsers=0,missingSnapshots=0,saleProblems=0;try{duplicateUsers=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM (SELECT company_id,username,COUNT(*) FROM users GROUP BY company_id,username HAVING COUNT(*)>1)x`)).rows[0]?.n||0);missingSnapshots=Number((await pool.query(`SELECT COUNT(*)::int AS n FROM companies c LEFT JOIN snapshots s ON s.company_id=c.id WHERE s.company_id IS NULL`)).rows[0]?.n||0);const snaps=(await pool.query(`SELECT company_id,json FROM snapshots ORDER BY updated_at DESC LIMIT 500`)).rows;for(const row of snaps){const e=validateSaleIntegrity(row.json||{});if(e){saleProblems++;if(issues.length<10)issues.push({companyId:row.company_id,issue:e})}}}catch(e){issues.push({issue:e.message||String(e)})}return {status:duplicateUsers===0&&missingSnapshots===0&&saleProblems===0?'pass':'warning',duplicateUsers,missingSnapshots,saleProblems,issues,checkedAt:now()}}
-async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.43',apiVersion:'6.9.43',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
+async function phase10ReleaseReadiness(){const schema=await getServerSchemaStatus(),backup=await centralBackupSummary();const lastRestore=(backup.restoreEvents||[]).find(x=>x.status==='success')||null;const ready=schema.status==='ready'&&!!backup.lastSuccess&&!!lastRestore;return {status:ready?'ready':'attention',serverVersion:'14.9.44',apiVersion:'6.9.44',schemaCurrent:schema.currentVersion,schemaTarget:schema.targetVersion,schemaReady:schema.status==='ready',backupReady:!!backup.lastSuccess,restoreDrillReady:!!lastRestore,lastBackupAt:backup.lastSuccess?.completed_at||backup.lastSuccess?.started_at||null,lastRestoreAt:lastRestore?.completed_at||lastRestore?.started_at||null,note:ready?'具備程式版本回滾前置條件；真正 Render 回滾仍由部署平台操作。':'回滾前請先補齊 Schema / Backup / Restore Drill 條件。',checkedAt:now()}}
 
 // Phase 11A-11C: Commercial Launch Center（商用上線中心）
 async function phase11AcceptanceSummary(){
@@ -2114,7 +2114,7 @@ async function phase12Summary(options={}){
     pool.query(`SELECT COUNT(*) FILTER (WHERE status='active')::int AS active,COUNT(*) FILTER (WHERE status IN ('grace_period','past_due','suspended'))::int AS attention FROM dealer_subscriptions`)
   ]);
   return {
-    serverVersion:'14.9.43',apiVersion:'6.9.43',
+    serverVersion:'14.9.44',apiVersion:'6.9.44',
     plans:plans.rows,planOptions:planOptions.rows,providers:providers.rows,subscriptions:subs.rows,payments:pays.rows,
     planPagination:{page:planSafePage,pageSize,total:planTotal,totalPages:planTotalPages,search:planSearch,status:planStatus},
     subscriptionPagination:{page:subSafePage,pageSize,total:subTotal,totalPages:subTotalPages,search:subscriptionSearch,status:subscriptionStatus},
@@ -2144,12 +2144,12 @@ app.get('/m200530366/',(req,res)=>{
   res.setHeader('Pragma','no-cache');
   res.setHeader('Expires','0');
   res.setHeader('Surrogate-Control','no-store');
-  res.setHeader('X-SuperAdmin-UI-Version','14.9.43');
+  res.setHeader('X-SuperAdmin-UI-Version','14.9.44');
   res.sendFile(path.join(__dirname,'public','m200530366','index.html'));
 });
-app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.43');}}));
+app.use('/m200530366', express.static(path.join(__dirname,'public','m200530366'),{etag:false,lastModified:false,setHeaders:(res)=>{res.setHeader('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');res.setHeader('Pragma','no-cache');res.setHeader('Expires','0');res.setHeader('Surrogate-Control','no-store');res.setHeader('X-SuperAdmin-UI-Version','14.9.44');}}));
 app.get('/sales',(req,res)=>res.redirect('/sales/'));
-app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.43'));
+app.get('/m200530366',(req,res)=>res.redirect('/m200530366/?ui=14.9.44'));
 
 // A physical PostgreSQL standby must never accept mutations. After promotion,
 // refreshHaRuntime automatically flips writeReady and normal traffic resumes.
@@ -2172,14 +2172,14 @@ app.use('/api',(req,res,next)=>{
 app.get('/api/ready',async(req,res)=>{
   const st=await refreshHaRuntime({allowMigration:false,recordTransition:false});
   const ready=!CENTRAL_HA_ENABLED?st.schemaReady:(st.dbRole==='primary'&&st.schemaReady);
-  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.43',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
+  const body={ok:ready,time:now(),service:'car-dealer-central',version:'6.9.44',haEnabled:CENTRAL_HA_ENABLED,dbRole:st.dbRole,writeReady:ready,schemaReady:st.schemaReady,site:CENTRAL_HA_SITE,instanceId:CENTRAL_HA_INSTANCE_ID};
   res.status(ready?200:503).json(body);
 });
 
 app.get('/api/health',async(req,res)=>{
   try{
     await pool.query('SELECT 1');
-    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.43',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.43'});
+    res.json({ok:true,time:now(),service:'car-dealer-central',database:'postgres',version:'6.9.44',schemaVersion:SERVER_SCHEMA_TARGET,architecture:'multi-branch-live-operations',superAdminUiVersion:'14.9.44'});
   }catch(e){
     res.status(503).json({ok:false,error:'database unavailable'});
   }
@@ -2464,6 +2464,9 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
       const old=byName.rows[0];
       const ph=x.password?hashPassword(x.password):(old?.password_hash||'');
       const userBranchId=String(x.branchId||old?.branch_id||defaultBranchId);
+      const nextPosition=String(x.position||'').trim()||String(old?.position||'').trim()||(String(x.role||'')==='branchManager'?'分店主管':String(x.role||'')==='sales'?'業務':String(x.role||'')==='admin'?'公司管理員':'一般員工');
+      const incomingSalaryType=String(x.salaryType||'');
+      const nextSalaryType=['fixed','base_plus_commission','commission_only'].includes(incomingSalaryType)?incomingSalaryType:(old?.salary_type||'fixed');
       if(userBranchId&&!branchIds.has(userBranchId)){await client.query('ROLLBACK');return res.status(400).json({error:`職員 ${x.name||x.username} 的所屬分店不存在或已停用`});}
       let nextRole=['admin','branchManager','sales','staff'].includes(String(x.role||''))?String(x.role):'staff';
       if(isScopedOperator){
@@ -2476,15 +2479,15 @@ app.put('/api/company/snapshot',auth,requireActiveCompany,async(req,res,next)=>{
         await client.query(`
           UPDATE users SET username=$1,password_hash=$2,name=$3,role=$4,commission_rate=$5,base_salary=$6,enabled=TRUE,updated_at=$7,branch_id=$8,permissions=$9::jsonb,position=$10,salary_type=$11,login_enabled=$12
           WHERE id=$13 AND company_id=$14
-        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'staff',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,JSON.stringify(x.permissions||old.permissions||{}),String(x.position||''),['fixed','base_plus_commission','commission_only'].includes(String(x.salaryType||''))?String(x.salaryType):'fixed',x.loginEnabled!==false,old.id,req.auth.companyId]);
+        `,[x.username,ph||old.password_hash,x.name||x.username,x.role||'staff',Number(x.commissionRate??old.commission_rate??0),Number(x.baseSalary??old.base_salary??0),now(),userBranchId||null,JSON.stringify(x.permissions||old.permissions||{}),nextPosition,nextSalaryType,x.loginEnabled!==false,old.id,req.auth.companyId]);
         if(old.id!==x.id){ x.id=old.id; keep.add(old.id); }
       }else{
         if(!ph&&x.loginEnabled!==false){await client.query('ROLLBACK');return res.status(400).json({error:`新帳號 ${x.username} 必須設定密碼`});}
         await client.query(`
           INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id,permissions,position,salary_type,login_enabled)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,$10,$11::jsonb,$12,$13,$14)
-        `,[x.id,req.auth.companyId,x.username,ph||hashPassword(crypto.randomBytes(18).toString('hex')),x.name||x.username,x.role||'staff',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,JSON.stringify(x.permissions||{}),String(x.position||''),['fixed','base_plus_commission','commission_only'].includes(String(x.salaryType||''))?String(x.salaryType):'fixed',x.loginEnabled!==false]);
-        await client.query(`INSERT INTO staff_change_events(company_id,event_type,employee_id,employee_name,position,branch_id,actor_id,actor_name,actor_role,reason,owner_read_at,created_at) VALUES($1,'created',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[req.auth.companyId,x.id,String(x.name||x.username||''),String(x.position||''),userBranchId||'',String(authUser.id),actorName,String(authUser.role||''),String(staffChangeContext?.reason||'新增人員'),String(authUser.id)===companyOwnerId?now():null,now()]);
+        `,[x.id,req.auth.companyId,x.username,ph||hashPassword(crypto.randomBytes(18).toString('hex')),x.name||x.username,x.role||'staff',Number(x.commissionRate||0),Number(x.baseSalary||0),now(),userBranchId||null,JSON.stringify(x.permissions||{}),nextPosition,nextSalaryType,x.loginEnabled!==false]);
+        await client.query(`INSERT INTO staff_change_events(company_id,event_type,employee_id,employee_name,position,branch_id,actor_id,actor_name,actor_role,reason,owner_read_at,created_at) VALUES($1,'created',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[req.auth.companyId,x.id,String(x.name||x.username||''),nextPosition,userBranchId||'',String(authUser.id),actorName,String(authUser.role||''),String(staffChangeContext?.reason||'新增人員'),String(authUser.id)===companyOwnerId?now():null,now()]);
       }
       x.branchId=userBranchId||'';x.password='';
     }
@@ -4297,7 +4300,7 @@ async function createCentralBackup(triggerType='manual',actor='system'){
     const policy=await getCentralBackupPolicy(),client=await pool.connect();let data={};
     try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');for(const table of CENTRAL_BACKUP_TABLES){const {rows}=await client.query(`SELECT * FROM ${table}`);data[table]=rows}await client.query('COMMIT')}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
     const rowCount=Object.values(data).reduce((n,a)=>n+(Array.isArray(a)?a.length:0),0);const schema=await getServerSchemaStatus();
-    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.43',apiVersion:'6.9.43',schemaVersion:schema.currentVersion,tables:data};
+    const payload={format:'car-dealer-central-logical-backup',formatVersion:1,createdAt:now(),serverVersion:'14.9.44',apiVersion:'6.9.44',schemaVersion:schema.currentVersion,tables:data};
     const compressed=gzipSync(Buffer.from(JSON.stringify(payload))),encrypted=encryptBackupBuffer(compressed);const hash=crypto.createHash('sha256').update(encrypted).digest('hex');
     await fs.mkdir(POSTGRES_BACKUP_DIR,{recursive:true});const stamp=new Date().toISOString().replace(/[:.]/g,'-'),fileName=`central-${stamp}-${backupId.slice(0,8)}.cdbak`,localPath=path.join(POSTGRES_BACKUP_DIR,fileName);await fs.writeFile(localPath,encrypted,{mode:0o600});
     let offsiteStatus='disabled',offsiteKey='',offsiteProvider='';
@@ -4862,7 +4865,7 @@ app.get('/api/super/security/releases',superAuth,async(req,res,next)=>{try{const
 
 
 // -------------------- Phase 11A-11C Commercial Launch Center --------------------
-app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.43',apiVersion:'6.9.43',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
+app.get('/api/super/commercial-launch',superAuth,async(req,res,next)=>{try{const [readiness,companies,events]=await Promise.all([phase11ProductionReadiness(),pool.query(`SELECT id,name,enabled,start_date,expires_at,last_auth_at FROM companies ORDER BY name ASC`),pool.query(`SELECT acceptance_id,status,result,actor,created_at FROM commercial_acceptance_events ORDER BY id DESC LIMIT 50`)]);res.json({serverVersion:'14.9.44',apiVersion:'6.9.44',...readiness,companies:companies.rows,acceptanceEvents:events.rows})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/acceptance',superAuth,async(req,res,next)=>{try{const result=await phase11AcceptanceSummary(),acceptanceId=`acc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;await pool.query(`INSERT INTO commercial_acceptance_events(acceptance_id,status,result,actor,created_at) VALUES($1,$2,$3::jsonb,$4,$5)`,[acceptanceId,result.status,JSON.stringify(result),req.auth.username||req.auth.sub,now()]);await auditSecurityEvent(req,{action:'phase11a_commercial_acceptance',category:'commercial_launch',status:result.status==='fail'?'rejected':'success',targetType:'acceptance',targetId:acceptanceId,detail:`pass=${result.pass}, warning=${result.warning}, fail=${result.fail}`});res.json({acceptanceId,...result})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/start',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim(),notes=String(req.body?.notes||'').slice(0,1000);if(!companyId)return res.status(400).json({error:'請選擇 Dealer（車行）'});const c=await getCompany(companyId);if(!c)return res.status(404).json({error:'找不到車行'});await pool.query(`INSERT INTO pilot_dealers(company_id,status,started_at,completed_at,started_by,notes,baseline_server_version,baseline_schema_version,updated_at) VALUES($1,'active',$2,NULL,$3,$4,'14.9.10',$5,$2) ON CONFLICT(company_id) DO UPDATE SET status='active',started_at=EXCLUDED.started_at,completed_at=NULL,started_by=EXCLUDED.started_by,notes=EXCLUDED.notes,baseline_server_version=EXCLUDED.baseline_server_version,baseline_schema_version=EXCLUDED.baseline_schema_version,updated_at=EXCLUDED.updated_at`,[companyId,now(),req.auth.username||req.auth.sub,notes,SERVER_SCHEMA_TARGET]);await auditSecurityEvent(req,{action:'phase11b_pilot_start',category:'commercial_launch',targetType:'company',targetId:companyId,detail:`Pilot started: ${c.name}`});res.json({ok:true})}catch(e){next(e)}});
 app.post('/api/super/commercial-launch/pilot/complete',superAuth,async(req,res,next)=>{try{const companyId=String(req.body?.companyId||'').trim();const r=await pool.query(`UPDATE pilot_dealers SET status='completed',completed_at=$1,updated_at=$1 WHERE company_id=$2 RETURNING *`,[now(),companyId]);if(!r.rows[0])return res.status(404).json({error:'找不到此 Pilot 紀錄'});await auditSecurityEvent(req,{action:'phase11b_pilot_complete',category:'commercial_launch',targetType:'company',targetId:companyId,detail:'Pilot completed'});res.json({ok:true,row:r.rows[0]})}catch(e){next(e)}});
