@@ -2221,7 +2221,7 @@ app.post('/api/company/register',async(req,res,next)=>{
     if(exists.rowCount)return res.status(409).json({error:'車行代碼已被使用'});
 
     const company={
-      id:companyCode,name:companyName,enabled:true,start_date:today(),expires_at:addDays(7),
+      id:companyCode,name:companyName,enabled:true,start_date:today(),expires_at:addDays(30),
       created_at:now(),created_by:'self',contact_email:String(email||'').trim().slice(0,200),contact_landline:String(landline||'').trim().slice(0,80),contact_mobile:String(mobile||'').trim().slice(0,80),contact_line:String(lineId||'').trim().slice(0,120),trial:true
     };
     const user={
@@ -2244,7 +2244,7 @@ app.post('/api/company/register',async(req,res,next)=>{
     await client.query('UPDATE companies SET owner_user_id=$1 WHERE id=$2',[user.id,companyCode]);
     await client.query(`
       INSERT INTO users(id,company_id,username,password_hash,name,role,commission_rate,base_salary,enabled,updated_at,branch_id)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     `,[user.id,user.company_id,user.username,hashPassword(password),user.name,user.role,0,0,true,user.updated_at,user.branch_id]);
     await client.query(`
       INSERT INTO snapshots(company_id,version,json,updated_at) VALUES($1,$2,$3::jsonb,$4)
